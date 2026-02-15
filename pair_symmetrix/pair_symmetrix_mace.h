@@ -52,6 +52,7 @@ class PairSymmetrixMACE : public Pair {
   std::string mode;
 
   std::vector<double> H1, H1_adj;
+  std::vector<double> rrnlb_feat0, rrnlb_feat0_adj;
 
   // symmetrix evaluator and inputs
   std::unique_ptr<MACE> mace;

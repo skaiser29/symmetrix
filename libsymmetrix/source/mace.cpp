@@ -2,12 +2,125 @@
 #include <fstream>
 #include <numbers>
 #include <numeric>
+#include <stdexcept>
+#include <algorithm>
+#include <cmath>
+#include <cstdlib>
+#include <cctype>
+#include <sstream>
 
 #include "nlohmann/json.hpp"
 #include "sphericart.hpp"
 
 #include "cblas.hpp"
 #include "mace.hpp"
+
+namespace {
+
+enum class RRNLBNonlinearAblationMode {
+    Off,
+    GateIdentity
+};
+
+auto rrnlb_nonlinear_ablation_mode() -> RRNLBNonlinearAblationMode
+{
+    static RRNLBNonlinearAblationMode mode = []() -> RRNLBNonlinearAblationMode {
+        const char* mode_env = std::getenv("SYMMETRIX_RRNLB_ABLATION");
+        if (mode_env == nullptr || mode_env[0] == '\0') {
+            return RRNLBNonlinearAblationMode::Off;
+        }
+        std::string mode(mode_env);
+        std::transform(
+            mode.begin(),
+            mode.end(),
+            mode.begin(),
+            [] (unsigned char c) { return static_cast<char>(std::tolower(c)); });
+        if (mode == "off") {
+            return RRNLBNonlinearAblationMode::Off;
+        }
+        if (mode == "gate_identity" || mode == "identity_gate") {
+            return RRNLBNonlinearAblationMode::GateIdentity;
+        }
+        std::ostringstream oss;
+        oss << "Unsupported SYMMETRIX_RRNLB_ABLATION mode '" << mode
+            << "'. Supported values: off, gate_identity.";
+        throw std::runtime_error(oss.str());
+    }();
+    return mode;
+}
+
+auto parse_rrnlb_irrep_parts(const nlohmann::json& irreps_json)
+    -> std::vector<MACE::RRNLBIrrepPart>
+{
+    std::vector<MACE::RRNLBIrrepPart> parts;
+    int offset = 0;
+    for (const auto& part : irreps_json.at("parts")) {
+        MACE::RRNLBIrrepPart parsed;
+        parsed.mul = part.at("mul").get<int>();
+        parsed.l = part.at("l").get<int>();
+        parsed.p = part.at("p").get<int>();
+        parsed.offset = offset;
+        parsed.dim = parsed.mul * (2 * parsed.l + 1);
+        offset += parsed.dim;
+        parts.push_back(parsed);
+    }
+    return parts;
+}
+
+auto parse_rrnlb_linear(const nlohmann::json& linear_json)
+    -> MACE::RRNLBLinear
+{
+    MACE::RRNLBLinear linear;
+    linear.parts_in = parse_rrnlb_irrep_parts(linear_json.at("irreps_in"));
+    linear.parts_out = parse_rrnlb_irrep_parts(linear_json.at("irreps_out"));
+    linear.dim_in = linear_json.at("irreps_in").at("dim").get<int>();
+    linear.dim_out = linear_json.at("irreps_out").at("dim").get<int>();
+    for (const auto& ins : linear_json.at("instructions")) {
+        MACE::RRNLBLinearInstruction parsed;
+        parsed.i_in = ins.at("i_in").get<int>();
+        parsed.i_out = ins.at("i_out").get<int>();
+        auto path_shape = ins.at("path_shape").get<std::vector<int>>();
+        if (path_shape.size() != 2) {
+            throw std::runtime_error("RRNLB linear instruction path_shape must have length 2.");
+        }
+        parsed.mul_in = path_shape[0];
+        parsed.mul_out = path_shape[1];
+        parsed.path_weight = ins.at("path_weight").get<double>();
+        parsed.weights = ins.at("weight_values").get<std::vector<double>>();
+        const int expected = parsed.mul_in * parsed.mul_out;
+        if (static_cast<int>(parsed.weights.size()) != expected) {
+            throw std::runtime_error("RRNLB linear instruction has unexpected weight length.");
+        }
+        linear.instructions.push_back(std::move(parsed));
+    }
+    if (linear_json.contains("bias_values")) {
+        linear.bias = linear_json.at("bias_values").get<std::vector<double>>();
+    }
+    return linear;
+}
+
+inline auto sigmoid(const double x) -> double
+{
+    if (x >= 0.0) {
+        const double z = std::exp(-x);
+        return 1.0 / (1.0 + z);
+    }
+    const double z = std::exp(x);
+    return z / (1.0 + z);
+}
+
+inline auto silu(const double x) -> double
+{
+    return x * sigmoid(x);
+}
+
+inline auto silu_deriv(const double x) -> double
+{
+    const double s = sigmoid(x);
+    return s + x * s * (1.0 - s);
+}
+
+} // namespace
 
 MACE::MACE(std::string filename)
 {
@@ -35,6 +148,12 @@ void MACE::compute_node_energies_forces(
             atomic_numbers, r, xyz, node_energies, node_forces);
 
     compute_Y(xyz);
+
+    if (interaction_mode_rrnlb) {
+        compute_rrnlb_forward(
+            num_nodes, node_types, num_neigh, neigh_indices, neigh_types, xyz, r);
+        return;
+    }
 
     compute_R0(num_nodes, node_types, num_neigh, neigh_types, r);
     compute_A0(num_nodes, node_types, num_neigh, neigh_types);
@@ -369,6 +488,86 @@ void MACE::compute_M0(
     }
 }
 
+void MACE::compute_rrnlb_M0(
+    const int num_nodes,
+    std::span<const int> node_types,
+    std::span<const double> node_feats,
+    const std::vector<RRNLBIrrepPart>& parts)
+{
+    if (static_cast<int>(node_types.size()) != num_nodes) {
+        throw std::runtime_error("RRNLB M0 expects node_types sized to num_nodes.");
+    }
+    int in_row_dim = 0;
+    for (const auto& part : parts) {
+        in_row_dim = std::max(in_row_dim, part.offset + part.dim);
+    }
+    if (static_cast<int>(node_feats.size()) != num_nodes * in_row_dim) {
+        throw std::runtime_error("RRNLB M0 input feature size mismatch.");
+    }
+
+    std::vector<int> in_part_for_l(l_max + 1, -1);
+    for (int p = 0; p < static_cast<int>(parts.size()); ++p) {
+        const auto& part = parts[p];
+        if (part.mul != num_channels) {
+            throw std::runtime_error("RRNLB M0 input multiplicity must equal num_channels.");
+        }
+        if (part.l < 0 || part.l > l_max) {
+            throw std::runtime_error("RRNLB M0 input angular index is out of bounds.");
+        }
+        if (in_part_for_l[part.l] >= 0) {
+            throw std::runtime_error("RRNLB M0 input irreps contain duplicate l blocks.");
+        }
+        in_part_for_l[part.l] = p;
+    }
+
+    for (const auto& out_part : product_linear_0.parts_in) {
+        if (out_part.mul != num_channels) {
+            throw std::runtime_error("RRNLB M0 output multiplicity must equal num_channels.");
+        }
+        if (out_part.l < 0 || out_part.l > L_max) {
+            throw std::runtime_error("RRNLB M0 output angular index is out of bounds.");
+        }
+        if (out_part.offset < 0 || out_part.offset + out_part.dim > product_linear_0.dim_in) {
+            throw std::runtime_error("RRNLB M0 output irrep offset is out of bounds.");
+        }
+    }
+    if (product_linear_0.dim_in != num_LM * num_channels) {
+        throw std::runtime_error("RRNLB M0 expects product_linear_0 input to match num_LM*num_channels.");
+    }
+
+    M0.assign(num_nodes * product_linear_0.dim_in, 0.0);
+    M0_grad.assign(num_nodes * product_linear_0.dim_in * num_lm, 0.0);
+    std::vector<double> x(num_lm, 0.0);
+    for (int i = 0; i < num_nodes; ++i) {
+        const int type_i = node_types[i];
+        const auto* feats_i = node_feats.data() + i * in_row_dim;
+        auto* m0_i = M0.data() + i * product_linear_0.dim_in;
+        auto* m0_grad_i = M0_grad.data() + i * product_linear_0.dim_in * num_lm;
+        for (int k = 0; k < num_channels; ++k) {
+            std::fill(x.begin(), x.end(), 0.0);
+            for (int l = 0; l <= l_max; ++l) {
+                const int p = in_part_for_l[l];
+                if (p < 0) continue;
+                const auto& part = parts[p];
+                const int ir_dim = 2 * l + 1;
+                const auto* src = feats_i + part.offset + k * ir_dim;
+                std::copy(src, src + ir_dim, x.begin() + l * l);
+            }
+            for (const auto& out_part : product_linear_0.parts_in) {
+                const int ir_dim = 2 * out_part.l + 1;
+                for (int m = 0; m < ir_dim; ++m) {
+                    const int lm = out_part.l * out_part.l + m;
+                    auto [f, g] = P0[type_i * num_LM * num_channels + lm * num_channels + k]
+                                      .evaluate_gradient(x);
+                    const int out_idx = out_part.offset + k * ir_dim + m;
+                    m0_i[out_idx] = f;
+                    std::copy(g.begin(), g.end(), m0_grad_i + out_idx * num_lm);
+                }
+            }
+        }
+    }
+}
+
 void MACE::reverse_M0(
     const int num_nodes,
     std::span<const int> node_types)
@@ -388,6 +587,89 @@ void MACE::reverse_M0(
                     + lm*num_channels;
                 for (int k=0; k<num_channels; ++k) {
                     A0_adj_ilm[k] += M0_grad_ilmplm[k] * M0_adj_ilmp[k];
+                }
+            }
+        }
+    }
+}
+
+void MACE::reverse_rrnlb_M0(
+    const int num_nodes,
+    std::span<const int> node_types,
+    const std::vector<RRNLBIrrepPart>& parts,
+    std::span<double> node_feats_adj)
+{
+    if (static_cast<int>(node_types.size()) != num_nodes) {
+        throw std::runtime_error("RRNLB reverse M0 expects node_types sized to num_nodes.");
+    }
+    int in_row_dim = 0;
+    for (const auto& part : parts) {
+        in_row_dim = std::max(in_row_dim, part.offset + part.dim);
+    }
+    if (static_cast<int>(node_feats_adj.size()) != num_nodes * in_row_dim) {
+        throw std::runtime_error("RRNLB reverse M0 input adjoint size mismatch.");
+    }
+    if (static_cast<int>(M0_adj.size()) != num_nodes * product_linear_0.dim_in) {
+        throw std::runtime_error("RRNLB reverse M0 expects M0_adj sized to product linear input.");
+    }
+    if (static_cast<int>(M0_grad.size()) != num_nodes * product_linear_0.dim_in * num_lm) {
+        throw std::runtime_error("RRNLB reverse M0 expects M0_grad sized to product linear input.");
+    }
+
+    std::vector<int> in_part_for_l(l_max + 1, -1);
+    for (int p = 0; p < static_cast<int>(parts.size()); ++p) {
+        const auto& part = parts[p];
+        if (part.mul != num_channels) {
+            throw std::runtime_error("RRNLB reverse M0 input multiplicity must equal num_channels.");
+        }
+        if (part.l < 0 || part.l > l_max) {
+            throw std::runtime_error("RRNLB reverse M0 input angular index is out of bounds.");
+        }
+        if (in_part_for_l[part.l] >= 0) {
+            throw std::runtime_error("RRNLB reverse M0 input irreps contain duplicate l blocks.");
+        }
+        in_part_for_l[part.l] = p;
+    }
+
+    for (const auto& out_part : product_linear_0.parts_in) {
+        if (out_part.mul != num_channels) {
+            throw std::runtime_error("RRNLB reverse M0 output multiplicity must equal num_channels.");
+        }
+        if (out_part.l < 0 || out_part.l > L_max) {
+            throw std::runtime_error("RRNLB reverse M0 output angular index is out of bounds.");
+        }
+        if (out_part.offset < 0 || out_part.offset + out_part.dim > product_linear_0.dim_in) {
+            throw std::runtime_error("RRNLB reverse M0 output irrep offset is out of bounds.");
+        }
+    }
+
+    std::fill(node_feats_adj.begin(), node_feats_adj.end(), 0.0);
+    std::vector<double> x_adj(num_lm, 0.0);
+    for (int i = 0; i < num_nodes; ++i) {
+        const auto* m0_adj_i = M0_adj.data() + i * product_linear_0.dim_in;
+        const auto* m0_grad_i = M0_grad.data() + i * product_linear_0.dim_in * num_lm;
+        auto* feats_adj_i = node_feats_adj.data() + i * in_row_dim;
+        for (int k = 0; k < num_channels; ++k) {
+            std::fill(x_adj.begin(), x_adj.end(), 0.0);
+            for (const auto& out_part : product_linear_0.parts_in) {
+                const int ir_dim = 2 * out_part.l + 1;
+                for (int m = 0; m < ir_dim; ++m) {
+                    const int out_idx = out_part.offset + k * ir_dim + m;
+                    const double upstream = m0_adj_i[out_idx];
+                    const auto* grad = m0_grad_i + out_idx * num_lm;
+                    for (int lm = 0; lm < num_lm; ++lm) {
+                        x_adj[lm] += upstream * grad[lm];
+                    }
+                }
+            }
+            for (int l = 0; l <= l_max; ++l) {
+                const int p = in_part_for_l[l];
+                if (p < 0) continue;
+                const auto& part = parts[p];
+                const int ir_dim = 2 * l + 1;
+                auto* dst = feats_adj_i + part.offset + k * ir_dim;
+                for (int m = 0; m < ir_dim; ++m) {
+                    dst[m] += x_adj[l * l + m];
                 }
             }
         }
@@ -776,6 +1058,77 @@ void MACE::compute_M1(
     }
 }
 
+void MACE::compute_rrnlb_M1(
+    const int num_nodes,
+    std::span<const int> node_types,
+    std::span<const double> node_feats,
+    const std::vector<RRNLBIrrepPart>& parts)
+{
+    if (static_cast<int>(node_types.size()) != num_nodes) {
+        throw std::runtime_error("RRNLB M1 expects node_types sized to num_nodes.");
+    }
+    int in_row_dim = 0;
+    for (const auto& part : parts) {
+        in_row_dim = std::max(in_row_dim, part.offset + part.dim);
+    }
+    if (static_cast<int>(node_feats.size()) != num_nodes * in_row_dim) {
+        throw std::runtime_error("RRNLB M1 input feature size mismatch.");
+    }
+
+    std::vector<int> in_part_for_l(l_max + 1, -1);
+    for (int p = 0; p < static_cast<int>(parts.size()); ++p) {
+        const auto& part = parts[p];
+        if (part.mul != num_channels) {
+            throw std::runtime_error("RRNLB M1 input multiplicity must equal num_channels.");
+        }
+        if (part.l < 0 || part.l > l_max) {
+            throw std::runtime_error("RRNLB M1 input angular index is out of bounds.");
+        }
+        if (in_part_for_l[part.l] >= 0) {
+            throw std::runtime_error("RRNLB M1 input irreps contain duplicate l blocks.");
+        }
+        in_part_for_l[part.l] = p;
+    }
+
+    if (product_linear_1.dim_in != num_channels) {
+        throw std::runtime_error("RRNLB M1 expects product_linear_1 input to match num_channels.");
+    }
+    if (product_linear_1.parts_in.size() != 1
+        || product_linear_1.parts_in[0].l != 0
+        || product_linear_1.parts_in[0].mul != num_channels) {
+        throw std::runtime_error("RRNLB M1 expects a single scalar product input irrep block.");
+    }
+    const auto& out_part = product_linear_1.parts_in[0];
+    if (out_part.offset < 0 || out_part.offset + out_part.dim > product_linear_1.dim_in) {
+        throw std::runtime_error("RRNLB M1 output irrep offset is out of bounds.");
+    }
+
+    M1.assign(num_nodes * product_linear_1.dim_in, 0.0);
+    M1_grad.assign(num_nodes * product_linear_1.dim_in * num_lm, 0.0);
+    std::vector<double> x(num_lm, 0.0);
+    for (int i = 0; i < num_nodes; ++i) {
+        const int type_i = node_types[i];
+        const auto* feats_i = node_feats.data() + i * in_row_dim;
+        auto* m1_i = M1.data() + i * product_linear_1.dim_in;
+        auto* m1_grad_i = M1_grad.data() + i * product_linear_1.dim_in * num_lm;
+        for (int k = 0; k < num_channels; ++k) {
+            std::fill(x.begin(), x.end(), 0.0);
+            for (int l = 0; l <= l_max; ++l) {
+                const int p = in_part_for_l[l];
+                if (p < 0) continue;
+                const auto& part = parts[p];
+                const int ir_dim = 2 * l + 1;
+                const auto* src = feats_i + part.offset + k * ir_dim;
+                std::copy(src, src + ir_dim, x.begin() + l * l);
+            }
+            auto [f, g] = P1[type_i * num_channels + k].evaluate_gradient(x);
+            const int out_idx = out_part.offset + k;
+            m1_i[out_idx] = f;
+            std::copy(g.begin(), g.end(), m1_grad_i + out_idx * num_lm);
+        }
+    }
+}
+
 void MACE::reverse_M1(
     const int num_nodes,
     std::span<const int> node_types)
@@ -788,6 +1141,78 @@ void MACE::reverse_M1(
             auto M1_grad_ilm = M1_grad.begin() + (i*num_lm+lm)*num_channels;
             for (int k=0; k<num_channels; ++k) {
                 A1_adj_ilm[k] = M1_grad_ilm[k] * M1_adj_i[k];
+            }
+        }
+    }
+}
+
+void MACE::reverse_rrnlb_M1(
+    const int num_nodes,
+    std::span<const int> node_types,
+    const std::vector<RRNLBIrrepPart>& parts,
+    std::span<double> node_feats_adj)
+{
+    if (static_cast<int>(node_types.size()) != num_nodes) {
+        throw std::runtime_error("RRNLB reverse M1 expects node_types sized to num_nodes.");
+    }
+    int in_row_dim = 0;
+    for (const auto& part : parts) {
+        in_row_dim = std::max(in_row_dim, part.offset + part.dim);
+    }
+    if (static_cast<int>(node_feats_adj.size()) != num_nodes * in_row_dim) {
+        throw std::runtime_error("RRNLB reverse M1 input adjoint size mismatch.");
+    }
+    if (static_cast<int>(M1_adj.size()) != num_nodes * product_linear_1.dim_in) {
+        throw std::runtime_error("RRNLB reverse M1 expects M1_adj sized to product linear input.");
+    }
+    if (static_cast<int>(M1_grad.size()) != num_nodes * product_linear_1.dim_in * num_lm) {
+        throw std::runtime_error("RRNLB reverse M1 expects M1_grad sized to product linear input.");
+    }
+    if (product_linear_1.parts_in.size() != 1
+        || product_linear_1.parts_in[0].l != 0
+        || product_linear_1.parts_in[0].mul != num_channels) {
+        throw std::runtime_error("RRNLB reverse M1 expects a single scalar product input irrep block.");
+    }
+    const auto& out_part = product_linear_1.parts_in[0];
+
+    std::vector<int> in_part_for_l(l_max + 1, -1);
+    for (int p = 0; p < static_cast<int>(parts.size()); ++p) {
+        const auto& part = parts[p];
+        if (part.mul != num_channels) {
+            throw std::runtime_error("RRNLB reverse M1 input multiplicity must equal num_channels.");
+        }
+        if (part.l < 0 || part.l > l_max) {
+            throw std::runtime_error("RRNLB reverse M1 input angular index is out of bounds.");
+        }
+        if (in_part_for_l[part.l] >= 0) {
+            throw std::runtime_error("RRNLB reverse M1 input irreps contain duplicate l blocks.");
+        }
+        in_part_for_l[part.l] = p;
+    }
+
+    std::fill(node_feats_adj.begin(), node_feats_adj.end(), 0.0);
+    std::vector<double> x_adj(num_lm, 0.0);
+    for (int i = 0; i < num_nodes; ++i) {
+        const auto* m1_adj_i = M1_adj.data() + i * product_linear_1.dim_in;
+        const auto* m1_grad_i = M1_grad.data() + i * product_linear_1.dim_in * num_lm;
+        auto* feats_adj_i = node_feats_adj.data() + i * in_row_dim;
+        for (int k = 0; k < num_channels; ++k) {
+            std::fill(x_adj.begin(), x_adj.end(), 0.0);
+            const int out_idx = out_part.offset + k;
+            const double upstream = m1_adj_i[out_idx];
+            const auto* grad = m1_grad_i + out_idx * num_lm;
+            for (int lm = 0; lm < num_lm; ++lm) {
+                x_adj[lm] = upstream * grad[lm];
+            }
+            for (int l = 0; l <= l_max; ++l) {
+                const int p = in_part_for_l[l];
+                if (p < 0) continue;
+                const auto& part = parts[p];
+                const int ir_dim = 2 * l + 1;
+                auto* dst = feats_adj_i + part.offset + k * ir_dim;
+                for (int m = 0; m < ir_dim; ++m) {
+                    dst[m] += x_adj[l * l + m];
+                }
             }
         }
     }
@@ -902,11 +1327,957 @@ void MACE::compute_readouts(
     }
 }
 
+void MACE::apply_rrnlb_linear(
+    const RRNLBLinear& linear,
+    std::span<const double> x,
+    std::span<double> y)
+{
+    if (static_cast<int>(x.size()) != linear.dim_in) {
+        throw std::runtime_error("RRNLB linear input has unexpected dimension.");
+    }
+    if (static_cast<int>(y.size()) != linear.dim_out) {
+        throw std::runtime_error("RRNLB linear output has unexpected dimension.");
+    }
+    std::fill(y.begin(), y.end(), 0.0);
+    for (const auto& ins : linear.instructions) {
+        if (ins.i_in < 0 || ins.i_in >= static_cast<int>(linear.parts_in.size())
+            || ins.i_out < 0 || ins.i_out >= static_cast<int>(linear.parts_out.size())) {
+            throw std::runtime_error("RRNLB linear instruction has invalid part index.");
+        }
+        const auto& in_part = linear.parts_in[ins.i_in];
+        const auto& out_part = linear.parts_out[ins.i_out];
+        if (in_part.l != out_part.l) {
+            throw std::runtime_error("RRNLB linear instruction maps incompatible angular channels.");
+        }
+        if (ins.mul_in != in_part.mul || ins.mul_out != out_part.mul) {
+            throw std::runtime_error("RRNLB linear instruction has unexpected multiplicity.");
+        }
+        const int ir_dim = 2 * in_part.l + 1;
+        cblas_dgemm(
+            CblasRowMajor,                  // const CBLAS_LAYOUT Layout
+            CblasTrans,                     // const CBLAS_TRANSPOSE transa
+            CblasNoTrans,                   // const CBLAS_TRANSPOSE transb
+            ins.mul_out,                    // const MKL_INT m
+            ir_dim,                         // const MKL_INT n
+            ins.mul_in,                     // const MKL_INT k
+            ins.path_weight,                // const double alpha
+            ins.weights.data(),             // const double *a
+            ins.mul_out,                    // const MKL_INT lda
+            x.data() + in_part.offset,      // const double *b
+            ir_dim,                         // const MKL_INT ldb
+            1.0,                            // const double beta
+            y.data() + out_part.offset,     // double *c
+            ir_dim);                        // const MKL_INT ldc
+    }
+    if (!linear.bias.empty()) {
+        int bias_offset = 0;
+        for (const auto& out_part : linear.parts_out) {
+            if (out_part.l != 0) continue;
+            if (bias_offset + out_part.mul > static_cast<int>(linear.bias.size())) {
+                throw std::runtime_error("RRNLB linear bias has unexpected size.");
+            }
+            for (int k = 0; k < out_part.mul; ++k) {
+                y[out_part.offset + k] += linear.bias[bias_offset + k];
+            }
+            bias_offset += out_part.mul;
+        }
+        if (bias_offset != static_cast<int>(linear.bias.size())) {
+            throw std::runtime_error("RRNLB linear bias has trailing values.");
+        }
+    }
+}
+
+void MACE::apply_rrnlb_linear_transpose(
+    const RRNLBLinear& linear,
+    std::span<const double> y_adj,
+    std::span<double> x_adj)
+{
+    if (static_cast<int>(y_adj.size()) != linear.dim_out) {
+        throw std::runtime_error("RRNLB linear adjoint output has unexpected dimension.");
+    }
+    if (static_cast<int>(x_adj.size()) != linear.dim_in) {
+        throw std::runtime_error("RRNLB linear adjoint input has unexpected dimension.");
+    }
+    std::fill(x_adj.begin(), x_adj.end(), 0.0);
+    for (const auto& ins : linear.instructions) {
+        if (ins.i_in < 0 || ins.i_in >= static_cast<int>(linear.parts_in.size())
+            || ins.i_out < 0 || ins.i_out >= static_cast<int>(linear.parts_out.size())) {
+            throw std::runtime_error("RRNLB linear instruction has invalid part index.");
+        }
+        const auto& in_part = linear.parts_in[ins.i_in];
+        const auto& out_part = linear.parts_out[ins.i_out];
+        if (in_part.l != out_part.l) {
+            throw std::runtime_error("RRNLB linear instruction maps incompatible angular channels.");
+        }
+        if (ins.mul_in != in_part.mul || ins.mul_out != out_part.mul) {
+            throw std::runtime_error("RRNLB linear instruction has unexpected multiplicity.");
+        }
+        const int ir_dim = 2 * in_part.l + 1;
+        cblas_dgemm(
+            CblasRowMajor,                    // const CBLAS_LAYOUT Layout
+            CblasNoTrans,                     // const CBLAS_TRANSPOSE transa
+            CblasNoTrans,                     // const CBLAS_TRANSPOSE transb
+            ins.mul_in,                       // const MKL_INT m
+            ir_dim,                           // const MKL_INT n
+            ins.mul_out,                      // const MKL_INT k
+            ins.path_weight,                  // const double alpha
+            ins.weights.data(),               // const double *a
+            ins.mul_out,                      // const MKL_INT lda
+            y_adj.data() + out_part.offset,   // const double *b
+            ir_dim,                           // const MKL_INT ldb
+            1.0,                              // const double beta
+            x_adj.data() + in_part.offset,    // double *c
+            ir_dim);                          // const MKL_INT ldc
+    }
+}
+
+void MACE::apply_rrnlb_gate(
+    const RRNLBLayer& layer,
+    std::span<const double> x,
+    std::span<double> y)
+{
+    if (layer.nonlin_parts.empty() || layer.target_parts.empty()) {
+        throw std::runtime_error("RRNLB gate metadata is missing.");
+    }
+    const bool gate_identity_mode =
+        rrnlb_nonlinear_ablation_mode() == RRNLBNonlinearAblationMode::GateIdentity;
+    std::fill(y.begin(), y.end(), 0.0);
+    const auto& nonlin_scalars = layer.nonlin_parts[0];
+    const auto& out_scalars = layer.target_parts[0];
+    if (nonlin_scalars.l != 0 || out_scalars.l != 0) {
+        throw std::runtime_error("RRNLB gate scalar metadata is invalid.");
+    }
+    if (out_scalars.mul > nonlin_scalars.mul) {
+        throw std::runtime_error("RRNLB gate has inconsistent scalar multiplicities.");
+    }
+    for (int k = 0; k < out_scalars.mul; ++k) {
+        const double v = x[nonlin_scalars.offset + k];
+        y[out_scalars.offset + k] = gate_identity_mode
+            ? layer.gate_scalar_cst * v
+            : layer.gate_scalar_cst * silu(v);
+    }
+
+    int gate_offset = nonlin_scalars.offset + out_scalars.mul;
+    int gate_idx = 0;
+    if (layer.nonlin_parts.size() != layer.target_parts.size()) {
+        throw std::runtime_error("RRNLB gate irreps metadata size mismatch.");
+    }
+    for (size_t p = 1; p < layer.target_parts.size(); ++p) {
+        const auto& out_part = layer.target_parts[p];
+        const auto& in_part = layer.nonlin_parts[p];
+        if (in_part.l != out_part.l || in_part.mul != out_part.mul) {
+            throw std::runtime_error("RRNLB gate non-scalar metadata is inconsistent.");
+        }
+        const double cst = gate_idx < static_cast<int>(layer.gate_gate_cst.size())
+            ? layer.gate_gate_cst[gate_idx]
+            : 1.0;
+        const int ir_dim = 2 * out_part.l + 1;
+        for (int k = 0; k < out_part.mul; ++k) {
+            const double g = gate_identity_mode ? cst : cst * sigmoid(x[gate_offset + k]);
+            for (int m = 0; m < ir_dim; ++m) {
+                y[out_part.offset + k * ir_dim + m] =
+                    g * x[in_part.offset + k * ir_dim + m];
+            }
+        }
+        gate_offset += out_part.mul;
+        gate_idx += 1;
+    }
+}
+
+void MACE::apply_rrnlb_gate_reverse(
+    const RRNLBLayer& layer,
+    std::span<const double> x,
+    std::span<const double> y_adj,
+    std::span<double> x_adj)
+{
+    if (static_cast<int>(x.size()) != layer.linear_1.dim_out) {
+        throw std::runtime_error("RRNLB gate reverse input has unexpected dimension.");
+    }
+    if (static_cast<int>(y_adj.size()) != layer.linear_2.dim_in) {
+        throw std::runtime_error("RRNLB gate reverse output adjoint has unexpected dimension.");
+    }
+    if (static_cast<int>(x_adj.size()) != layer.linear_1.dim_out) {
+        throw std::runtime_error("RRNLB gate reverse input adjoint has unexpected dimension.");
+    }
+    if (layer.nonlin_parts.empty() || layer.target_parts.empty()) {
+        throw std::runtime_error("RRNLB gate reverse metadata is missing.");
+    }
+    const bool gate_identity_mode =
+        rrnlb_nonlinear_ablation_mode() == RRNLBNonlinearAblationMode::GateIdentity;
+
+    std::fill(x_adj.begin(), x_adj.end(), 0.0);
+
+    const auto& nonlin_scalars = layer.nonlin_parts[0];
+    const auto& out_scalars = layer.target_parts[0];
+    if (nonlin_scalars.l != 0 || out_scalars.l != 0) {
+        throw std::runtime_error("RRNLB gate reverse scalar metadata is invalid.");
+    }
+    if (out_scalars.mul > nonlin_scalars.mul) {
+        throw std::runtime_error("RRNLB gate reverse has inconsistent scalar multiplicities.");
+    }
+    for (int k = 0; k < out_scalars.mul; ++k) {
+        x_adj[nonlin_scalars.offset + k] += y_adj[out_scalars.offset + k]
+            * layer.gate_scalar_cst
+            * (gate_identity_mode ? 1.0 : silu_deriv(x[nonlin_scalars.offset + k]));
+    }
+
+    int gate_offset = nonlin_scalars.offset + out_scalars.mul;
+    int gate_idx = 0;
+    if (layer.nonlin_parts.size() != layer.target_parts.size()) {
+        throw std::runtime_error("RRNLB gate reverse irreps metadata size mismatch.");
+    }
+    for (size_t p = 1; p < layer.target_parts.size(); ++p) {
+        const auto& out_part = layer.target_parts[p];
+        const auto& in_part = layer.nonlin_parts[p];
+        if (in_part.l != out_part.l || in_part.mul != out_part.mul) {
+            throw std::runtime_error("RRNLB gate reverse non-scalar metadata is inconsistent.");
+        }
+        const double cst = gate_idx < static_cast<int>(layer.gate_gate_cst.size())
+            ? layer.gate_gate_cst[gate_idx]
+            : 1.0;
+        const int ir_dim = 2 * out_part.l + 1;
+        for (int k = 0; k < out_part.mul; ++k) {
+            const double gate_x = x[gate_offset + k];
+            const double sig = sigmoid(gate_x);
+            const double g = gate_identity_mode ? cst : cst * sig;
+            double d_g = 0.0;
+            for (int m = 0; m < ir_dim; ++m) {
+                const int out_idx = out_part.offset + k * ir_dim + m;
+                const int in_idx = in_part.offset + k * ir_dim + m;
+                x_adj[in_idx] += y_adj[out_idx] * g;
+                if (!gate_identity_mode) {
+                    d_g += y_adj[out_idx] * x[in_idx];
+                }
+            }
+            if (!gate_identity_mode) {
+                x_adj[gate_offset + k] += d_g * cst * sig * (1.0 - sig);
+            }
+        }
+        gate_offset += out_part.mul;
+        gate_idx += 1;
+    }
+}
+
+void MACE::compute_rrnlb_interaction_layer_forward(
+    const int layer_index,
+    const int num_nodes,
+    std::span<const int> node_types,
+    std::span<const int> num_neigh,
+    std::span<const int> neigh_indices,
+    std::span<const int> neigh_types,
+    std::span<const double> r,
+    std::span<const double> node_feats_in,
+    std::vector<double>& layer_output,
+    std::vector<double>& layer_skip,
+    RRNLBLayerCache* cache,
+    int num_sender_nodes,
+    std::span<const int> target_node_indices)
+{
+    auto& layer = rrnlb_layers[layer_index];
+    const int in_dim = layer.linear_up.dim_in;
+    const int sender_nodes = (num_sender_nodes > 0) ? num_sender_nodes : num_nodes;
+    if (static_cast<int>(node_feats_in.size()) != sender_nodes * in_dim) {
+        throw std::runtime_error("RRNLB layer input has unexpected size.");
+    }
+    if (!target_node_indices.empty() && static_cast<int>(target_node_indices.size()) != num_nodes) {
+        throw std::runtime_error("RRNLB layer target index map has unexpected size.");
+    }
+
+    auto target_sender = [&](const int i) -> int {
+        if (target_node_indices.empty()) return i;
+        return target_node_indices[i];
+    };
+
+    std::vector<double> h_up(sender_nodes * layer.linear_up.dim_out);
+    std::vector<double> h_res(num_nodes * layer.linear_res.dim_out);
+    layer_skip.resize(num_nodes * layer.skip_tp.dim_out);
+    for (int s = 0; s < sender_nodes; ++s) {
+        auto x_s = std::span<const double>(node_feats_in.data() + s * in_dim, in_dim);
+        auto up_s = std::span<double>(h_up.data() + s * layer.linear_up.dim_out, layer.linear_up.dim_out);
+        apply_rrnlb_linear(layer.linear_up, x_s, up_s);
+    }
+    for (int i = 0; i < num_nodes; ++i) {
+        const int sender_i = target_sender(i);
+        if (sender_i < 0 || sender_i >= sender_nodes) {
+            throw std::runtime_error("RRNLB layer target index is out of bounds.");
+        }
+        auto x_i = std::span<const double>(node_feats_in.data() + sender_i * in_dim, in_dim);
+        auto up_i = std::span<const double>(h_up.data() + sender_i * layer.linear_up.dim_out, layer.linear_up.dim_out);
+        auto res_i = std::span<double>(h_res.data() + i * layer.linear_res.dim_out, layer.linear_res.dim_out);
+        auto skip_i = std::span<double>(layer_skip.data() + i * layer.skip_tp.dim_out, layer.skip_tp.dim_out);
+        apply_rrnlb_linear(layer.linear_res, up_i, res_i);
+        apply_rrnlb_linear(layer.skip_tp, x_i, skip_i);
+    }
+
+    std::vector<double> conv_accum(num_nodes * layer.linear_1.dim_in, 0.0);
+    std::vector<double> density(num_nodes, 0.0);
+    std::vector<double> tp_values(layer.tp_weight_numel, 0.0);
+
+    int ij = 0;
+    for (int i = 0; i < num_nodes; ++i) {
+        for (int j = 0; j < num_neigh[i]; ++j) {
+            const int sender = neigh_indices[ij];
+            if (sender < 0 || sender >= sender_nodes) {
+                throw std::runtime_error("RRNLB layer sender index is out of bounds.");
+            }
+            const int type_src = neigh_types[ij];
+            const int type_tgt = node_types[i];
+            const int pair_index = type_src * num_elements + type_tgt;
+            if (pair_index < 0 || pair_index >= static_cast<int>(layer.tp_splines.size())) {
+                throw std::runtime_error("RRNLB pair index is out of bounds.");
+            }
+            layer.tp_splines[pair_index]->evaluate(r[ij], tp_values);
+            density[i] += layer.density_splines[pair_index].evaluate(r[ij]);
+            const auto Y_ij = Y.data() + ij * num_lm;
+
+            auto conv_i = conv_accum.data() + i * layer.linear_1.dim_in;
+            auto up_sender = h_up.data() + sender * layer.linear_up.dim_out;
+            for (const auto& ins : layer.conv_instructions) {
+                const auto& in_part = layer.edge_parts[ins.i_in1];
+                const auto& out_part = layer.linear_1.parts_in[ins.i_out];
+                auto conv_i_out = conv_i + out_part.offset;
+                auto up_sender_in = up_sender + in_part.offset;
+                const int in_ir_dim = 2 * in_part.l + 1;
+                const int out_ir_dim = 2 * out_part.l + 1;
+                for (const auto& term : ins.terms) {
+                    const double c = term.coeff * Y_ij[term.y_lm];
+                    for (int k = 0; k < ins.mul; ++k) {
+                        conv_i_out[k * out_ir_dim + term.m_out] += c
+                            * tp_values[ins.weight_offset + k]
+                            * up_sender_in[k * in_ir_dim + term.m_in1];
+                    }
+                }
+            }
+            ij += 1;
+        }
+    }
+
+    std::vector<double> lin1_raw(num_nodes * layer.linear_1.dim_out);
+    std::vector<double> pre_gate(num_nodes * layer.linear_1.dim_out);
+    std::vector<double> gated(num_nodes * layer.linear_2.dim_in);
+    layer_output.resize(num_nodes * layer.linear_2.dim_out);
+    for (int i = 0; i < num_nodes; ++i) {
+        auto conv_i = std::span<const double>(
+            conv_accum.data() + i * layer.linear_1.dim_in, layer.linear_1.dim_in);
+        auto lin1_raw_i = std::span<double>(
+            lin1_raw.data() + i * layer.linear_1.dim_out, layer.linear_1.dim_out);
+        auto pre_gate_i = std::span<double>(
+            pre_gate.data() + i * layer.linear_1.dim_out, layer.linear_1.dim_out);
+        auto res_i = std::span<const double>(
+            h_res.data() + i * layer.linear_res.dim_out, layer.linear_res.dim_out);
+        auto gated_i = std::span<double>(
+            gated.data() + i * layer.linear_2.dim_in, layer.linear_2.dim_in);
+        auto out_i = std::span<double>(
+            layer_output.data() + i * layer.linear_2.dim_out, layer.linear_2.dim_out);
+
+        apply_rrnlb_linear(layer.linear_1, conv_i, lin1_raw_i);
+        const double denom = density[i] * layer.beta + layer.alpha;
+        for (int p = 0; p < layer.linear_1.dim_out; ++p) {
+            pre_gate_i[p] = lin1_raw_i[p] / denom + res_i[p];
+        }
+        apply_rrnlb_gate(layer, pre_gate_i, gated_i);
+        apply_rrnlb_linear(layer.linear_2, gated_i, out_i);
+    }
+
+    if (cache != nullptr) {
+        cache->h_up = std::move(h_up);
+        cache->density = std::move(density);
+        cache->lin1_raw = std::move(lin1_raw);
+        cache->pre_gate = std::move(pre_gate);
+    }
+}
+
+void MACE::reverse_rrnlb_interaction_layer(
+    const int layer_index,
+    const int num_nodes,
+    std::span<const int> node_types,
+    std::span<const int> num_neigh,
+    std::span<const int> neigh_indices,
+    std::span<const int> neigh_types,
+    std::span<const double> xyz,
+    std::span<const double> r,
+    std::span<const double> node_feats_in,
+    const RRNLBLayerCache& cache,
+    std::span<const double> layer_output_adj,
+    std::span<const double> layer_skip_adj,
+    std::span<double> node_feats_in_adj,
+    int num_sender_nodes,
+    std::span<const int> target_node_indices)
+{
+    auto& layer = rrnlb_layers[layer_index];
+    const int in_dim = layer.linear_up.dim_in;
+    const int sender_nodes = (num_sender_nodes > 0) ? num_sender_nodes : num_nodes;
+    if (static_cast<int>(node_feats_in.size()) != sender_nodes * in_dim) {
+        throw std::runtime_error("RRNLB reverse layer input has unexpected size.");
+    }
+    if (static_cast<int>(node_feats_in_adj.size()) != sender_nodes * in_dim) {
+        throw std::runtime_error("RRNLB reverse layer input adjoint has unexpected size.");
+    }
+    if (!target_node_indices.empty() && static_cast<int>(target_node_indices.size()) != num_nodes) {
+        throw std::runtime_error("RRNLB reverse layer target index map has unexpected size.");
+    }
+    if (static_cast<int>(layer_output_adj.size()) != num_nodes * layer.linear_2.dim_out) {
+        throw std::runtime_error("RRNLB reverse layer output adjoint has unexpected size.");
+    }
+    if (static_cast<int>(layer_skip_adj.size()) != num_nodes * layer.skip_tp.dim_out) {
+        throw std::runtime_error("RRNLB reverse layer skip adjoint has unexpected size.");
+    }
+    if (static_cast<int>(cache.h_up.size()) != sender_nodes * layer.linear_up.dim_out
+        || static_cast<int>(cache.density.size()) != num_nodes
+        || static_cast<int>(cache.lin1_raw.size()) != num_nodes * layer.linear_1.dim_out
+        || static_cast<int>(cache.pre_gate.size()) != num_nodes * layer.linear_1.dim_out) {
+        throw std::runtime_error("RRNLB reverse layer cache has unexpected size.");
+    }
+
+    auto target_sender = [&](const int i) -> int {
+        if (target_node_indices.empty()) return i;
+        return target_node_indices[i];
+    };
+
+    std::fill(node_feats_in_adj.begin(), node_feats_in_adj.end(), 0.0);
+
+    std::vector<double> gated_adj(num_nodes * layer.linear_2.dim_in, 0.0);
+    std::vector<double> pre_gate_adj(num_nodes * layer.linear_1.dim_out, 0.0);
+    std::vector<double> lin1_raw_adj(num_nodes * layer.linear_1.dim_out, 0.0);
+    std::vector<double> h_res_adj(num_nodes * layer.linear_res.dim_out, 0.0);
+    std::vector<double> conv_adj(num_nodes * layer.linear_1.dim_in, 0.0);
+    std::vector<double> h_up_adj(sender_nodes * layer.linear_up.dim_out, 0.0);
+    std::vector<double> density_adj(num_nodes, 0.0);
+
+    for (int i = 0; i < num_nodes; ++i) {
+        auto out_adj_i = std::span<const double>(
+            layer_output_adj.data() + i * layer.linear_2.dim_out, layer.linear_2.dim_out);
+        auto gated_adj_i = std::span<double>(
+            gated_adj.data() + i * layer.linear_2.dim_in, layer.linear_2.dim_in);
+        apply_rrnlb_linear_transpose(layer.linear_2, out_adj_i, gated_adj_i);
+
+        auto pre_gate_i = std::span<const double>(
+            cache.pre_gate.data() + i * layer.linear_1.dim_out, layer.linear_1.dim_out);
+        auto pre_gate_adj_i = std::span<double>(
+            pre_gate_adj.data() + i * layer.linear_1.dim_out, layer.linear_1.dim_out);
+        apply_rrnlb_gate_reverse(layer, pre_gate_i, gated_adj_i, pre_gate_adj_i);
+
+        const auto lin1_raw_i = std::span<const double>(
+            cache.lin1_raw.data() + i * layer.linear_1.dim_out, layer.linear_1.dim_out);
+        auto lin1_raw_adj_i = std::span<double>(
+            lin1_raw_adj.data() + i * layer.linear_1.dim_out, layer.linear_1.dim_out);
+        auto h_res_adj_i = std::span<double>(
+            h_res_adj.data() + i * layer.linear_res.dim_out, layer.linear_res.dim_out);
+        const double denom = cache.density[i] * layer.beta + layer.alpha;
+        for (int p = 0; p < layer.linear_1.dim_out; ++p) {
+            lin1_raw_adj_i[p] += pre_gate_adj_i[p] / denom;
+            h_res_adj_i[p] += pre_gate_adj_i[p];
+            density_adj[i] +=
+                pre_gate_adj_i[p] * (-layer.beta * lin1_raw_i[p] / (denom * denom));
+        }
+    }
+
+    for (int i = 0; i < num_nodes; ++i) {
+        const int sender_i = target_sender(i);
+        if (sender_i < 0 || sender_i >= sender_nodes) {
+            throw std::runtime_error("RRNLB reverse layer target index is out of bounds.");
+        }
+        auto h_res_adj_i = std::span<const double>(
+            h_res_adj.data() + i * layer.linear_res.dim_out, layer.linear_res.dim_out);
+        auto h_up_adj_i = std::span<double>(
+            h_up_adj.data() + sender_i * layer.linear_up.dim_out, layer.linear_up.dim_out);
+        apply_rrnlb_linear_transpose(layer.linear_res, h_res_adj_i, h_up_adj_i);
+    }
+
+    for (int i = 0; i < num_nodes; ++i) {
+        auto lin1_raw_adj_i = std::span<const double>(
+            lin1_raw_adj.data() + i * layer.linear_1.dim_out, layer.linear_1.dim_out);
+        auto conv_adj_i = std::span<double>(
+            conv_adj.data() + i * layer.linear_1.dim_in, layer.linear_1.dim_in);
+        apply_rrnlb_linear_transpose(layer.linear_1, lin1_raw_adj_i, conv_adj_i);
+    }
+
+    std::vector<double> tp_values(layer.tp_weight_numel, 0.0);
+    std::vector<double> tp_derivs(layer.tp_weight_numel, 0.0);
+    std::vector<double> y_adj(num_lm, 0.0);
+    int ij = 0;
+    for (int i = 0; i < num_nodes; ++i) {
+        for (int j = 0; j < num_neigh[i]; ++j) {
+            const int sender = neigh_indices[ij];
+            if (sender < 0 || sender >= sender_nodes) {
+                throw std::runtime_error("RRNLB reverse layer sender index is out of bounds.");
+            }
+            const int type_src = neigh_types[ij];
+            const int type_tgt = node_types[i];
+            const int pair_index = type_src * num_elements + type_tgt;
+            if (pair_index < 0 || pair_index >= static_cast<int>(layer.tp_splines.size())) {
+                throw std::runtime_error("RRNLB reverse pair index is out of bounds.");
+            }
+            layer.tp_splines[pair_index]->evaluate_derivs(r[ij], tp_values, tp_derivs);
+            auto [edge_density_value, edge_density_deriv] =
+                layer.density_splines[pair_index].evaluate_deriv(r[ij]);
+            (void)edge_density_value;
+            std::fill(y_adj.begin(), y_adj.end(), 0.0);
+            double dE_dr = density_adj[i] * edge_density_deriv;
+
+            const auto* y_ij = Y.data() + ij * num_lm;
+            auto* conv_adj_i = conv_adj.data() + i * layer.linear_1.dim_in;
+            auto* h_up_sender_adj = h_up_adj.data() + sender * layer.linear_up.dim_out;
+            const auto* h_up_sender = cache.h_up.data() + sender * layer.linear_up.dim_out;
+            for (const auto& ins : layer.conv_instructions) {
+                const auto& in_part = layer.edge_parts[ins.i_in1];
+                const auto& out_part = layer.linear_1.parts_in[ins.i_out];
+                auto* conv_adj_i_out = conv_adj_i + out_part.offset;
+                auto* h_up_sender_adj_in = h_up_sender_adj + in_part.offset;
+                const auto* h_up_sender_in = h_up_sender + in_part.offset;
+                const int in_ir_dim = 2 * in_part.l + 1;
+                const int out_ir_dim = 2 * out_part.l + 1;
+                for (const auto& term : ins.terms) {
+                    const int y_lm = term.y_lm;
+                    const double y_lm_value = y_ij[y_lm];
+                    for (int k = 0; k < ins.mul; ++k) {
+                        const int out_idx = k * out_ir_dim + term.m_out;
+                        const int in_idx = k * in_ir_dim + term.m_in1;
+                        const int w_idx = ins.weight_offset + k;
+                        const double upstream = conv_adj_i_out[out_idx];
+                        const double tp_val = tp_values[w_idx];
+                        const double up_val = h_up_sender_in[in_idx];
+                        const double coeff = term.coeff;
+                        const double coeff_upstream = upstream * coeff;
+                        h_up_sender_adj_in[in_idx] += coeff_upstream * y_lm_value * tp_val;
+                        y_adj[y_lm] += coeff_upstream * tp_val * up_val;
+                        dE_dr += coeff_upstream * y_lm_value * up_val * tp_derivs[w_idx];
+                    }
+                }
+            }
+
+            const auto* xyz_ij = xyz.data() + 3 * ij;
+            auto* node_forces_ij = node_forces.data() + 3 * ij;
+            const auto* y_grad_ij = Y_grad.data() + ij * 3 * num_lm;
+            double dE_dxyz_x = dE_dr * xyz_ij[0] / r[ij];
+            double dE_dxyz_y = dE_dr * xyz_ij[1] / r[ij];
+            double dE_dxyz_z = dE_dr * xyz_ij[2] / r[ij];
+            for (int lm = 0; lm < num_lm; ++lm) {
+                dE_dxyz_x += y_adj[lm] * y_grad_ij[lm];
+                dE_dxyz_y += y_adj[lm] * y_grad_ij[num_lm + lm];
+                dE_dxyz_z += y_adj[lm] * y_grad_ij[2 * num_lm + lm];
+            }
+            node_forces_ij[0] += -dE_dxyz_x;
+            node_forces_ij[1] += -dE_dxyz_y;
+            node_forces_ij[2] += -dE_dxyz_z;
+            ij += 1;
+        }
+    }
+
+    for (int i = 0; i < num_nodes; ++i) {
+        const int sender_i = target_sender(i);
+        if (sender_i < 0 || sender_i >= sender_nodes) {
+            throw std::runtime_error("RRNLB reverse layer target index is out of bounds.");
+        }
+        auto skip_adj_i = std::span<const double>(
+            layer_skip_adj.data() + i * layer.skip_tp.dim_out, layer.skip_tp.dim_out);
+        auto x_adj_i = std::span<double>(
+            node_feats_in_adj.data() + sender_i * in_dim, in_dim);
+        apply_rrnlb_linear_transpose(layer.skip_tp, skip_adj_i, x_adj_i);
+    }
+
+    std::vector<double> x_up_adj_tmp(in_dim, 0.0);
+    for (int i = 0; i < sender_nodes; ++i) {
+        auto h_up_adj_i = std::span<const double>(
+            h_up_adj.data() + i * layer.linear_up.dim_out, layer.linear_up.dim_out);
+        auto x_up_adj_i_span = std::span<double>(x_up_adj_tmp.data(), in_dim);
+        apply_rrnlb_linear_transpose(layer.linear_up, h_up_adj_i, x_up_adj_i_span);
+        auto x_adj_i = std::span<double>(
+            node_feats_in_adj.data() + i * in_dim, in_dim);
+        for (int p = 0; p < in_dim; ++p) {
+            x_adj_i[p] += x_up_adj_tmp[p];
+        }
+    }
+}
+
+void MACE::compute_rrnlb_forward(
+    const int num_nodes,
+    std::span<const int> node_types,
+    std::span<const int> num_neigh,
+    std::span<const int> neigh_indices,
+    std::span<const int> neigh_types,
+    std::span<const double> xyz,
+    std::span<const double> r)
+{
+    if (rrnlb_layers.size() != 2) {
+        throw std::runtime_error("RRNLB forward currently expects exactly 2 interaction layers.");
+    }
+    if (static_cast<int>(node_embedding_species_values.size()) != num_elements * num_channels) {
+        throw std::runtime_error("RRNLB node embedding table has unexpected size.");
+    }
+    if (product_linear_0.dim_in != num_LM * num_channels) {
+        throw std::runtime_error("RRNLB product linear 0 input dimension mismatch.");
+    }
+    if (product_linear_1.dim_in != num_channels) {
+        throw std::runtime_error("RRNLB product linear 1 input dimension mismatch.");
+    }
+    if (product_linear_0.dim_out != rrnlb_layers[0].skip_tp.dim_out) {
+        throw std::runtime_error("RRNLB product 0/skip0 dimensions are inconsistent.");
+    }
+    if (product_linear_1.dim_out != rrnlb_layers[1].skip_tp.dim_out) {
+        throw std::runtime_error("RRNLB product 1/skip1 dimensions are inconsistent.");
+    }
+    if (static_cast<int>(readout_1_weights.size()) != num_channels) {
+        throw std::runtime_error("RRNLB readout_1_weights has unexpected length.");
+    }
+    if (num_nodes == 0) {
+        return;
+    }
+
+    std::vector<double> node_embed(num_nodes * num_channels);
+    for (int i = 0; i < num_nodes; ++i) {
+        const int t = node_types[i];
+        const auto* src = node_embedding_species_values.data() + t * num_channels;
+        std::copy(src, src + num_channels, node_embed.begin() + i * num_channels);
+    }
+
+    RRNLBLayerCache layer0_cache;
+    RRNLBLayerCache layer1_cache;
+
+    std::vector<double> interaction0_out, skip0;
+    compute_rrnlb_interaction_layer_forward(
+        0,
+        num_nodes,
+        node_types,
+        num_neigh,
+        neigh_indices,
+        neigh_types,
+        r,
+        node_embed,
+        interaction0_out,
+        skip0,
+        &layer0_cache);
+    if (static_cast<int>(interaction0_out.size()) != num_nodes * rrnlb_layers[0].linear_2.dim_out) {
+        throw std::runtime_error("RRNLB layer0 interaction output has unexpected size.");
+    }
+    compute_rrnlb_M0(
+        num_nodes,
+        node_types,
+        interaction0_out,
+        rrnlb_layers[0].linear_2.parts_out);
+
+    rrnlb_node_feats_0.resize(num_nodes * product_linear_0.dim_out);
+    for (int i = 0; i < num_nodes; ++i) {
+        auto m0_i = std::span<const double>(M0.data() + i * product_linear_0.dim_in, product_linear_0.dim_in);
+        auto feat_i = std::span<double>(
+            rrnlb_node_feats_0.data() + i * product_linear_0.dim_out, product_linear_0.dim_out);
+        apply_rrnlb_linear(product_linear_0, m0_i, feat_i);
+        auto sc_i = skip0.data() + i * product_linear_0.dim_out;
+        for (int j = 0; j < product_linear_0.dim_out; ++j) {
+            feat_i[j] += sc_i[j];
+        }
+    }
+
+    std::vector<double> interaction1_out, skip1;
+    compute_rrnlb_interaction_layer_forward(
+        1,
+        num_nodes,
+        node_types,
+        num_neigh,
+        neigh_indices,
+        neigh_types,
+        r,
+        rrnlb_node_feats_0,
+        interaction1_out,
+        skip1,
+        &layer1_cache);
+    if (static_cast<int>(interaction1_out.size()) != num_nodes * rrnlb_layers[1].linear_2.dim_out) {
+        throw std::runtime_error("RRNLB layer1 interaction output has unexpected size.");
+    }
+    compute_rrnlb_M1(
+        num_nodes,
+        node_types,
+        interaction1_out,
+        rrnlb_layers[1].linear_2.parts_out);
+
+    rrnlb_node_feats_1.resize(num_nodes * product_linear_1.dim_out);
+    for (int i = 0; i < num_nodes; ++i) {
+        auto m1_i = std::span<const double>(M1.data() + i * product_linear_1.dim_in, product_linear_1.dim_in);
+        auto feat_i = std::span<double>(
+            rrnlb_node_feats_1.data() + i * product_linear_1.dim_out, product_linear_1.dim_out);
+        apply_rrnlb_linear(product_linear_1, m1_i, feat_i);
+        auto sc_i = skip1.data() + i * product_linear_1.dim_out;
+        for (int j = 0; j < product_linear_1.dim_out; ++j) {
+            feat_i[j] += sc_i[j];
+        }
+    }
+
+    std::vector<double> feat0_adj(num_nodes * product_linear_0.dim_out, 0.0);
+    std::vector<double> feat1_adj(num_nodes * product_linear_1.dim_out, 0.0);
+    for (int i = 0; i < num_nodes; ++i) {
+        node_energies[i] += atomic_energies[node_types[i]];
+        auto feat0_i = rrnlb_node_feats_0.data() + i * product_linear_0.dim_out;
+        for (int k = 0; k < num_channels; ++k) {
+            node_energies[i] += readout_1_weights[k] * feat0_i[k];
+            feat0_adj[i * product_linear_0.dim_out + k] += readout_1_weights[k];
+        }
+        auto feat1_i = rrnlb_node_feats_1.data() + i * product_linear_1.dim_out;
+        auto x = std::vector<double>(feat1_i, feat1_i + product_linear_1.dim_out);
+        auto [f, g] = readout_2->evaluate_gradient(x);
+        node_energies[i] += f[0];
+        for (int k = 0; k < product_linear_1.dim_out; ++k) {
+            feat1_adj[i * product_linear_1.dim_out + k] += g[k];
+        }
+    }
+
+    std::vector<double> skip1_adj = feat1_adj;
+    M1_adj.assign(num_nodes * product_linear_1.dim_in, 0.0);
+    for (int i = 0; i < num_nodes; ++i) {
+        auto feat1_adj_i = std::span<const double>(
+            feat1_adj.data() + i * product_linear_1.dim_out, product_linear_1.dim_out);
+        auto m1_adj_i = std::span<double>(M1_adj.data() + i * product_linear_1.dim_in, product_linear_1.dim_in);
+        apply_rrnlb_linear_transpose(product_linear_1, feat1_adj_i, m1_adj_i);
+    }
+    std::vector<double> interaction1_adj(num_nodes * rrnlb_layers[1].linear_2.dim_out, 0.0);
+    reverse_rrnlb_M1(
+        num_nodes,
+        node_types,
+        rrnlb_layers[1].linear_2.parts_out,
+        interaction1_adj);
+    std::vector<double> feat0_from_layer1_adj(rrnlb_node_feats_0.size(), 0.0);
+    reverse_rrnlb_interaction_layer(
+        1,
+        num_nodes,
+        node_types,
+        num_neigh,
+        neigh_indices,
+        neigh_types,
+        xyz,
+        r,
+        rrnlb_node_feats_0,
+        layer1_cache,
+        interaction1_adj,
+        skip1_adj,
+        feat0_from_layer1_adj);
+    for (int i = 0; i < static_cast<int>(feat0_adj.size()); ++i) {
+        feat0_adj[i] += feat0_from_layer1_adj[i];
+    }
+
+    std::vector<double> skip0_adj = feat0_adj;
+    M0_adj.assign(num_nodes * product_linear_0.dim_in, 0.0);
+    for (int i = 0; i < num_nodes; ++i) {
+        auto feat0_adj_i = std::span<const double>(
+            feat0_adj.data() + i * product_linear_0.dim_out, product_linear_0.dim_out);
+        auto m0_adj_i = std::span<double>(M0_adj.data() + i * product_linear_0.dim_in, product_linear_0.dim_in);
+        apply_rrnlb_linear_transpose(product_linear_0, feat0_adj_i, m0_adj_i);
+    }
+    std::vector<double> interaction0_adj(num_nodes * rrnlb_layers[0].linear_2.dim_out, 0.0);
+    reverse_rrnlb_M0(
+        num_nodes,
+        node_types,
+        rrnlb_layers[0].linear_2.parts_out,
+        interaction0_adj);
+    std::vector<double> node_embed_adj(node_embed.size(), 0.0);
+    reverse_rrnlb_interaction_layer(
+        0,
+        num_nodes,
+        node_types,
+        num_neigh,
+        neigh_indices,
+        neigh_types,
+        xyz,
+        r,
+        node_embed,
+        layer0_cache,
+        interaction0_adj,
+        skip0_adj,
+        node_embed_adj);
+}
+
 void MACE::load_from_json(
     const std::string filename)
 {
     std::ifstream f(filename);
     nlohmann::json file = nlohmann::json::parse(f);
+    const std::string interaction_mode = file.value("interaction_mode", "legacy");
+    interaction_mode_rrnlb = false;
+    if (interaction_mode == "rrnlb") {
+        interaction_mode_rrnlb = true;
+
+        // Basic model information
+        num_elements = file["num_elements"];
+        num_channels = file["num_channels"];
+        r_cut = file["r_cut"];
+        l_max = file["l_max"];
+        num_lm = (l_max + 1) * (l_max + 1);
+        L_max = file["L_max"];
+        num_LM = (L_max + 1) * (L_max + 1);
+        atomic_numbers = file["atomic_numbers"].get<std::vector<int>>();
+        atomic_energies = file["atomic_energies"].get<std::vector<double>>();
+
+        // ZBL
+        has_zbl = file["has_zbl"].get<bool>();
+        if (has_zbl) {
+            zbl = ZBL(
+                file["zbl_a_exp"].get<double>(),
+                file["zbl_a_prefactor"].get<double>(),
+                file["zbl_c"].get<std::vector<double>>(),
+                file["zbl_covalent_radii"].get<std::vector<double>>(),
+                file["zbl_p"].get<int>());
+        }
+
+        if (!file.contains("node_embedding_species_values")) {
+            throw std::runtime_error(
+                "RRNLB JSON is missing 'node_embedding_species_values'.");
+        }
+        if (file["node_embedding_species_values"].size() != atomic_numbers.size()) {
+            throw std::runtime_error(
+                "RRNLB node embedding table size does not match number of elements.");
+        }
+        node_embedding_species_values.clear();
+        for (const auto& v : file["node_embedding_species_values"]) {
+            auto row = v.get<std::vector<double>>();
+            if (static_cast<int>(row.size()) != num_channels) {
+                throw std::runtime_error(
+                    "RRNLB node embedding row has unexpected size.");
+            }
+            node_embedding_species_values.insert(
+                node_embedding_species_values.end(), row.begin(), row.end());
+        }
+
+        if (!file.contains("product_linears")) {
+            throw std::runtime_error("RRNLB JSON is missing 'product_linears'.");
+        }
+        product_linear_0 = parse_rrnlb_linear(file["product_linears"]["layer0"]);
+        product_linear_1 = parse_rrnlb_linear(file["product_linears"]["layer1"]);
+
+        if (!file.contains("interaction_layers") || !file["interaction_layers"].is_array()) {
+            throw std::runtime_error(
+                "RRNLB JSON is missing required 'interaction_layers' array.");
+        }
+        const auto& interaction_layers = file["interaction_layers"];
+        if (interaction_layers.size() != 2) {
+            throw std::runtime_error(
+                "RRNLB JSON currently expects exactly 2 interaction layers.");
+        }
+        rrnlb_layers.clear();
+        rrnlb_layers.reserve(interaction_layers.size());
+        for (const auto& layer_json : interaction_layers) {
+            RRNLBLayer layer;
+            layer.alpha = layer_json.at("alpha").get<double>();
+            layer.beta = layer_json.at("beta").get<double>();
+            layer.avg_num_neighbors = layer_json.at("avg_num_neighbors").get<double>();
+            layer.tp_weight_numel = layer_json.at("conv_tp").at("weight_numel").get<int>();
+
+            layer.linear_up = parse_rrnlb_linear(layer_json.at("linears").at("linear_up"));
+            layer.linear_res = parse_rrnlb_linear(layer_json.at("linears").at("linear_res"));
+            layer.linear_1 = parse_rrnlb_linear(layer_json.at("linears").at("linear_1"));
+            layer.linear_2 = parse_rrnlb_linear(layer_json.at("linears").at("linear_2"));
+            layer.skip_tp = parse_rrnlb_linear(layer_json.at("linears").at("skip_tp"));
+            layer.edge_parts = layer.linear_up.parts_out;
+            layer.target_parts = layer.linear_2.parts_in;
+            layer.nonlin_parts = layer.linear_1.parts_out;
+
+            if (layer_json.at("gate").contains("scalar_activation_details")) {
+                auto scalar_details = layer_json.at("gate").at("scalar_activation_details");
+                if (!scalar_details.empty()) {
+                    layer.gate_scalar_cst = scalar_details.at(0).at("cst").get<double>();
+                }
+            }
+            if (layer_json.at("gate").contains("gate_activation_details")) {
+                for (const auto& gate_act : layer_json.at("gate").at("gate_activation_details")) {
+                    layer.gate_gate_cst.push_back(gate_act.at("cst").get<double>());
+                }
+            }
+
+            if (!layer_json.at("conv_tp").contains("cg_maps")) {
+                throw std::runtime_error("RRNLB JSON is missing conv_tp cg_maps.");
+            }
+            for (const auto& cg_map : layer_json.at("conv_tp").at("cg_maps")) {
+                RRNLBConvInstruction ins;
+                ins.i_in1 = cg_map.at("i_in1").get<int>();
+                ins.i_in2 = cg_map.at("i_in2").get<int>();
+                ins.i_out = cg_map.at("i_out").get<int>();
+                ins.mul = cg_map.at("mul").get<int>();
+                ins.weight_offset = cg_map.at("weight_offset").get<int>();
+                ins.l_in1 = cg_map.at("l_in1").get<int>();
+                ins.l_in2 = cg_map.at("l_in2").get<int>();
+                ins.l_out = cg_map.at("l_out").get<int>();
+                for (const auto& term_json : cg_map.at("terms")) {
+                    RRNLBConvTerm term;
+                    term.m_out = term_json.at("m_out").get<int>();
+                    term.m_in1 = term_json.at("m_in1").get<int>();
+                    term.y_lm = term_json.at("y_lm").get<int>();
+                    term.coeff = term_json.at("coeff").get<double>();
+                    ins.terms.push_back(term);
+                }
+                if (ins.weight_offset < 0
+                    || ins.weight_offset + ins.mul > layer.tp_weight_numel) {
+                    throw std::runtime_error("RRNLB conv instruction has invalid weight range.");
+                }
+                layer.conv_instructions.push_back(std::move(ins));
+            }
+
+            const auto& radial = layer_json.at("radial");
+            const double spline_h = radial.at("spline_h").get<double>();
+            auto tp_values = radial.at("tp_weights_values").get<std::vector<std::vector<std::vector<double>>>>();
+            auto tp_derivs = radial.at("tp_weights_derivs").get<std::vector<std::vector<std::vector<double>>>>();
+            if (tp_values.size() != tp_derivs.size()) {
+                throw std::runtime_error("RRNLB radial tp spline values/derivs mismatch.");
+            }
+            for (size_t p = 0; p < tp_values.size(); ++p) {
+                layer.tp_splines.push_back(
+                    std::make_unique<CubicSplineSet>(spline_h, tp_values[p], tp_derivs[p]));
+            }
+            auto dens_values = radial.at("edge_density_values").get<std::vector<std::vector<double>>>();
+            auto dens_derivs = radial.at("edge_density_derivs").get<std::vector<std::vector<double>>>();
+            if (dens_values.size() != dens_derivs.size()) {
+                throw std::runtime_error("RRNLB radial density spline values/derivs mismatch.");
+            }
+            for (size_t p = 0; p < dens_values.size(); ++p) {
+                layer.density_splines.emplace_back(spline_h, dens_values[p], dens_derivs[p]);
+            }
+            if (layer.tp_splines.size() != static_cast<size_t>(num_elements * num_elements)
+                || layer.density_splines.size() != static_cast<size_t>(num_elements * num_elements)) {
+                throw std::runtime_error(
+                    "RRNLB radial tables must contain ordered pairs for every element pair.");
+            }
+            rrnlb_layers.push_back(std::move(layer));
+        }
+
+        // M0
+        auto M0_weights = file["M0_weights"].get<std::map<std::string,std::map<std::string,std::map<std::string,std::vector<double>>>>>();
+        auto M0_monomials = file["M0_monomials"].get<std::map<std::string,std::vector<std::vector<int>>>>();
+        P0 = std::vector<MultivariatePolynomial>();
+        for (int a = 0; a < atomic_numbers.size(); ++a) {
+            for (int lm = 0; lm < num_LM; ++lm) {
+                for (int k = 0; k < num_channels; ++k) {
+                    P0.push_back(MultivariatePolynomial(
+                        num_lm,
+                        M0_weights[std::to_string(a)][std::to_string(lm)][std::to_string(k)],
+                        M0_monomials[std::to_string(lm)]));
+                }
+            }
+        }
+
+        // M1
+        auto M1_weights = file["M1_weights"].get<std::map<std::string,std::map<std::string,std::vector<double>>>>();
+        auto M1_monomials = file["M1_monomials"].get<std::vector<std::vector<int>>>();
+        P1 = std::vector<MultivariatePolynomial>();
+        for (int a = 0; a < atomic_numbers.size(); ++a) {
+            for (int k = 0; k < num_channels; ++k) {
+                P1.push_back(MultivariatePolynomial(
+                    num_lm,
+                    M1_weights[std::to_string(a)][std::to_string(k)],
+                    M1_monomials));
+            }
+        }
+
+        // Readouts
+        readout_1_weights = file["readout_1_weights"].get<std::vector<double>>();
+        auto readout_2_weights_1 = file["readout_2_weights_1"].get<std::vector<double>>();
+        auto readout_2_weights_2 = file["readout_2_weights_2"].get<std::vector<double>>();
+        readout_2 = std::make_unique<MultilayerPerceptron>(
+            std::vector<int>{num_channels, 16, 1},
+            std::vector<std::vector<double>>{readout_2_weights_1, readout_2_weights_2},
+            file["readout_2_scale_factor"]);
+        return;
+    }
+    if (interaction_mode != "legacy") {
+        throw std::runtime_error(
+            std::string("Unsupported interaction_mode '") + interaction_mode + "'.");
+    }
+    interaction_mode_rrnlb = false;
 
     // Basic model information
     num_elements = file["num_elements"];

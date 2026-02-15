@@ -1,5 +1,15 @@
 #include <fstream>
+#include <cmath>
 #include <numbers>
+#include <stdexcept>
+#include <cstdlib>
+#include <sstream>
+#include <type_traits>
+#include <mutex>
+#include <unordered_map>
+#include <limits>
+#include <algorithm>
+#include <cctype>
 
 // TODO: remove some of these headers?
 #include "KokkosBatched_Util.hpp"
@@ -11,6 +21,12 @@
 
 #include "tools_kokkos.hpp"
 #include "mace_kokkos.hpp"
+#include "mace.hpp"
+
+#if defined(KOKKOS_ENABLE_CUDA) && defined(SYMMETRIX_HAVE_CUBLAS)
+#include <cublas_v2.h>
+#include <cublasLt.h>
+#endif
 
 using Kokkos::ALL;
 using Kokkos::LayoutRight;
@@ -24,14 +40,1218 @@ using Kokkos::TeamVectorRange;
 using Kokkos::TeamVectorMDRange;
 using Kokkos::View;
 
+namespace {
+
+enum class RRNLBGroupPackedGemmMode {
+    Off,
+    On,
+    Auto
+};
+
+enum class RRNLBInteractionCompactMode {
+    Off,
+    On,
+    Auto
+};
+
+enum class RRNLBNonlinearAblationMode {
+    Off,
+    GateIdentity
+};
+
+auto rrnlb_nonlinear_ablation_mode() -> RRNLBNonlinearAblationMode
+{
+    static RRNLBNonlinearAblationMode mode = []() -> RRNLBNonlinearAblationMode {
+        const char* mode_env = std::getenv("SYMMETRIX_RRNLB_ABLATION");
+        if (mode_env == nullptr || mode_env[0] == '\0') {
+            return RRNLBNonlinearAblationMode::Off;
+        }
+        std::string mode(mode_env);
+        std::transform(
+            mode.begin(),
+            mode.end(),
+            mode.begin(),
+            [] (unsigned char c) { return static_cast<char>(std::tolower(c)); });
+        if (mode == "off") return RRNLBNonlinearAblationMode::Off;
+        if (mode == "gate_identity" || mode == "identity_gate") {
+            return RRNLBNonlinearAblationMode::GateIdentity;
+        }
+        std::ostringstream oss;
+        oss << "Unsupported SYMMETRIX_RRNLB_ABLATION mode '" << mode
+            << "'. Supported values: off, gate_identity.";
+        throw std::runtime_error(oss.str());
+    }();
+    return mode;
+}
+
+auto rrnlb_reverse_vector_length() -> int
+{
+    static int value = []() -> int {
+        const char* env = std::getenv("SYMMETRIX_RRNLB_REVERSE_VECTOR_LENGTH");
+        if (env == nullptr || env[0] == '\0') return 1;
+        int parsed = std::atoi(env);
+        if (parsed < 1) parsed = 1;
+        if (parsed > 32) parsed = 32;
+        return parsed;
+    }();
+    return value;
+}
+
+auto rrnlb_forward_vector_length() -> int
+{
+    static int value = []() -> int {
+        const char* env = std::getenv("SYMMETRIX_RRNLB_FORWARD_VECTOR_LENGTH");
+        if (env == nullptr || env[0] == '\0') return 1;
+        int parsed = std::atoi(env);
+        if (parsed < 1) parsed = 1;
+        if (parsed > 32) parsed = 32;
+        return parsed;
+    }();
+    return value;
+}
+
+auto rrnlb_group_packed_gemm_mode() -> RRNLBGroupPackedGemmMode
+{
+    static RRNLBGroupPackedGemmMode mode = []() -> RRNLBGroupPackedGemmMode {
+        const char* mode_env = std::getenv("SYMMETRIX_RRNLB_GROUP_PACKED_GEMM_MODE");
+        if (mode_env != nullptr && mode_env[0] != '\0') {
+            std::string mode(mode_env);
+            std::transform(
+                mode.begin(),
+                mode.end(),
+                mode.begin(),
+                [] (unsigned char c) { return static_cast<char>(std::tolower(c)); });
+            if (mode == "off") return RRNLBGroupPackedGemmMode::Off;
+            if (mode == "on") return RRNLBGroupPackedGemmMode::On;
+            if (mode == "auto") return RRNLBGroupPackedGemmMode::Auto;
+        }
+
+        // Backward-compatible fallback for older env knob.
+        const char* legacy_env = std::getenv("SYMMETRIX_RRNLB_GROUP_PACKED_GEMM");
+        if (legacy_env != nullptr) {
+            const bool legacy_on = legacy_env[0] != '\0' && legacy_env[0] != '0';
+            return legacy_on ? RRNLBGroupPackedGemmMode::On : RRNLBGroupPackedGemmMode::Off;
+        }
+
+        // New default: adaptive auto mode.
+        return RRNLBGroupPackedGemmMode::Auto;
+    }();
+    return mode;
+}
+
+auto rrnlb_group_packed_min_rows() -> int
+{
+    static int value = []() -> int {
+        const char* env = std::getenv("SYMMETRIX_RRNLB_GROUP_PACKED_MIN_ROWS");
+        if (env == nullptr || env[0] == '\0') return 1024;
+        int parsed = std::atoi(env);
+        if (parsed < 1) parsed = 1;
+        return parsed;
+    }();
+    return value;
+}
+
+auto rrnlb_group_packed_auto_should_run(
+    const int num_nodes,
+    const std::vector<int>& group_ir_dim,
+    const std::vector<int>& group_lhs_dim,
+    const std::vector<int>& group_rhs_dim) -> bool
+{
+    if (num_nodes <= 0) return false;
+    if (group_ir_dim.empty()) return false;
+    if (group_lhs_dim.size() != group_ir_dim.size()
+        || group_rhs_dim.size() != group_ir_dim.size()) {
+        return false;
+    }
+
+    const int min_rows = rrnlb_group_packed_min_rows();
+    int max_rows = 0;
+    long long total_work = 0;
+    for (int g = 0; g < static_cast<int>(group_ir_dim.size()); ++g) {
+        const int ir_dim = group_ir_dim[g];
+        const int lhs_dim = group_lhs_dim[g];
+        const int rhs_dim = group_rhs_dim[g];
+        if (ir_dim <= 0 || lhs_dim <= 0 || rhs_dim <= 0) continue;
+        const int rows = num_nodes * ir_dim;
+        max_rows = std::max(max_rows, rows);
+        const long long work = static_cast<long long>(rows) * lhs_dim * rhs_dim;
+        if (work > 0) {
+            if (total_work > std::numeric_limits<long long>::max() - work) {
+                total_work = std::numeric_limits<long long>::max();
+            } else {
+                total_work += work;
+            }
+        }
+    }
+    return max_rows >= min_rows && total_work > 0;
+}
+
+auto rrnlb_group_packed_should_run(
+    const int num_nodes,
+    const std::vector<int>& group_ir_dim,
+    const std::vector<int>& group_lhs_dim,
+    const std::vector<int>& group_rhs_dim) -> bool
+{
+    const auto mode = rrnlb_group_packed_gemm_mode();
+    if (mode == RRNLBGroupPackedGemmMode::Off) return false;
+    if (mode == RRNLBGroupPackedGemmMode::On) return true;
+    return rrnlb_group_packed_auto_should_run(
+        num_nodes, group_ir_dim, group_lhs_dim, group_rhs_dim);
+}
+
+auto rrnlb_group_packed_gemm_strict_enabled() -> bool
+{
+    static bool enabled = []() -> bool {
+        const char* env = std::getenv("SYMMETRIX_RRNLB_GROUP_PACKED_GEMM_STRICT");
+        if (env == nullptr) return false;
+        return env[0] != '\0' && env[0] != '0';
+    }();
+    return enabled;
+}
+
+auto rrnlb_interaction_compact_mode() -> RRNLBInteractionCompactMode
+{
+    static RRNLBInteractionCompactMode mode = []() -> RRNLBInteractionCompactMode {
+        const char* mode_env = std::getenv("SYMMETRIX_RRNLB_INTERACTION_COMPACT_MODE");
+        if (mode_env != nullptr && mode_env[0] != '\0') {
+            std::string mode(mode_env);
+            std::transform(
+                mode.begin(),
+                mode.end(),
+                mode.begin(),
+                [] (unsigned char c) { return static_cast<char>(std::tolower(c)); });
+            if (mode == "off") return RRNLBInteractionCompactMode::Off;
+            if (mode == "on") return RRNLBInteractionCompactMode::On;
+            if (mode == "auto") return RRNLBInteractionCompactMode::Auto;
+        }
+
+        // Backward-compatible fallback for older env knob.
+        const char* legacy_env = std::getenv("SYMMETRIX_RRNLB_INTERACTION_COMPACT");
+        if (legacy_env != nullptr) {
+            const bool legacy_on = legacy_env[0] != '\0' && legacy_env[0] != '0';
+            return legacy_on ? RRNLBInteractionCompactMode::On : RRNLBInteractionCompactMode::Off;
+        }
+
+        return RRNLBInteractionCompactMode::Auto;
+    }();
+    return mode;
+}
+
+auto rrnlb_group_packed_work_fits_int(
+    const int num_nodes,
+    const int ir_dim,
+    const int packed_width) -> bool
+{
+    if (num_nodes <= 0 || ir_dim <= 0 || packed_width <= 0) return false;
+    const long long work =
+        static_cast<long long>(num_nodes) * ir_dim * packed_width;
+    return work > 0 && work <= std::numeric_limits<int>::max();
+}
+
+#if defined(KOKKOS_ENABLE_CUDA) && defined(SYMMETRIX_HAVE_CUBLAS)
+auto rrnlb_cublas_tf32_enabled() -> bool
+{
+    static bool enabled = []() -> bool {
+        const char* env = std::getenv("SYMMETRIX_RRNLB_CUBLAS_TF32");
+        // Default-on for NVIDIA CUDA path; can be disabled explicitly with
+        // SYMMETRIX_RRNLB_CUBLAS_TF32=0 for diagnostic/validation runs.
+        if (env == nullptr) return true;
+        return env[0] != '\0' && env[0] != '0';
+    }();
+    return enabled;
+}
+
+auto rrnlb_cublaslt_strict_enabled() -> bool
+{
+    static bool enabled = []() -> bool {
+        const char* env = std::getenv("SYMMETRIX_RRNLB_CUBLASLT_STRICT");
+        if (env == nullptr) return false;
+        return env[0] != '\0' && env[0] != '0';
+    }();
+    return enabled;
+}
+
+auto rrnlb_get_cublas_handle() -> cublasHandle_t
+{
+    static cublasHandle_t handle = []() -> cublasHandle_t {
+        cublasHandle_t h = nullptr;
+        if (cublasCreate(&h) != CUBLAS_STATUS_SUCCESS) {
+            throw std::runtime_error("RRNLB cuBLAS init failed (cublasCreate).");
+        }
+        if (rrnlb_cublas_tf32_enabled()) {
+            cublasSetMathMode(h, CUBLAS_TF32_TENSOR_OP_MATH);
+        } else {
+            cublasSetMathMode(h, CUBLAS_DEFAULT_MATH);
+        }
+        return h;
+    }();
+    return handle;
+}
+
+auto rrnlb_get_cublaslt_handle() -> cublasLtHandle_t
+{
+    static cublasLtHandle_t handle = []() -> cublasLtHandle_t {
+        cublasLtHandle_t h = nullptr;
+        if (cublasLtCreate(&h) != CUBLAS_STATUS_SUCCESS) {
+            throw std::runtime_error("RRNLB cuBLASLt init failed (cublasLtCreate).");
+        }
+        return h;
+    }();
+    return handle;
+}
+
+auto rrnlb_throw_cublas_error(cublasStatus_t status, const char* where) -> void
+{
+    if (status == CUBLAS_STATUS_SUCCESS) return;
+    std::ostringstream oss;
+    oss << where << " failed with cuBLAS status " << static_cast<int>(status);
+    throw std::runtime_error(oss.str());
+}
+
+struct RRNLBCublasLtPlanKey {
+    int op_a = 0;
+    int op_b = 0;
+    int m = 0;
+    int n = 0;
+    int k = 0;
+    int lda = 0;
+    int ldb = 0;
+    int ldc = 0;
+    long long stride_a = 0;
+    long long stride_b = 0;
+    long long stride_c = 0;
+    int batch_count = 0;
+
+    auto operator==(const RRNLBCublasLtPlanKey& other) const -> bool
+    {
+        return op_a == other.op_a
+            && op_b == other.op_b
+            && m == other.m
+            && n == other.n
+            && k == other.k
+            && lda == other.lda
+            && ldb == other.ldb
+            && ldc == other.ldc
+            && stride_a == other.stride_a
+            && stride_b == other.stride_b
+            && stride_c == other.stride_c
+            && batch_count == other.batch_count;
+    }
+};
+
+struct RRNLBCublasLtPlanKeyHash {
+    auto operator()(const RRNLBCublasLtPlanKey& key) const -> std::size_t
+    {
+        auto seed = std::size_t{0};
+        auto hash_combine = [&seed](std::size_t v) {
+            seed ^= v + 0x9e3779b97f4a7c15ULL + (seed << 6) + (seed >> 2);
+        };
+        hash_combine(std::hash<int>{}(key.op_a));
+        hash_combine(std::hash<int>{}(key.op_b));
+        hash_combine(std::hash<int>{}(key.m));
+        hash_combine(std::hash<int>{}(key.n));
+        hash_combine(std::hash<int>{}(key.k));
+        hash_combine(std::hash<int>{}(key.lda));
+        hash_combine(std::hash<int>{}(key.ldb));
+        hash_combine(std::hash<int>{}(key.ldc));
+        hash_combine(std::hash<long long>{}(key.stride_a));
+        hash_combine(std::hash<long long>{}(key.stride_b));
+        hash_combine(std::hash<long long>{}(key.stride_c));
+        hash_combine(std::hash<int>{}(key.batch_count));
+        return seed;
+    }
+};
+
+struct RRNLBCublasLtPlan {
+    bool available = false;
+    cublasLtMatmulDesc_t op_desc = nullptr;
+    cublasLtMatrixLayout_t a_layout = nullptr;
+    cublasLtMatrixLayout_t b_layout = nullptr;
+    cublasLtMatrixLayout_t c_layout = nullptr;
+    cublasLtMatrixLayout_t d_layout = nullptr;
+    cublasLtMatmulAlgo_t algo{};
+    size_t workspace_bytes = 0;
+};
+
+auto rrnlb_destroy_cublaslt_plan(RRNLBCublasLtPlan& plan) -> void
+{
+    if (plan.d_layout != nullptr) cublasLtMatrixLayoutDestroy(plan.d_layout);
+    if (plan.c_layout != nullptr) cublasLtMatrixLayoutDestroy(plan.c_layout);
+    if (plan.b_layout != nullptr) cublasLtMatrixLayoutDestroy(plan.b_layout);
+    if (plan.a_layout != nullptr) cublasLtMatrixLayoutDestroy(plan.a_layout);
+    if (plan.op_desc != nullptr) cublasLtMatmulDescDestroy(plan.op_desc);
+    plan = RRNLBCublasLtPlan{};
+}
+
+auto rrnlb_create_cublaslt_plan(const RRNLBCublasLtPlanKey& key) -> RRNLBCublasLtPlan
+{
+    RRNLBCublasLtPlan plan;
+    auto lt_handle = rrnlb_get_cublaslt_handle();
+
+    if (cublasLtMatmulDescCreate(&plan.op_desc, CUBLAS_COMPUTE_32F, CUDA_R_32F) != CUBLAS_STATUS_SUCCESS) {
+        rrnlb_destroy_cublaslt_plan(plan);
+        return plan;
+    }
+
+    const auto op_a = static_cast<cublasOperation_t>(key.op_a);
+    const auto op_b = static_cast<cublasOperation_t>(key.op_b);
+    cublasLtPointerMode_t pointer_mode = CUBLASLT_POINTER_MODE_HOST;
+    if (cublasLtMatmulDescSetAttribute(
+            plan.op_desc, CUBLASLT_MATMUL_DESC_TRANSA, &op_a, sizeof(op_a)) != CUBLAS_STATUS_SUCCESS
+        || cublasLtMatmulDescSetAttribute(
+            plan.op_desc, CUBLASLT_MATMUL_DESC_TRANSB, &op_b, sizeof(op_b)) != CUBLAS_STATUS_SUCCESS
+        || cublasLtMatmulDescSetAttribute(
+            plan.op_desc,
+            CUBLASLT_MATMUL_DESC_POINTER_MODE,
+            &pointer_mode,
+            sizeof(pointer_mode)) != CUBLAS_STATUS_SUCCESS) {
+        rrnlb_destroy_cublaslt_plan(plan);
+        return plan;
+    }
+
+    const int64_t a_rows = (op_a == CUBLAS_OP_N) ? key.m : key.k;
+    const int64_t a_cols = (op_a == CUBLAS_OP_N) ? key.k : key.m;
+    const int64_t b_rows = (op_b == CUBLAS_OP_N) ? key.k : key.n;
+    const int64_t b_cols = (op_b == CUBLAS_OP_N) ? key.n : key.k;
+    const int64_t c_rows = key.m;
+    const int64_t c_cols = key.n;
+    const int64_t batch_count = key.batch_count;
+    const int64_t stride_a = key.stride_a;
+    const int64_t stride_b = key.stride_b;
+    const int64_t stride_c = key.stride_c;
+    const int64_t lda = key.lda;
+    const int64_t ldb = key.ldb;
+    const int64_t ldc = key.ldc;
+
+    if (cublasLtMatrixLayoutCreate(&plan.a_layout, CUDA_R_32F, a_rows, a_cols, lda) != CUBLAS_STATUS_SUCCESS
+        || cublasLtMatrixLayoutCreate(&plan.b_layout, CUDA_R_32F, b_rows, b_cols, ldb) != CUBLAS_STATUS_SUCCESS
+        || cublasLtMatrixLayoutCreate(&plan.c_layout, CUDA_R_32F, c_rows, c_cols, ldc) != CUBLAS_STATUS_SUCCESS
+        || cublasLtMatrixLayoutCreate(&plan.d_layout, CUDA_R_32F, c_rows, c_cols, ldc) != CUBLAS_STATUS_SUCCESS) {
+        rrnlb_destroy_cublaslt_plan(plan);
+        return plan;
+    }
+
+    if (cublasLtMatrixLayoutSetAttribute(
+            plan.a_layout,
+            CUBLASLT_MATRIX_LAYOUT_BATCH_COUNT,
+            &batch_count,
+            sizeof(batch_count)) != CUBLAS_STATUS_SUCCESS
+        || cublasLtMatrixLayoutSetAttribute(
+            plan.b_layout,
+            CUBLASLT_MATRIX_LAYOUT_BATCH_COUNT,
+            &batch_count,
+            sizeof(batch_count)) != CUBLAS_STATUS_SUCCESS
+        || cublasLtMatrixLayoutSetAttribute(
+            plan.c_layout,
+            CUBLASLT_MATRIX_LAYOUT_BATCH_COUNT,
+            &batch_count,
+            sizeof(batch_count)) != CUBLAS_STATUS_SUCCESS
+        || cublasLtMatrixLayoutSetAttribute(
+            plan.d_layout,
+            CUBLASLT_MATRIX_LAYOUT_BATCH_COUNT,
+            &batch_count,
+            sizeof(batch_count)) != CUBLAS_STATUS_SUCCESS
+        || cublasLtMatrixLayoutSetAttribute(
+            plan.a_layout,
+            CUBLASLT_MATRIX_LAYOUT_STRIDED_BATCH_OFFSET,
+            &stride_a,
+            sizeof(stride_a)) != CUBLAS_STATUS_SUCCESS
+        || cublasLtMatrixLayoutSetAttribute(
+            plan.b_layout,
+            CUBLASLT_MATRIX_LAYOUT_STRIDED_BATCH_OFFSET,
+            &stride_b,
+            sizeof(stride_b)) != CUBLAS_STATUS_SUCCESS
+        || cublasLtMatrixLayoutSetAttribute(
+            plan.c_layout,
+            CUBLASLT_MATRIX_LAYOUT_STRIDED_BATCH_OFFSET,
+            &stride_c,
+            sizeof(stride_c)) != CUBLAS_STATUS_SUCCESS
+        || cublasLtMatrixLayoutSetAttribute(
+            plan.d_layout,
+            CUBLASLT_MATRIX_LAYOUT_STRIDED_BATCH_OFFSET,
+            &stride_c,
+            sizeof(stride_c)) != CUBLAS_STATUS_SUCCESS) {
+        rrnlb_destroy_cublaslt_plan(plan);
+        return plan;
+    }
+
+    cublasLtMatmulPreference_t preference = nullptr;
+    if (cublasLtMatmulPreferenceCreate(&preference) != CUBLAS_STATUS_SUCCESS) {
+        rrnlb_destroy_cublaslt_plan(plan);
+        return plan;
+    }
+    const size_t max_workspace_bytes = []() -> size_t {
+        const char* env = std::getenv("SYMMETRIX_RRNLB_CUBLASLT_MAX_WORKSPACE_MB");
+        if (env == nullptr || env[0] == '\0') return static_cast<size_t>(8) * 1024 * 1024;
+        const long mb = std::atol(env);
+        if (mb <= 0) return 0;
+        return static_cast<size_t>(mb) * 1024 * 1024;
+    }();
+    if (cublasLtMatmulPreferenceSetAttribute(
+            preference,
+            CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES,
+            &max_workspace_bytes,
+            sizeof(max_workspace_bytes)) != CUBLAS_STATUS_SUCCESS) {
+        cublasLtMatmulPreferenceDestroy(preference);
+        rrnlb_destroy_cublaslt_plan(plan);
+        return plan;
+    }
+
+    constexpr int max_heuristics = 32;
+    cublasLtMatmulHeuristicResult_t heuristics[max_heuristics];
+    int returned_results = 0;
+    const auto heuristic_status = cublasLtMatmulAlgoGetHeuristic(
+        lt_handle,
+        plan.op_desc,
+        plan.a_layout,
+        plan.b_layout,
+        plan.c_layout,
+        plan.d_layout,
+        preference,
+        max_heuristics,
+        heuristics,
+        &returned_results);
+    cublasLtMatmulPreferenceDestroy(preference);
+
+    if (heuristic_status != CUBLAS_STATUS_SUCCESS || returned_results == 0) {
+        rrnlb_destroy_cublaslt_plan(plan);
+        return plan;
+    }
+
+    int best_idx = 0;
+    float best_waves = std::numeric_limits<float>::max();
+    for (int i = 0; i < returned_results; ++i) {
+        if (heuristics[i].wavesCount < best_waves) {
+            best_waves = heuristics[i].wavesCount;
+            best_idx = i;
+        }
+    }
+    plan.algo = heuristics[best_idx].algo;
+    plan.workspace_bytes = heuristics[best_idx].workspaceSize;
+    plan.available = true;
+    return plan;
+}
+
+auto rrnlb_get_cublaslt_plan(const RRNLBCublasLtPlanKey& key) -> RRNLBCublasLtPlan
+{
+    static auto* plan_cache = new std::unordered_map<RRNLBCublasLtPlanKey, RRNLBCublasLtPlan, RRNLBCublasLtPlanKeyHash>();
+    static std::mutex cache_mutex;
+    std::lock_guard<std::mutex> guard(cache_mutex);
+    auto it = plan_cache->find(key);
+    if (it == plan_cache->end()) {
+        it = plan_cache->emplace(key, rrnlb_create_cublaslt_plan(key)).first;
+    }
+    return it->second;
+}
+
+auto rrnlb_get_cublaslt_workspace(const size_t required_bytes) -> void*
+{
+    if (required_bytes == 0) return nullptr;
+    struct WorkspaceState {
+        void* ptr = nullptr;
+        size_t size = 0;
+        std::mutex mtx;
+    };
+    static auto* state = new WorkspaceState();
+    std::lock_guard<std::mutex> guard(state->mtx);
+    if (state->size >= required_bytes) return state->ptr;
+    if (state->ptr != nullptr) {
+        cudaFree(state->ptr);
+        state->ptr = nullptr;
+        state->size = 0;
+    }
+    if (cudaMalloc(&state->ptr, required_bytes) != cudaSuccess) {
+        return nullptr;
+    }
+    state->size = required_bytes;
+    return state->ptr;
+}
+
+auto rrnlb_cublas_enabled() -> bool
+{
+    const char* disable = std::getenv("SYMMETRIX_DISABLE_RRNLB_CUBLAS");
+    if (disable == nullptr) return true;
+    return disable[0] == '\0' || disable[0] == '0';
+}
+
+auto rrnlb_cublaslt_gemm_strided_batched_fp32(
+    cublasLtHandle_t lt_handle,
+    cudaStream_t stream,
+    cublasOperation_t op_a,
+    cublasOperation_t op_b,
+    int m,
+    int n,
+    int k,
+    const float* alpha,
+    const float* a,
+    int lda,
+    long long int stride_a,
+    const float* b,
+    int ldb,
+    long long int stride_b,
+    const float* beta,
+    float* c,
+    int ldc,
+    long long int stride_c,
+    int batch_count) -> cublasStatus_t
+{
+    const RRNLBCublasLtPlanKey key{
+        static_cast<int>(op_a),
+        static_cast<int>(op_b),
+        m,
+        n,
+        k,
+        lda,
+        ldb,
+        ldc,
+        stride_a,
+        stride_b,
+        stride_c,
+        batch_count
+    };
+    const RRNLBCublasLtPlan plan = rrnlb_get_cublaslt_plan(key);
+    if (!plan.available) {
+        if (rrnlb_cublaslt_strict_enabled()) {
+            std::ostringstream oss;
+            oss << "RRNLB cublasLt plan unavailable for "
+                << "opA=" << key.op_a
+                << " opB=" << key.op_b
+                << " m=" << key.m
+                << " n=" << key.n
+                << " k=" << key.k
+                << " lda=" << key.lda
+                << " ldb=" << key.ldb
+                << " ldc=" << key.ldc
+                << " strideA=" << key.stride_a
+                << " strideB=" << key.stride_b
+                << " strideC=" << key.stride_c
+                << " batch=" << key.batch_count;
+            throw std::runtime_error(oss.str());
+        }
+        return CUBLAS_STATUS_NOT_SUPPORTED;
+    }
+    void* workspace = rrnlb_get_cublaslt_workspace(plan.workspace_bytes);
+    if (plan.workspace_bytes > 0 && workspace == nullptr) {
+        if (rrnlb_cublaslt_strict_enabled()) {
+            throw std::runtime_error("RRNLB cublasLt workspace allocation failed.");
+        }
+        return CUBLAS_STATUS_ALLOC_FAILED;
+    }
+    return cublasLtMatmul(
+        lt_handle,
+        plan.op_desc,
+        alpha,
+        a,
+        plan.a_layout,
+        b,
+        plan.b_layout,
+        beta,
+        c,
+        plan.c_layout,
+        c,
+        plan.d_layout,
+        &plan.algo,
+        workspace,
+        plan.workspace_bytes,
+        stream);
+}
+
 template <typename Precision>
-MACEKokkos<Precision>::MACEKokkos(std::string filename)
+auto rrnlb_cublas_gemm_strided_batched(
+    cublasHandle_t handle,
+    cublasOperation_t op_a,
+    cublasOperation_t op_b,
+    int m,
+    int n,
+    int k,
+    const Precision* alpha,
+    const Precision* a,
+    int lda,
+    long long int stride_a,
+    const Precision* b,
+    int ldb,
+    long long int stride_b,
+    const Precision* beta,
+    Precision* c,
+    int ldc,
+    long long int stride_c,
+    int batch_count) -> cublasStatus_t;
+
+template <>
+auto rrnlb_cublas_gemm_strided_batched<double>(
+    cublasHandle_t handle,
+    cublasOperation_t op_a,
+    cublasOperation_t op_b,
+    int m,
+    int n,
+    int k,
+    const double* alpha,
+    const double* a,
+    int lda,
+    long long int stride_a,
+    const double* b,
+    int ldb,
+    long long int stride_b,
+    const double* beta,
+    double* c,
+    int ldc,
+    long long int stride_c,
+    int batch_count) -> cublasStatus_t
+{
+    return cublasDgemmStridedBatched(
+        handle, op_a, op_b, m, n, k, alpha, a, lda, stride_a, b, ldb, stride_b,
+        beta, c, ldc, stride_c, batch_count);
+}
+
+template <>
+auto rrnlb_cublas_gemm_strided_batched<float>(
+    cublasHandle_t handle,
+    cublasOperation_t op_a,
+    cublasOperation_t op_b,
+    int m,
+    int n,
+    int k,
+    const float* alpha,
+    const float* a,
+    int lda,
+    long long int stride_a,
+    const float* b,
+    int ldb,
+    long long int stride_b,
+    const float* beta,
+    float* c,
+    int ldc,
+    long long int stride_c,
+    int batch_count) -> cublasStatus_t
+{
+    return cublasSgemmStridedBatched(
+        handle, op_a, op_b, m, n, k, alpha, a, lda, stride_a, b, ldb, stride_b,
+        beta, c, ldc, stride_c, batch_count);
+}
+#endif
+
+template <typename T>
+KOKKOS_INLINE_FUNCTION
+auto rrnlb_sigmoid(const T x) -> T
+{
+    if (x >= static_cast<T>(0.0)) {
+        const T z = std::exp(-x);
+        return static_cast<T>(1.0) / (static_cast<T>(1.0) + z);
+    }
+    const T z = std::exp(x);
+    return z / (static_cast<T>(1.0) + z);
+}
+
+template <typename T>
+KOKKOS_INLINE_FUNCTION
+auto rrnlb_silu(const T x) -> T
+{
+    return x * rrnlb_sigmoid(x);
+}
+
+template <typename T>
+KOKKOS_INLINE_FUNCTION
+auto rrnlb_silu_deriv(const T x) -> T
+{
+    const T s = rrnlb_sigmoid(x);
+    return s + x * s * (static_cast<T>(1.0) - s);
+}
+
+template <typename T>
+KOKKOS_INLINE_FUNCTION
+auto rrnlb_eval_spline(
+    const Kokkos::View<T****,Kokkos::LayoutRight>& coeffs,
+    const int pair_index,
+    const int interval,
+    const int comp,
+    const T x,
+    const T xx,
+    const T xxx) -> T
+{
+    const T c0 = coeffs(pair_index, interval, 0, comp);
+    const T c1 = coeffs(pair_index, interval, 1, comp);
+    const T c2 = coeffs(pair_index, interval, 2, comp);
+    const T c3 = coeffs(pair_index, interval, 3, comp);
+    return c0 + c1 * x + c2 * xx + c3 * xxx;
+}
+
+template <typename T>
+KOKKOS_INLINE_FUNCTION
+auto rrnlb_eval_spline_deriv(
+    const Kokkos::View<T****,Kokkos::LayoutRight>& coeffs,
+    const int pair_index,
+    const int interval,
+    const int comp,
+    const T x,
+    const T xx) -> T
+{
+    const T c1 = coeffs(pair_index, interval, 1, comp);
+    const T c2 = coeffs(pair_index, interval, 2, comp);
+    const T c3 = coeffs(pair_index, interval, 3, comp);
+    return c1 + static_cast<T>(2.0) * c2 * x + static_cast<T>(3.0) * c3 * xx;
+}
+
+template <typename T>
+KOKKOS_INLINE_FUNCTION
+auto rrnlb_eval_spline_scalar(
+    const Kokkos::View<T***,Kokkos::LayoutRight>& coeffs,
+    const int pair_index,
+    const int interval,
+    const T x,
+    const T xx,
+    const T xxx) -> T
+{
+    const T c0 = coeffs(pair_index, interval, 0);
+    const T c1 = coeffs(pair_index, interval, 1);
+    const T c2 = coeffs(pair_index, interval, 2);
+    const T c3 = coeffs(pair_index, interval, 3);
+    return c0 + c1 * x + c2 * xx + c3 * xxx;
+}
+
+template <typename T>
+KOKKOS_INLINE_FUNCTION
+auto rrnlb_eval_spline_scalar_deriv(
+    const Kokkos::View<T***,Kokkos::LayoutRight>& coeffs,
+    const int pair_index,
+    const int interval,
+    const T x,
+    const T xx) -> T
+{
+    const T c1 = coeffs(pair_index, interval, 1);
+    const T c2 = coeffs(pair_index, interval, 2);
+    const T c3 = coeffs(pair_index, interval, 3);
+    return c1 + static_cast<T>(2.0) * c2 * x + static_cast<T>(3.0) * c3 * xx;
+}
+
+template <typename T>
+struct RRNLBTermReduction {
+    T dE_dr;
+    T y_adj;
+
+    KOKKOS_INLINE_FUNCTION
+    RRNLBTermReduction()
+        : dE_dr(static_cast<T>(0.0)),
+          y_adj(static_cast<T>(0.0))
+    {}
+
+    KOKKOS_INLINE_FUNCTION
+    auto operator+=(const RRNLBTermReduction& rhs) -> void
+    {
+        dE_dr += rhs.dE_dr;
+        y_adj += rhs.y_adj;
+    }
+};
+
+template <typename Precision, typename AccumPrecision>
+auto make_rrnlb_linear_kokkos(
+    const MACE::RRNLBLinear& src,
+    const std::string& label)
+    -> typename MACEKokkos<Precision, AccumPrecision>::RRNLBLinearKokkos
+{
+    using Linear = typename MACEKokkos<Precision, AccumPrecision>::RRNLBLinearKokkos;
+    Linear dst;
+    dst.dim_in = src.dim_in;
+    dst.dim_out = src.dim_out;
+    dst.h_parts_in_offset.resize(src.parts_in.size());
+    dst.h_parts_in_mul.resize(src.parts_in.size());
+    dst.h_parts_in_l.resize(src.parts_in.size());
+    dst.h_parts_out_offset.resize(src.parts_out.size());
+    dst.h_parts_out_mul.resize(src.parts_out.size());
+    dst.h_parts_out_l.resize(src.parts_out.size());
+
+    const int num_parts_in = static_cast<int>(src.parts_in.size());
+    const int num_parts_out = static_cast<int>(src.parts_out.size());
+    Kokkos::realloc(dst.parts_in_offset, num_parts_in);
+    Kokkos::realloc(dst.parts_in_mul, num_parts_in);
+    Kokkos::realloc(dst.parts_in_l, num_parts_in);
+    Kokkos::realloc(dst.parts_in_dim, num_parts_in);
+    Kokkos::realloc(dst.parts_out_offset, num_parts_out);
+    Kokkos::realloc(dst.parts_out_mul, num_parts_out);
+    Kokkos::realloc(dst.parts_out_l, num_parts_out);
+    Kokkos::realloc(dst.parts_out_dim, num_parts_out);
+
+    auto h_parts_in_offset = Kokkos::create_mirror_view(dst.parts_in_offset);
+    auto h_parts_in_mul = Kokkos::create_mirror_view(dst.parts_in_mul);
+    auto h_parts_in_l = Kokkos::create_mirror_view(dst.parts_in_l);
+    auto h_parts_in_dim = Kokkos::create_mirror_view(dst.parts_in_dim);
+    auto h_parts_out_offset = Kokkos::create_mirror_view(dst.parts_out_offset);
+    auto h_parts_out_mul = Kokkos::create_mirror_view(dst.parts_out_mul);
+    auto h_parts_out_l = Kokkos::create_mirror_view(dst.parts_out_l);
+    auto h_parts_out_dim = Kokkos::create_mirror_view(dst.parts_out_dim);
+    for (int p = 0; p < num_parts_in; ++p) {
+        h_parts_in_offset(p) = src.parts_in[p].offset;
+        h_parts_in_mul(p) = src.parts_in[p].mul;
+        h_parts_in_l(p) = src.parts_in[p].l;
+        h_parts_in_dim(p) = src.parts_in[p].dim;
+        dst.h_parts_in_offset[p] = src.parts_in[p].offset;
+        dst.h_parts_in_mul[p] = src.parts_in[p].mul;
+        dst.h_parts_in_l[p] = src.parts_in[p].l;
+    }
+    for (int p = 0; p < num_parts_out; ++p) {
+        h_parts_out_offset(p) = src.parts_out[p].offset;
+        h_parts_out_mul(p) = src.parts_out[p].mul;
+        h_parts_out_l(p) = src.parts_out[p].l;
+        h_parts_out_dim(p) = src.parts_out[p].dim;
+        dst.h_parts_out_offset[p] = src.parts_out[p].offset;
+        dst.h_parts_out_mul[p] = src.parts_out[p].mul;
+        dst.h_parts_out_l[p] = src.parts_out[p].l;
+    }
+    Kokkos::deep_copy(dst.parts_in_offset, h_parts_in_offset);
+    Kokkos::deep_copy(dst.parts_in_mul, h_parts_in_mul);
+    Kokkos::deep_copy(dst.parts_in_l, h_parts_in_l);
+    Kokkos::deep_copy(dst.parts_in_dim, h_parts_in_dim);
+    Kokkos::deep_copy(dst.parts_out_offset, h_parts_out_offset);
+    Kokkos::deep_copy(dst.parts_out_mul, h_parts_out_mul);
+    Kokkos::deep_copy(dst.parts_out_l, h_parts_out_l);
+    Kokkos::deep_copy(dst.parts_out_dim, h_parts_out_dim);
+
+    const int num_ins = static_cast<int>(src.instructions.size());
+    dst.h_ins_in_offset.resize(num_ins);
+    dst.h_ins_out_offset.resize(num_ins);
+    dst.h_ins_mul_in.resize(num_ins);
+    dst.h_ins_mul_out.resize(num_ins);
+    dst.h_ins_ir_dim.resize(num_ins);
+    dst.h_ins_weight_offset.resize(num_ins);
+    dst.h_ins_path_weight.resize(num_ins);
+    Kokkos::realloc(dst.ins_in_offset, num_ins);
+    Kokkos::realloc(dst.ins_out_offset, num_ins);
+    Kokkos::realloc(dst.ins_mul_in, num_ins);
+    Kokkos::realloc(dst.ins_mul_out, num_ins);
+    Kokkos::realloc(dst.ins_ir_dim, num_ins);
+    Kokkos::realloc(dst.ins_weight_offset, num_ins);
+    Kokkos::realloc(dst.ins_path_weight, num_ins);
+    auto h_ins_in_offset = Kokkos::create_mirror_view(dst.ins_in_offset);
+    auto h_ins_out_offset = Kokkos::create_mirror_view(dst.ins_out_offset);
+    auto h_ins_mul_in = Kokkos::create_mirror_view(dst.ins_mul_in);
+    auto h_ins_mul_out = Kokkos::create_mirror_view(dst.ins_mul_out);
+    auto h_ins_ir_dim = Kokkos::create_mirror_view(dst.ins_ir_dim);
+    auto h_ins_weight_offset = Kokkos::create_mirror_view(dst.ins_weight_offset);
+    auto h_ins_path_weight = Kokkos::create_mirror_view(dst.ins_path_weight);
+    int total_weights = 0;
+    for (const auto& ins : src.instructions) {
+        total_weights += static_cast<int>(ins.weights.size());
+    }
+    Kokkos::realloc(dst.ins_weights, total_weights);
+    auto h_ins_weights = Kokkos::create_mirror_view(dst.ins_weights);
+    int offset = 0;
+    for (int q = 0; q < num_ins; ++q) {
+        const auto& ins = src.instructions[q];
+        const auto& in_part = src.parts_in[ins.i_in];
+        const auto& out_part = src.parts_out[ins.i_out];
+        const int ir_dim = 2 * in_part.l + 1;
+        h_ins_in_offset(q) = in_part.offset;
+        h_ins_out_offset(q) = out_part.offset;
+        h_ins_mul_in(q) = ins.mul_in;
+        h_ins_mul_out(q) = ins.mul_out;
+        h_ins_ir_dim(q) = ir_dim;
+        h_ins_weight_offset(q) = offset;
+        h_ins_path_weight(q) = static_cast<Precision>(ins.path_weight);
+        dst.h_ins_in_offset[q] = in_part.offset;
+        dst.h_ins_out_offset[q] = out_part.offset;
+        dst.h_ins_mul_in[q] = ins.mul_in;
+        dst.h_ins_mul_out[q] = ins.mul_out;
+        dst.h_ins_ir_dim[q] = ir_dim;
+        dst.h_ins_weight_offset[q] = offset;
+        dst.h_ins_path_weight[q] = static_cast<Precision>(ins.path_weight);
+        for (int w = 0; w < static_cast<int>(ins.weights.size()); ++w) {
+            h_ins_weights(offset + w) = static_cast<Precision>(ins.weights[w]);
+        }
+        offset += static_cast<int>(ins.weights.size());
+    }
+    Kokkos::deep_copy(dst.ins_in_offset, h_ins_in_offset);
+    Kokkos::deep_copy(dst.ins_out_offset, h_ins_out_offset);
+    Kokkos::deep_copy(dst.ins_mul_in, h_ins_mul_in);
+    Kokkos::deep_copy(dst.ins_mul_out, h_ins_mul_out);
+    Kokkos::deep_copy(dst.ins_ir_dim, h_ins_ir_dim);
+    Kokkos::deep_copy(dst.ins_weight_offset, h_ins_weight_offset);
+    Kokkos::deep_copy(dst.ins_path_weight, h_ins_path_weight);
+    Kokkos::deep_copy(dst.ins_weights, h_ins_weights);
+
+    // Build grouped instruction plans for portable batched kernels:
+    // - forward grouped by output part (exclusive y-block ownership)
+    // - transpose grouped by input part (exclusive x_adj-block ownership)
+    std::vector<std::vector<int>> fwd_lists(num_parts_out);
+    std::vector<std::vector<int>> rev_lists(num_parts_in);
+    for (int q = 0; q < num_ins; ++q) {
+        const auto& ins = src.instructions[q];
+        fwd_lists[ins.i_out].push_back(q);
+        rev_lists[ins.i_in].push_back(q);
+    }
+
+    std::vector<int> fwd_group_out_offset;
+    std::vector<int> fwd_group_mul_out;
+    std::vector<int> fwd_group_ir_dim;
+    std::vector<int> fwd_group_first_ins;
+    std::vector<int> fwd_group_num_ins;
+    std::vector<int> fwd_group_ins_index;
+    for (int p = 0; p < num_parts_out; ++p) {
+        const auto& group = fwd_lists[p];
+        if (group.empty()) continue;
+        const int mul_out = dst.h_ins_mul_out[group.front()];
+        const int ir_dim = dst.h_ins_ir_dim[group.front()];
+        fwd_group_out_offset.push_back(src.parts_out[p].offset);
+        fwd_group_mul_out.push_back(mul_out);
+        fwd_group_ir_dim.push_back(ir_dim);
+        fwd_group_first_ins.push_back(static_cast<int>(fwd_group_ins_index.size()));
+        fwd_group_num_ins.push_back(static_cast<int>(group.size()));
+        fwd_group_ins_index.insert(fwd_group_ins_index.end(), group.begin(), group.end());
+    }
+    dst.fwd_group_out_offset = toKokkosView((label + "_fwd_group_out_offset").c_str(), fwd_group_out_offset);
+    dst.fwd_group_mul_out = toKokkosView((label + "_fwd_group_mul_out").c_str(), fwd_group_mul_out);
+    dst.fwd_group_ir_dim = toKokkosView((label + "_fwd_group_ir_dim").c_str(), fwd_group_ir_dim);
+    dst.fwd_group_first_ins = toKokkosView((label + "_fwd_group_first_ins").c_str(), fwd_group_first_ins);
+    dst.fwd_group_num_ins = toKokkosView((label + "_fwd_group_num_ins").c_str(), fwd_group_num_ins);
+    dst.fwd_group_ins_index = toKokkosView((label + "_fwd_group_ins_index").c_str(), fwd_group_ins_index);
+    dst.h_fwd_group_out_offset = fwd_group_out_offset;
+    dst.h_fwd_group_mul_out = fwd_group_mul_out;
+    dst.h_fwd_group_ir_dim = fwd_group_ir_dim;
+    dst.h_fwd_group_first_ins = fwd_group_first_ins;
+    dst.h_fwd_group_num_ins = fwd_group_num_ins;
+    dst.h_fwd_group_ins_index = fwd_group_ins_index;
+
+    std::vector<int> rev_group_in_offset;
+    std::vector<int> rev_group_mul_in;
+    std::vector<int> rev_group_ir_dim;
+    std::vector<int> rev_group_first_ins;
+    std::vector<int> rev_group_num_ins;
+    std::vector<int> rev_group_ins_index;
+    for (int p = 0; p < num_parts_in; ++p) {
+        const auto& group = rev_lists[p];
+        if (group.empty()) continue;
+        const int mul_in = dst.h_ins_mul_in[group.front()];
+        const int ir_dim = dst.h_ins_ir_dim[group.front()];
+        rev_group_in_offset.push_back(src.parts_in[p].offset);
+        rev_group_mul_in.push_back(mul_in);
+        rev_group_ir_dim.push_back(ir_dim);
+        rev_group_first_ins.push_back(static_cast<int>(rev_group_ins_index.size()));
+        rev_group_num_ins.push_back(static_cast<int>(group.size()));
+        rev_group_ins_index.insert(rev_group_ins_index.end(), group.begin(), group.end());
+    }
+    dst.rev_group_in_offset = toKokkosView((label + "_rev_group_in_offset").c_str(), rev_group_in_offset);
+    dst.rev_group_mul_in = toKokkosView((label + "_rev_group_mul_in").c_str(), rev_group_mul_in);
+    dst.rev_group_ir_dim = toKokkosView((label + "_rev_group_ir_dim").c_str(), rev_group_ir_dim);
+    dst.rev_group_first_ins = toKokkosView((label + "_rev_group_first_ins").c_str(), rev_group_first_ins);
+    dst.rev_group_num_ins = toKokkosView((label + "_rev_group_num_ins").c_str(), rev_group_num_ins);
+    dst.rev_group_ins_index = toKokkosView((label + "_rev_group_ins_index").c_str(), rev_group_ins_index);
+    dst.h_rev_group_in_offset = rev_group_in_offset;
+    dst.h_rev_group_mul_in = rev_group_mul_in;
+    dst.h_rev_group_ir_dim = rev_group_ir_dim;
+    dst.h_rev_group_first_ins = rev_group_first_ins;
+    dst.h_rev_group_num_ins = rev_group_num_ins;
+    dst.h_rev_group_ins_index = rev_group_ins_index;
+
+    // Build packed per-group weights used by the grouped dense GEMM path.
+    // Forward groups are packed as [K_total, N_out] where K_total is the
+    // concatenation of all instruction mul_in blocks for the output group.
+    const int num_fwd_groups = static_cast<int>(dst.h_fwd_group_first_ins.size());
+    dst.h_fwd_group_k_total.assign(num_fwd_groups, 0);
+    dst.h_fwd_group_pack_weight_offset.assign(num_fwd_groups, 0);
+    dst.h_fwd_group_ins_k_offset.assign(dst.h_fwd_group_ins_index.size(), 0);
+    int total_fwd_pack_weights = 0;
+    for (int g = 0; g < num_fwd_groups; ++g) {
+        const int first = dst.h_fwd_group_first_ins[g];
+        const int count = dst.h_fwd_group_num_ins[g];
+        int k_total = 0;
+        for (int t = 0; t < count; ++t) {
+            const int idx = first + t;
+            const int q = dst.h_fwd_group_ins_index[idx];
+            dst.h_fwd_group_ins_k_offset[idx] = k_total;
+            k_total += dst.h_ins_mul_in[q];
+        }
+        dst.h_fwd_group_k_total[g] = k_total;
+        dst.h_fwd_group_pack_weight_offset[g] = total_fwd_pack_weights;
+        total_fwd_pack_weights += k_total * dst.h_fwd_group_mul_out[g];
+    }
+    Kokkos::realloc(dst.fwd_group_pack_weights, total_fwd_pack_weights);
+    auto h_fwd_group_pack_weights = Kokkos::create_mirror_view(dst.fwd_group_pack_weights);
+    for (int g = 0; g < num_fwd_groups; ++g) {
+        const int first = dst.h_fwd_group_first_ins[g];
+        const int count = dst.h_fwd_group_num_ins[g];
+        const int n_out = dst.h_fwd_group_mul_out[g];
+        const int base = dst.h_fwd_group_pack_weight_offset[g];
+        for (int t = 0; t < count; ++t) {
+            const int idx = first + t;
+            const int q = dst.h_fwd_group_ins_index[idx];
+            const int k_off = dst.h_fwd_group_ins_k_offset[idx];
+            const int mul_in = dst.h_ins_mul_in[q];
+            const int mul_out = dst.h_ins_mul_out[q];
+            const int w_off = dst.h_ins_weight_offset[q];
+            const Precision alpha = dst.h_ins_path_weight[q];
+            if (mul_out != n_out) {
+                throw std::runtime_error("RRNLB forward packed GEMM group has inconsistent mul_out.");
+            }
+            for (int kin = 0; kin < mul_in; ++kin) {
+                for (int out = 0; out < n_out; ++out) {
+                    h_fwd_group_pack_weights(base + (k_off + kin) * n_out + out) =
+                        alpha * h_ins_weights(w_off + kin * mul_out + out);
+                }
+            }
+        }
+    }
+    Kokkos::deep_copy(dst.fwd_group_pack_weights, h_fwd_group_pack_weights);
+
+    // Reverse groups are packed as [N_total, K_in] where N_total is the
+    // concatenation of all instruction mul_out blocks for the input group.
+    const int num_rev_groups = static_cast<int>(dst.h_rev_group_first_ins.size());
+    dst.h_rev_group_n_total.assign(num_rev_groups, 0);
+    dst.h_rev_group_pack_weight_offset.assign(num_rev_groups, 0);
+    dst.h_rev_group_ins_n_offset.assign(dst.h_rev_group_ins_index.size(), 0);
+    int total_rev_pack_weights = 0;
+    for (int g = 0; g < num_rev_groups; ++g) {
+        const int first = dst.h_rev_group_first_ins[g];
+        const int count = dst.h_rev_group_num_ins[g];
+        int n_total = 0;
+        for (int t = 0; t < count; ++t) {
+            const int idx = first + t;
+            const int q = dst.h_rev_group_ins_index[idx];
+            dst.h_rev_group_ins_n_offset[idx] = n_total;
+            n_total += dst.h_ins_mul_out[q];
+        }
+        dst.h_rev_group_n_total[g] = n_total;
+        dst.h_rev_group_pack_weight_offset[g] = total_rev_pack_weights;
+        total_rev_pack_weights += n_total * dst.h_rev_group_mul_in[g];
+    }
+    Kokkos::realloc(dst.rev_group_pack_weights, total_rev_pack_weights);
+    auto h_rev_group_pack_weights = Kokkos::create_mirror_view(dst.rev_group_pack_weights);
+    for (int g = 0; g < num_rev_groups; ++g) {
+        const int first = dst.h_rev_group_first_ins[g];
+        const int count = dst.h_rev_group_num_ins[g];
+        const int k_in = dst.h_rev_group_mul_in[g];
+        const int base = dst.h_rev_group_pack_weight_offset[g];
+        for (int t = 0; t < count; ++t) {
+            const int idx = first + t;
+            const int q = dst.h_rev_group_ins_index[idx];
+            const int n_off = dst.h_rev_group_ins_n_offset[idx];
+            const int mul_in = dst.h_ins_mul_in[q];
+            const int mul_out = dst.h_ins_mul_out[q];
+            const int w_off = dst.h_ins_weight_offset[q];
+            const Precision alpha = dst.h_ins_path_weight[q];
+            if (mul_in != k_in) {
+                throw std::runtime_error("RRNLB reverse packed GEMM group has inconsistent mul_in.");
+            }
+            for (int out = 0; out < mul_out; ++out) {
+                for (int kin = 0; kin < k_in; ++kin) {
+                    h_rev_group_pack_weights(base + (n_off + out) * k_in + kin) =
+                        alpha * h_ins_weights(w_off + kin * mul_out + out);
+                }
+            }
+        }
+    }
+    Kokkos::deep_copy(dst.rev_group_pack_weights, h_rev_group_pack_weights);
+
+    // Validate packed metadata once at load time so hot loops do not recheck it.
+    dst.fwd_group_pack_valid =
+        dst.h_fwd_group_ins_k_offset.size() == dst.h_fwd_group_ins_index.size();
+    for (int g = 0; dst.fwd_group_pack_valid && g < num_fwd_groups; ++g) {
+        const int ir_dim = dst.h_fwd_group_ir_dim[g];
+        const int k_total = dst.h_fwd_group_k_total[g];
+        const int n_out = dst.h_fwd_group_mul_out[g];
+        const int first = dst.h_fwd_group_first_ins[g];
+        const int count = dst.h_fwd_group_num_ins[g];
+        if (ir_dim <= 0 || k_total <= 0 || n_out <= 0 || first < 0 || count <= 0
+            || first + count > static_cast<int>(dst.h_fwd_group_ins_index.size())) {
+            dst.fwd_group_pack_valid = false;
+            break;
+        }
+        dst.fwd_group_max_ir_dim = std::max(dst.fwd_group_max_ir_dim, ir_dim);
+        dst.fwd_group_max_k_total = std::max(dst.fwd_group_max_k_total, k_total);
+        dst.fwd_group_max_mul_out = std::max(dst.fwd_group_max_mul_out, n_out);
+        for (int t = 0; t < count; ++t) {
+            const int idx = first + t;
+            const int q = dst.h_fwd_group_ins_index[idx];
+            if (q < 0 || q >= num_ins) {
+                dst.fwd_group_pack_valid = false;
+                break;
+            }
+            const int mul_in = dst.h_ins_mul_in[q];
+            const int q_ir_dim = dst.h_ins_ir_dim[q];
+            const int in_offset = dst.h_ins_in_offset[q];
+            const int out_offset = dst.h_ins_out_offset[q];
+            const int k_offset = dst.h_fwd_group_ins_k_offset[idx];
+            if (mul_in <= 0
+                || q_ir_dim != ir_dim
+                || in_offset < 0
+                || out_offset < 0
+                || in_offset + mul_in * ir_dim > dst.dim_in
+                || out_offset + n_out * ir_dim > dst.dim_out
+                || k_offset < 0
+                || k_offset + mul_in > k_total) {
+                dst.fwd_group_pack_valid = false;
+                break;
+            }
+        }
+    }
+
+    dst.rev_group_pack_valid =
+        dst.h_rev_group_ins_n_offset.size() == dst.h_rev_group_ins_index.size();
+    for (int g = 0; dst.rev_group_pack_valid && g < num_rev_groups; ++g) {
+        const int ir_dim = dst.h_rev_group_ir_dim[g];
+        const int n_total = dst.h_rev_group_n_total[g];
+        const int k_in = dst.h_rev_group_mul_in[g];
+        const int first = dst.h_rev_group_first_ins[g];
+        const int count = dst.h_rev_group_num_ins[g];
+        if (ir_dim <= 0 || n_total <= 0 || k_in <= 0 || first < 0 || count <= 0
+            || first + count > static_cast<int>(dst.h_rev_group_ins_index.size())) {
+            dst.rev_group_pack_valid = false;
+            break;
+        }
+        dst.rev_group_max_ir_dim = std::max(dst.rev_group_max_ir_dim, ir_dim);
+        dst.rev_group_max_n_total = std::max(dst.rev_group_max_n_total, n_total);
+        dst.rev_group_max_mul_in = std::max(dst.rev_group_max_mul_in, k_in);
+        for (int t = 0; t < count; ++t) {
+            const int idx = first + t;
+            const int q = dst.h_rev_group_ins_index[idx];
+            if (q < 0 || q >= num_ins) {
+                dst.rev_group_pack_valid = false;
+                break;
+            }
+            const int mul_out = dst.h_ins_mul_out[q];
+            const int q_ir_dim = dst.h_ins_ir_dim[q];
+            const int in_offset = dst.h_rev_group_in_offset[g];
+            const int out_offset = dst.h_ins_out_offset[q];
+            const int n_offset = dst.h_rev_group_ins_n_offset[idx];
+            if (mul_out <= 0
+                || q_ir_dim != ir_dim
+                || in_offset < 0
+                || out_offset < 0
+                || in_offset + k_in * ir_dim > dst.dim_in
+                || out_offset + mul_out * ir_dim > dst.dim_out
+                || n_offset < 0
+                || n_offset + mul_out > n_total) {
+                dst.rev_group_pack_valid = false;
+                break;
+            }
+        }
+    }
+
+    std::vector<int> bias_indices;
+    std::vector<Precision> bias_values;
+    if (!src.bias.empty()) {
+        int bias_offset = 0;
+        for (const auto& out_part : src.parts_out) {
+            if (out_part.l != 0) continue;
+            for (int k = 0; k < out_part.mul; ++k) {
+                bias_indices.push_back(out_part.offset + k);
+                bias_values.push_back(static_cast<Precision>(src.bias[bias_offset + k]));
+            }
+            bias_offset += out_part.mul;
+        }
+    }
+    dst.bias_indices = toKokkosView((label + "_bias_indices").c_str(), bias_indices);
+    dst.bias_values = toKokkosView((label + "_bias_values").c_str(), bias_values);
+    return dst;
+}
+
+} // namespace
+
+template <typename Precision, typename AccumPrecision>
+MACEKokkos<Precision, AccumPrecision>::MACEKokkos(std::string filename)
 {
     load_from_json(filename);
 }
 
-template <typename Precision>
-MACEKokkos<Precision>::~MACEKokkos()
+template <typename Precision, typename AccumPrecision>
+MACEKokkos<Precision, AccumPrecision>::~MACEKokkos()
 {
     Kokkos::fence();
 
@@ -41,13 +1261,2837 @@ MACEKokkos<Precision>::~MACEKokkos()
     M0_poly_coeff = Kokkos::View<Kokkos::View<Precision***,Kokkos::LayoutRight>*,Kokkos::SharedSpace>();
     M0_poly_values = Kokkos::View<Kokkos::View<Precision***,Kokkos::LayoutRight>*,Kokkos::SharedSpace>();
     M0_poly_adjoints = Kokkos::View<Kokkos::View<Precision***,Kokkos::LayoutRight>*,Kokkos::SharedSpace>();
+    rrnlb_M0_poly_adjoints_ap =
+        Kokkos::View<Kokkos::View<AccumPrecision***,Kokkos::LayoutRight>*,Kokkos::SharedSpace>();
 
     A1_weights = Kokkos::View<Kokkos::View<Precision**,Kokkos::LayoutRight>*,Kokkos::SharedSpace>();
     A1_weights_trans = Kokkos::View<Kokkos::View<Precision**,Kokkos::LayoutRight>*,Kokkos::SharedSpace>();
 }
 
-template <typename Precision>
-void MACEKokkos<Precision>::compute_node_energies_forces(
+template <typename Precision, typename AccumPrecision>
+void MACEKokkos<Precision, AccumPrecision>::rrnlb_apply_linear_forward(
+    const RRNLBLinearKokkos& linear,
+    const int num_nodes,
+    Kokkos::View<const Precision**,Kokkos::LayoutRight> x,
+    Kokkos::View<Precision**,Kokkos::LayoutRight> y)
+{
+    if (x.extent(0) < num_nodes || x.extent(1) != linear.dim_in) {
+        throw std::runtime_error("RRNLB linear forward input has invalid shape.");
+    }
+    if (y.extent(0) < num_nodes || y.extent(1) != linear.dim_out) {
+        throw std::runtime_error("RRNLB linear forward output has invalid shape.");
+    }
+
+    Kokkos::deep_copy(y, static_cast<Precision>(0.0));
+
+    const bool want_group_packed_forward =
+        num_nodes > 0
+        && !linear.h_fwd_group_first_ins.empty()
+        && rrnlb_group_packed_should_run(
+            num_nodes,
+            linear.h_fwd_group_ir_dim,
+            linear.h_fwd_group_k_total,
+            linear.h_fwd_group_mul_out);
+    const bool use_group_packed_forward =
+        want_group_packed_forward && linear.fwd_group_pack_valid;
+    if (want_group_packed_forward && !linear.fwd_group_pack_valid
+        && rrnlb_group_packed_gemm_strict_enabled()) {
+        throw std::runtime_error(
+            "RRNLB grouped packed GEMM forward path validation failed.");
+    }
+    if (use_group_packed_forward) {
+        const bool packed_work_overflow =
+            !rrnlb_group_packed_work_fits_int(
+                num_nodes,
+                linear.fwd_group_max_ir_dim,
+                linear.fwd_group_max_k_total)
+            || !rrnlb_group_packed_work_fits_int(
+                num_nodes,
+                linear.fwd_group_max_ir_dim,
+                linear.fwd_group_max_mul_out);
+        if (packed_work_overflow) {
+            if (rrnlb_group_packed_gemm_strict_enabled()) {
+                throw std::runtime_error(
+                    "RRNLB grouped packed GEMM forward path work overflow.");
+            }
+        } else {
+            const int num_groups = static_cast<int>(linear.h_fwd_group_first_ins.size());
+            const int max_rows = num_nodes * linear.fwd_group_max_ir_dim;
+            if (rrnlb_fwd_pack_x_workspace.extent_int(0) < max_rows
+                || rrnlb_fwd_pack_x_workspace.extent_int(1) < linear.fwd_group_max_k_total) {
+                Kokkos::realloc(
+                    rrnlb_fwd_pack_x_workspace,
+                    max_rows,
+                    linear.fwd_group_max_k_total);
+            }
+            if (rrnlb_fwd_pack_y_workspace.extent_int(0) < max_rows
+                || rrnlb_fwd_pack_y_workspace.extent_int(1) < linear.fwd_group_max_mul_out) {
+                Kokkos::realloc(
+                    rrnlb_fwd_pack_y_workspace,
+                    max_rows,
+                    linear.fwd_group_max_mul_out);
+            }
+
+            for (int g = 0; g < num_groups; ++g) {
+                const int ir_dim = linear.h_fwd_group_ir_dim[g];
+                const int k_total = linear.h_fwd_group_k_total[g];
+                const int n_out = linear.h_fwd_group_mul_out[g];
+                const int out_offset = linear.h_fwd_group_out_offset[g];
+                const int first = linear.h_fwd_group_first_ins[g];
+                const int count = linear.h_fwd_group_num_ins[g];
+                const int rows = num_nodes * ir_dim;
+                auto xg = Kokkos::subview(
+                    rrnlb_fwd_pack_x_workspace,
+                    make_pair(0, rows),
+                    make_pair(0, k_total));
+                auto yg = Kokkos::subview(
+                    rrnlb_fwd_pack_y_workspace,
+                    make_pair(0, rows),
+                    make_pair(0, n_out));
+
+                for (int t = 0; t < count; ++t) {
+                    const int idx = first + t;
+                    const int q = linear.h_fwd_group_ins_index[idx];
+                    const int in_offset = linear.h_ins_in_offset[q];
+                    const int mul_in = linear.h_ins_mul_in[q];
+                    const int k_offset = linear.h_fwd_group_ins_k_offset[idx];
+                    const int pack_work = num_nodes * mul_in * ir_dim;
+                    Kokkos::parallel_for(
+                        "RRNLB fwd pack input",
+                        Kokkos::RangePolicy<Kokkos::DefaultExecutionSpace>(0, pack_work),
+                        KOKKOS_LAMBDA (const int ikm) {
+                            const int i = ikm / (mul_in * ir_dim);
+                            const int rem = ikm - i * mul_in * ir_dim;
+                            const int kin = rem / ir_dim;
+                            const int lm = rem - kin * ir_dim;
+                            const int row = i * ir_dim + lm;
+                            xg(row, k_offset + kin) = x(i, in_offset + kin * ir_dim + lm);
+                        });
+                }
+
+                const int w_base = linear.h_fwd_group_pack_weight_offset[g];
+                const auto wg = Kokkos::View<const Precision**,Kokkos::LayoutRight,Kokkos::MemoryUnmanaged>(
+                    linear.fwd_group_pack_weights.data() + w_base,
+                    k_total,
+                    n_out);
+                KokkosBlas::gemm(
+                    "N",
+                    "N",
+                    static_cast<Precision>(1.0),
+                    xg,
+                    wg,
+                    static_cast<Precision>(0.0),
+                    yg);
+
+                Kokkos::parallel_for(
+                    "RRNLB fwd unpack output",
+                    Kokkos::RangePolicy<Kokkos::DefaultExecutionSpace>(0, num_nodes * n_out * ir_dim),
+                    KOKKOS_LAMBDA (const int iom) {
+                        const int i = iom / (n_out * ir_dim);
+                        const int rem = iom - i * n_out * ir_dim;
+                        const int out = rem / ir_dim;
+                        const int lm = rem - out * ir_dim;
+                        const int row = i * ir_dim + lm;
+                        y(i, out_offset + out * ir_dim + lm) = yg(row, out);
+                    });
+            }
+
+            const auto bias_indices = linear.bias_indices;
+            const auto bias_values = linear.bias_values;
+            const int num_bias = bias_indices.extent_int(0);
+            if (num_bias > 0) {
+                Kokkos::parallel_for(
+                    "RRNLB linear forward bias (packed path)",
+                    Kokkos::RangePolicy<Kokkos::DefaultExecutionSpace>(0, num_nodes * num_bias),
+                    KOKKOS_LAMBDA (const int ib) {
+                        const int i = ib / num_bias;
+                        const int b = ib % num_bias;
+                        y(i, bias_indices(b)) += bias_values(b);
+                    });
+            }
+            return;
+        }
+    }
+
+#if defined(KOKKOS_ENABLE_CUDA) && defined(SYMMETRIX_HAVE_CUBLAS)
+    if (rrnlb_cublas_enabled() &&
+        Kokkos::SpaceAccessibility<Kokkos::CudaSpace, typename decltype(x)::memory_space>::accessible
+               && Kokkos::SpaceAccessibility<Kokkos::CudaSpace, typename decltype(y)::memory_space>::accessible) {
+        if (num_nodes > 0) {
+            auto exec = Kokkos::DefaultExecutionSpace();
+            auto handle = rrnlb_get_cublas_handle();
+            cublasLtHandle_t lt_handle = nullptr;
+            if constexpr (std::is_same_v<Precision, float>) {
+                if (!rrnlb_cublas_tf32_enabled()) {
+                    lt_handle = rrnlb_get_cublaslt_handle();
+                }
+            }
+            rrnlb_throw_cublas_error(
+                cublasSetPointerMode(handle, CUBLAS_POINTER_MODE_HOST),
+                "rrnlb_apply_linear_forward(cublasSetPointerMode)");
+            rrnlb_throw_cublas_error(
+                cublasSetStream(handle, exec.cuda_stream()),
+                "rrnlb_apply_linear_forward(cublasSetStream)");
+
+            const int x_row_stride = x.extent_int(1);
+            const int y_row_stride = y.extent_int(1);
+            const auto& h_ins_in_offset = linear.h_ins_in_offset;
+            const auto& h_ins_out_offset = linear.h_ins_out_offset;
+            const auto& h_ins_mul_in = linear.h_ins_mul_in;
+            const auto& h_ins_mul_out = linear.h_ins_mul_out;
+            const auto& h_ins_ir_dim = linear.h_ins_ir_dim;
+            const auto& h_ins_weight_offset = linear.h_ins_weight_offset;
+            const auto& h_ins_path_weight = linear.h_ins_path_weight;
+            const auto ins_weights = linear.ins_weights;
+            const int num_ins = static_cast<int>(h_ins_in_offset.size());
+            const Precision beta = static_cast<Precision>(1.0);
+
+            for (int q = 0; q < num_ins; ++q) {
+                const int mul_in = h_ins_mul_in[q];
+                const int mul_out = h_ins_mul_out[q];
+                const int ir_dim = h_ins_ir_dim[q];
+                const int in_offset = h_ins_in_offset[q];
+                const int out_offset = h_ins_out_offset[q];
+                const int w_offset = h_ins_weight_offset[q];
+                const Precision alpha = h_ins_path_weight[q];
+                const Precision* x_base = x.data() + in_offset;
+                const Precision* w_base = ins_weights.data() + w_offset;
+                Precision* y_base = y.data() + out_offset;
+                cublasStatus_t gemm_status = CUBLAS_STATUS_NOT_SUPPORTED;
+                if constexpr (std::is_same_v<Precision, float>) {
+                    if (!rrnlb_cublas_tf32_enabled() && lt_handle != nullptr) {
+                        gemm_status = rrnlb_cublaslt_gemm_strided_batched_fp32(
+                            lt_handle,
+                            exec.cuda_stream(),
+                            CUBLAS_OP_N,
+                            CUBLAS_OP_T,
+                            ir_dim,
+                            mul_out,
+                            mul_in,
+                            &alpha,
+                            x_base,
+                            ir_dim,
+                            static_cast<long long int>(x_row_stride),
+                            w_base,
+                            mul_out,
+                            0,
+                            &beta,
+                            y_base,
+                            ir_dim,
+                            static_cast<long long int>(y_row_stride),
+                            num_nodes);
+                        if (rrnlb_cublaslt_strict_enabled() && gemm_status != CUBLAS_STATUS_SUCCESS) {
+                            rrnlb_throw_cublas_error(
+                                gemm_status,
+                                "rrnlb_apply_linear_forward(cublasLtMatmul)");
+                        }
+                    }
+                }
+                if (gemm_status != CUBLAS_STATUS_SUCCESS) {
+                    gemm_status = rrnlb_cublas_gemm_strided_batched<Precision>(
+                        handle,
+                        CUBLAS_OP_N,
+                        CUBLAS_OP_T,
+                        ir_dim,
+                        mul_out,
+                        mul_in,
+                        &alpha,
+                        x_base,
+                        ir_dim,
+                        static_cast<long long int>(x_row_stride),
+                        w_base,
+                        mul_out,
+                        0,
+                        &beta,
+                        y_base,
+                        ir_dim,
+                        static_cast<long long int>(y_row_stride),
+                        num_nodes);
+                }
+                rrnlb_throw_cublas_error(
+                    gemm_status,
+                    "rrnlb_apply_linear_forward(cublasGemmStridedBatched)");
+            }
+        }
+
+        const auto bias_indices = linear.bias_indices;
+        const auto bias_values = linear.bias_values;
+        const int num_bias = bias_indices.extent_int(0);
+        if (num_bias > 0 && num_nodes > 0) {
+            Kokkos::parallel_for(
+                "RRNLB linear forward bias (cuBLAS path)",
+                Kokkos::RangePolicy<Kokkos::DefaultExecutionSpace>(0, num_nodes * num_bias),
+                KOKKOS_LAMBDA (const int ib) {
+                    const int i = ib / num_bias;
+                    const int b = ib % num_bias;
+                    y(i, bias_indices(b)) += bias_values(b);
+                });
+        }
+        return;
+    }
+#endif
+
+    const auto ins_in_offset = linear.ins_in_offset;
+    const auto ins_out_offset = linear.ins_out_offset;
+    const auto ins_mul_in = linear.ins_mul_in;
+    const auto ins_mul_out = linear.ins_mul_out;
+    const auto ins_ir_dim = linear.ins_ir_dim;
+    const auto ins_weight_offset = linear.ins_weight_offset;
+    const auto ins_path_weight = linear.ins_path_weight;
+    const auto ins_weights = linear.ins_weights;
+    const auto fwd_group_first_ins = linear.fwd_group_first_ins;
+    const auto fwd_group_num_ins = linear.fwd_group_num_ins;
+    const auto fwd_group_ins_index = linear.fwd_group_ins_index;
+    const auto bias_indices = linear.bias_indices;
+    const auto bias_values = linear.bias_values;
+    const int num_groups = fwd_group_first_ins.extent_int(0);
+    if (num_nodes > 0 && num_groups > 0) {
+        Kokkos::parallel_for(
+            "RRNLB linear forward",
+            Kokkos::TeamPolicy<>(num_nodes * num_groups, Kokkos::AUTO, 32),
+            KOKKOS_LAMBDA (Kokkos::TeamPolicy<>::member_type team_member) {
+                const int league = team_member.league_rank();
+                const int g = league / num_nodes;
+                const int i = league - g * num_nodes;
+                auto x_i = Kokkos::subview(x, i, Kokkos::ALL);
+                auto y_i = Kokkos::subview(y, i, Kokkos::ALL);
+                const int first = fwd_group_first_ins(g);
+                const int count = fwd_group_num_ins(g);
+                for (int t = 0; t < count; ++t) {
+                    const int q = fwd_group_ins_index(first + t);
+                    const int mul_in = ins_mul_in(q);
+                    const int mul_out = ins_mul_out(q);
+                    const int ir_dim = ins_ir_dim(q);
+                    const int in_offset = ins_in_offset(q);
+                    const int out_offset = ins_out_offset(q);
+                    const int w_offset = ins_weight_offset(q);
+                    const auto W = Kokkos::View<const Precision**,Kokkos::LayoutRight,Kokkos::MemoryUnmanaged>(
+                        ins_weights.data() + w_offset, mul_in, mul_out);
+                    const auto X = Kokkos::View<const Precision**,Kokkos::LayoutRight,Kokkos::MemoryUnmanaged>(
+                        x_i.data() + in_offset, mul_in, ir_dim);
+                    auto Y = Kokkos::View<Precision**,Kokkos::LayoutRight,Kokkos::MemoryUnmanaged>(
+                        y_i.data() + out_offset, mul_out, ir_dim);
+                    KokkosBatched::TeamGemm<Kokkos::TeamPolicy<>::member_type,
+                                            KokkosBatched::Trans::Transpose,
+                                            KokkosBatched::Trans::NoTranspose,
+                                            KokkosBatched::Algo::Gemm::Blocked>
+                        ::invoke(
+                            team_member,
+                            ins_path_weight(q),
+                            W,
+                            X,
+                            static_cast<Precision>(1.0),
+                            Y);
+                    team_member.team_barrier();
+                }
+            });
+    }
+
+    const int num_bias = bias_indices.extent_int(0);
+    if (num_bias > 0 && num_nodes > 0) {
+        Kokkos::parallel_for(
+            "RRNLB linear forward bias",
+            Kokkos::RangePolicy<Kokkos::DefaultExecutionSpace>(0, num_nodes * num_bias),
+            KOKKOS_LAMBDA (const int ib) {
+                const int i = ib / num_bias;
+                const int b = ib % num_bias;
+                y(i, bias_indices(b)) += bias_values(b);
+            });
+    }
+}
+
+template <typename Precision, typename AccumPrecision>
+void MACEKokkos<Precision, AccumPrecision>::rrnlb_apply_linear_transpose(
+    const RRNLBLinearKokkos& linear,
+    const int num_nodes,
+    Kokkos::View<const AccumPrecision**,Kokkos::LayoutRight> y_adj,
+    Kokkos::View<AccumPrecision**,Kokkos::LayoutRight> x_adj)
+{
+    if (y_adj.extent(0) < num_nodes || y_adj.extent(1) != linear.dim_out) {
+        throw std::runtime_error("RRNLB linear transpose input has invalid shape.");
+    }
+    if (x_adj.extent(0) < num_nodes || x_adj.extent(1) != linear.dim_in) {
+        throw std::runtime_error("RRNLB linear transpose output has invalid shape.");
+    }
+
+    Kokkos::deep_copy(x_adj, static_cast<AccumPrecision>(0.0));
+
+    auto run_transpose_precision = [&] (
+        Kokkos::View<const Precision**,Kokkos::LayoutStride> y_adj_work,
+        Kokkos::View<Precision**,Kokkos::LayoutStride> x_adj_work) {
+    const bool want_group_packed_transpose =
+        num_nodes > 0
+        && !linear.h_rev_group_first_ins.empty()
+        && rrnlb_group_packed_should_run(
+            num_nodes,
+            linear.h_rev_group_ir_dim,
+            linear.h_rev_group_n_total,
+            linear.h_rev_group_mul_in);
+    const bool use_group_packed_transpose =
+        want_group_packed_transpose && linear.rev_group_pack_valid;
+    if (want_group_packed_transpose && !linear.rev_group_pack_valid
+        && rrnlb_group_packed_gemm_strict_enabled()) {
+        throw std::runtime_error(
+            "RRNLB grouped packed GEMM transpose path validation failed.");
+    }
+    if (use_group_packed_transpose) {
+        const bool packed_work_overflow =
+            !rrnlb_group_packed_work_fits_int(
+                num_nodes,
+                linear.rev_group_max_ir_dim,
+                linear.rev_group_max_n_total)
+            || !rrnlb_group_packed_work_fits_int(
+                num_nodes,
+                linear.rev_group_max_ir_dim,
+                linear.rev_group_max_mul_in);
+        if (packed_work_overflow) {
+            if (rrnlb_group_packed_gemm_strict_enabled()) {
+                throw std::runtime_error(
+                    "RRNLB grouped packed GEMM transpose path work overflow.");
+            }
+        } else {
+            const int num_groups = static_cast<int>(linear.h_rev_group_first_ins.size());
+            const int max_rows = num_nodes * linear.rev_group_max_ir_dim;
+            if (rrnlb_rev_pack_y_workspace.extent_int(0) < max_rows
+                || rrnlb_rev_pack_y_workspace.extent_int(1) < linear.rev_group_max_n_total) {
+                Kokkos::realloc(
+                    rrnlb_rev_pack_y_workspace,
+                    max_rows,
+                    linear.rev_group_max_n_total);
+            }
+            if (rrnlb_rev_pack_x_workspace.extent_int(0) < max_rows
+                || rrnlb_rev_pack_x_workspace.extent_int(1) < linear.rev_group_max_mul_in) {
+                Kokkos::realloc(
+                    rrnlb_rev_pack_x_workspace,
+                    max_rows,
+                    linear.rev_group_max_mul_in);
+            }
+
+            for (int g = 0; g < num_groups; ++g) {
+                const int ir_dim = linear.h_rev_group_ir_dim[g];
+                const int n_total = linear.h_rev_group_n_total[g];
+                const int k_in = linear.h_rev_group_mul_in[g];
+                const int in_offset = linear.h_rev_group_in_offset[g];
+                const int first = linear.h_rev_group_first_ins[g];
+                const int count = linear.h_rev_group_num_ins[g];
+                const int rows = num_nodes * ir_dim;
+                auto yg = Kokkos::subview(
+                    rrnlb_rev_pack_y_workspace,
+                    make_pair(0, rows),
+                    make_pair(0, n_total));
+                auto xg = Kokkos::subview(
+                    rrnlb_rev_pack_x_workspace,
+                    make_pair(0, rows),
+                    make_pair(0, k_in));
+
+                for (int t = 0; t < count; ++t) {
+                    const int idx = first + t;
+                    const int q = linear.h_rev_group_ins_index[idx];
+                    const int out_offset = linear.h_ins_out_offset[q];
+                    const int mul_out = linear.h_ins_mul_out[q];
+                    const int n_offset = linear.h_rev_group_ins_n_offset[idx];
+                    const int pack_work = num_nodes * mul_out * ir_dim;
+                    Kokkos::parallel_for(
+                        "RRNLB rev pack input",
+                        Kokkos::RangePolicy<Kokkos::DefaultExecutionSpace>(0, pack_work),
+                        KOKKOS_LAMBDA (const int iom) {
+                            const int i = iom / (mul_out * ir_dim);
+                            const int rem = iom - i * mul_out * ir_dim;
+                            const int out = rem / ir_dim;
+                            const int lm = rem - out * ir_dim;
+                            const int row = i * ir_dim + lm;
+                            yg(row, n_offset + out) = y_adj_work(i, out_offset + out * ir_dim + lm);
+                        });
+                }
+
+                const int w_base = linear.h_rev_group_pack_weight_offset[g];
+                const auto wg = Kokkos::View<const Precision**,Kokkos::LayoutRight,Kokkos::MemoryUnmanaged>(
+                    linear.rev_group_pack_weights.data() + w_base,
+                    n_total,
+                    k_in);
+                KokkosBlas::gemm(
+                    "N",
+                    "N",
+                    static_cast<Precision>(1.0),
+                    yg,
+                    wg,
+                    static_cast<Precision>(0.0),
+                    xg);
+
+                Kokkos::parallel_for(
+                    "RRNLB rev unpack output",
+                    Kokkos::RangePolicy<Kokkos::DefaultExecutionSpace>(0, num_nodes * k_in * ir_dim),
+                    KOKKOS_LAMBDA (const int ikm) {
+                        const int i = ikm / (k_in * ir_dim);
+                        const int rem = ikm - i * k_in * ir_dim;
+                        const int kin = rem / ir_dim;
+                        const int lm = rem - kin * ir_dim;
+                        const int row = i * ir_dim + lm;
+                        x_adj_work(i, in_offset + kin * ir_dim + lm) = xg(row, kin);
+                    });
+            }
+            return;
+        }
+    }
+
+#if defined(KOKKOS_ENABLE_CUDA) && defined(SYMMETRIX_HAVE_CUBLAS)
+    if (rrnlb_cublas_enabled() &&
+        Kokkos::SpaceAccessibility<Kokkos::CudaSpace, typename decltype(y_adj_work)::memory_space>::accessible
+               && Kokkos::SpaceAccessibility<Kokkos::CudaSpace, typename decltype(x_adj_work)::memory_space>::accessible) {
+        if (num_nodes > 0) {
+            auto exec = Kokkos::DefaultExecutionSpace();
+            auto handle = rrnlb_get_cublas_handle();
+            cublasLtHandle_t lt_handle = nullptr;
+            if constexpr (std::is_same_v<Precision, float>) {
+                if (!rrnlb_cublas_tf32_enabled()) {
+                    lt_handle = rrnlb_get_cublaslt_handle();
+                }
+            }
+            rrnlb_throw_cublas_error(
+                cublasSetPointerMode(handle, CUBLAS_POINTER_MODE_HOST),
+                "rrnlb_apply_linear_transpose(cublasSetPointerMode)");
+            rrnlb_throw_cublas_error(
+                cublasSetStream(handle, exec.cuda_stream()),
+                "rrnlb_apply_linear_transpose(cublasSetStream)");
+
+            const std::size_t y_row_stride_sz = y_adj_work.stride(0);
+            const std::size_t y_col_stride_sz = y_adj_work.stride(1);
+            const std::size_t x_row_stride_sz = x_adj_work.stride(0);
+            const std::size_t x_col_stride_sz = x_adj_work.stride(1);
+            if (y_col_stride_sz != 1 || x_col_stride_sz != 1) {
+                throw std::runtime_error(
+                    "RRNLB linear transpose requires contiguous column stride.");
+            }
+            const long long int y_row_stride = static_cast<long long int>(y_row_stride_sz);
+            const long long int x_row_stride = static_cast<long long int>(x_row_stride_sz);
+            const auto& h_ins_in_offset = linear.h_ins_in_offset;
+            const auto& h_ins_out_offset = linear.h_ins_out_offset;
+            const auto& h_ins_mul_in = linear.h_ins_mul_in;
+            const auto& h_ins_mul_out = linear.h_ins_mul_out;
+            const auto& h_ins_ir_dim = linear.h_ins_ir_dim;
+            const auto& h_ins_weight_offset = linear.h_ins_weight_offset;
+            const auto& h_ins_path_weight = linear.h_ins_path_weight;
+            const auto ins_weights = linear.ins_weights;
+            const int num_ins = static_cast<int>(h_ins_in_offset.size());
+            const Precision beta = static_cast<Precision>(1.0);
+
+            for (int q = 0; q < num_ins; ++q) {
+                const int mul_in = h_ins_mul_in[q];
+                const int mul_out = h_ins_mul_out[q];
+                const int ir_dim = h_ins_ir_dim[q];
+                const int in_offset = h_ins_in_offset[q];
+                const int out_offset = h_ins_out_offset[q];
+                const int w_offset = h_ins_weight_offset[q];
+                const Precision alpha = h_ins_path_weight[q];
+                const Precision* y_base = y_adj_work.data() + out_offset;
+                const Precision* w_base = ins_weights.data() + w_offset;
+                Precision* x_base = x_adj_work.data() + in_offset;
+                cublasStatus_t gemm_status = CUBLAS_STATUS_NOT_SUPPORTED;
+                if constexpr (std::is_same_v<Precision, float>) {
+                    if (!rrnlb_cublas_tf32_enabled() && lt_handle != nullptr) {
+                        gemm_status = rrnlb_cublaslt_gemm_strided_batched_fp32(
+                            lt_handle,
+                            exec.cuda_stream(),
+                            CUBLAS_OP_N,
+                            CUBLAS_OP_N,
+                            ir_dim,
+                            mul_in,
+                            mul_out,
+                            &alpha,
+                            y_base,
+                            ir_dim,
+                            y_row_stride,
+                            w_base,
+                            mul_out,
+                            0,
+                            &beta,
+                            x_base,
+                            ir_dim,
+                            x_row_stride,
+                            num_nodes);
+                        if (rrnlb_cublaslt_strict_enabled() && gemm_status != CUBLAS_STATUS_SUCCESS) {
+                            rrnlb_throw_cublas_error(
+                                gemm_status,
+                                "rrnlb_apply_linear_transpose(cublasLtMatmul)");
+                        }
+                    }
+                }
+                if (gemm_status != CUBLAS_STATUS_SUCCESS) {
+                    gemm_status = rrnlb_cublas_gemm_strided_batched<Precision>(
+                        handle,
+                        CUBLAS_OP_N,
+                        CUBLAS_OP_N,
+                        ir_dim,
+                        mul_in,
+                        mul_out,
+                        &alpha,
+                        y_base,
+                        ir_dim,
+                        y_row_stride,
+                        w_base,
+                        mul_out,
+                        0,
+                        &beta,
+                        x_base,
+                        ir_dim,
+                        x_row_stride,
+                        num_nodes);
+                }
+                rrnlb_throw_cublas_error(
+                    gemm_status,
+                    "rrnlb_apply_linear_transpose(cublasGemmStridedBatched)");
+            }
+        }
+        return;
+    }
+#endif
+
+    const auto ins_in_offset = linear.ins_in_offset;
+    const auto ins_out_offset = linear.ins_out_offset;
+    const auto ins_mul_in = linear.ins_mul_in;
+    const auto ins_mul_out = linear.ins_mul_out;
+    const auto ins_ir_dim = linear.ins_ir_dim;
+    const auto ins_weight_offset = linear.ins_weight_offset;
+    const auto ins_path_weight = linear.ins_path_weight;
+    const auto ins_weights = linear.ins_weights;
+    const auto rev_group_first_ins = linear.rev_group_first_ins;
+    const auto rev_group_num_ins = linear.rev_group_num_ins;
+    const auto rev_group_ins_index = linear.rev_group_ins_index;
+    const int num_groups = rev_group_first_ins.extent_int(0);
+
+    if (num_nodes > 0 && num_groups > 0) {
+        Kokkos::parallel_for(
+            "RRNLB linear transpose",
+            Kokkos::TeamPolicy<>(num_nodes * num_groups, Kokkos::AUTO, 32),
+            KOKKOS_LAMBDA (Kokkos::TeamPolicy<>::member_type team_member) {
+                const int league = team_member.league_rank();
+                const int g = league / num_nodes;
+                const int i = league - g * num_nodes;
+                auto y_i = Kokkos::subview(y_adj_work, i, Kokkos::ALL);
+                auto x_i = Kokkos::subview(x_adj_work, i, Kokkos::ALL);
+                const int first = rev_group_first_ins(g);
+                const int count = rev_group_num_ins(g);
+                for (int t = 0; t < count; ++t) {
+                    const int q = rev_group_ins_index(first + t);
+                    const int in_offset = ins_in_offset(q);
+                    const int mul_in = ins_mul_in(q);
+                    const int mul_out = ins_mul_out(q);
+                    const int ir_dim = ins_ir_dim(q);
+                    const int out_offset = ins_out_offset(q);
+                    const int w_offset = ins_weight_offset(q);
+                    auto X = Kokkos::View<Precision**,Kokkos::LayoutRight,Kokkos::MemoryUnmanaged>(
+                        x_i.data() + in_offset, mul_in, ir_dim);
+                    const auto W = Kokkos::View<const Precision**,Kokkos::LayoutRight,Kokkos::MemoryUnmanaged>(
+                        ins_weights.data() + w_offset, mul_in, mul_out);
+                    const auto Y = Kokkos::View<const Precision**,Kokkos::LayoutRight,Kokkos::MemoryUnmanaged>(
+                        y_i.data() + out_offset, mul_out, ir_dim);
+                    KokkosBatched::TeamGemm<Kokkos::TeamPolicy<>::member_type,
+                                            KokkosBatched::Trans::NoTranspose,
+                                            KokkosBatched::Trans::NoTranspose,
+                                            KokkosBatched::Algo::Gemm::Blocked>
+                        ::invoke(
+                            team_member,
+                            ins_path_weight(q),
+                            W,
+                            Y,
+                            static_cast<Precision>(1.0),
+                            X);
+                    team_member.team_barrier();
+                }
+            });
+    }
+    };
+
+    if constexpr (!std::is_same_v<Precision, AccumPrecision>) {
+        if (rrnlb_transpose_y_precision_workspace.extent_int(0) < num_nodes
+            || rrnlb_transpose_y_precision_workspace.extent_int(1) < linear.dim_out) {
+            Kokkos::realloc(
+                rrnlb_transpose_y_precision_workspace,
+                num_nodes,
+                linear.dim_out);
+        }
+        if (rrnlb_transpose_x_precision_workspace.extent_int(0) < num_nodes
+            || rrnlb_transpose_x_precision_workspace.extent_int(1) < linear.dim_in) {
+            Kokkos::realloc(
+                rrnlb_transpose_x_precision_workspace,
+                num_nodes,
+                linear.dim_in);
+        }
+
+        auto y_adj_precision = Kokkos::subview(
+            rrnlb_transpose_y_precision_workspace,
+            Kokkos::make_pair(0, num_nodes),
+            Kokkos::make_pair(0, linear.dim_out));
+
+        Kokkos::parallel_for(
+            "RRNLB transpose cast-in",
+            Kokkos::RangePolicy<Kokkos::DefaultExecutionSpace>(0, num_nodes * linear.dim_out),
+            KOKKOS_LAMBDA (const int ip) {
+                const int i = ip / linear.dim_out;
+                const int p = ip % linear.dim_out;
+                y_adj_precision(i, p) = static_cast<Precision>(y_adj(i, p));
+            });
+
+        const bool want_group_packed_transpose =
+            num_nodes > 0
+            && !linear.h_rev_group_first_ins.empty()
+            && rrnlb_group_packed_should_run(
+                num_nodes,
+                linear.h_rev_group_ir_dim,
+                linear.h_rev_group_n_total,
+                linear.h_rev_group_mul_in);
+        const bool use_group_packed_transpose =
+            want_group_packed_transpose && linear.rev_group_pack_valid;
+        if (want_group_packed_transpose && !linear.rev_group_pack_valid
+            && rrnlb_group_packed_gemm_strict_enabled()) {
+            throw std::runtime_error(
+                "RRNLB grouped packed GEMM transpose path validation failed.");
+        }
+
+        if (use_group_packed_transpose) {
+            const bool packed_work_overflow =
+                !rrnlb_group_packed_work_fits_int(
+                    num_nodes,
+                    linear.rev_group_max_ir_dim,
+                    linear.rev_group_max_n_total)
+                || !rrnlb_group_packed_work_fits_int(
+                    num_nodes,
+                    linear.rev_group_max_ir_dim,
+                    linear.rev_group_max_mul_in);
+            if (packed_work_overflow) {
+                if (rrnlb_group_packed_gemm_strict_enabled()) {
+                    throw std::runtime_error(
+                        "RRNLB grouped packed GEMM transpose path work overflow.");
+                }
+            } else {
+                const int num_groups = static_cast<int>(linear.h_rev_group_first_ins.size());
+                const int max_rows = num_nodes * linear.rev_group_max_ir_dim;
+                if (rrnlb_rev_pack_y_workspace.extent_int(0) < max_rows
+                    || rrnlb_rev_pack_y_workspace.extent_int(1) < linear.rev_group_max_n_total) {
+                    Kokkos::realloc(
+                        rrnlb_rev_pack_y_workspace,
+                        max_rows,
+                        linear.rev_group_max_n_total);
+                }
+                if (rrnlb_rev_pack_x_workspace.extent_int(0) < max_rows
+                    || rrnlb_rev_pack_x_workspace.extent_int(1) < linear.rev_group_max_mul_in) {
+                    Kokkos::realloc(
+                        rrnlb_rev_pack_x_workspace,
+                        max_rows,
+                        linear.rev_group_max_mul_in);
+                }
+
+                for (int g = 0; g < num_groups; ++g) {
+                    const int ir_dim = linear.h_rev_group_ir_dim[g];
+                    const int n_total = linear.h_rev_group_n_total[g];
+                    const int k_in = linear.h_rev_group_mul_in[g];
+                    const int in_offset = linear.h_rev_group_in_offset[g];
+                    const int first = linear.h_rev_group_first_ins[g];
+                    const int count = linear.h_rev_group_num_ins[g];
+                    const int rows = num_nodes * ir_dim;
+                    auto yg = Kokkos::subview(
+                        rrnlb_rev_pack_y_workspace,
+                        make_pair(0, rows),
+                        make_pair(0, n_total));
+                    auto xg = Kokkos::subview(
+                        rrnlb_rev_pack_x_workspace,
+                        make_pair(0, rows),
+                        make_pair(0, k_in));
+
+                    for (int t = 0; t < count; ++t) {
+                        const int idx = first + t;
+                        const int q = linear.h_rev_group_ins_index[idx];
+                        const int out_offset = linear.h_ins_out_offset[q];
+                        const int mul_out = linear.h_ins_mul_out[q];
+                        const int n_offset = linear.h_rev_group_ins_n_offset[idx];
+                        const int pack_work = num_nodes * mul_out * ir_dim;
+                        Kokkos::parallel_for(
+                            "RRNLB rev pack input (mixed)",
+                            Kokkos::RangePolicy<Kokkos::DefaultExecutionSpace>(0, pack_work),
+                            KOKKOS_LAMBDA (const int iom) {
+                                const int i = iom / (mul_out * ir_dim);
+                                const int rem = iom - i * mul_out * ir_dim;
+                                const int out = rem / ir_dim;
+                                const int lm = rem - out * ir_dim;
+                                const int row = i * ir_dim + lm;
+                                yg(row, n_offset + out) =
+                                    y_adj_precision(i, out_offset + out * ir_dim + lm);
+                            });
+                    }
+
+                    const int w_base = linear.h_rev_group_pack_weight_offset[g];
+                    const auto wg =
+                        Kokkos::View<const Precision**,Kokkos::LayoutRight,Kokkos::MemoryUnmanaged>(
+                            linear.rev_group_pack_weights.data() + w_base,
+                            n_total,
+                            k_in);
+                    KokkosBlas::gemm(
+                        "N",
+                        "N",
+                        static_cast<Precision>(1.0),
+                        yg,
+                        wg,
+                        static_cast<Precision>(0.0),
+                        xg);
+
+                    Kokkos::parallel_for(
+                        "RRNLB rev unpack output (mixed)",
+                        Kokkos::RangePolicy<Kokkos::DefaultExecutionSpace>(
+                            0,
+                            num_nodes * k_in * ir_dim),
+                        KOKKOS_LAMBDA (const int ikm) {
+                            const int i = ikm / (k_in * ir_dim);
+                            const int rem = ikm - i * k_in * ir_dim;
+                            const int kin = rem / ir_dim;
+                            const int lm = rem - kin * ir_dim;
+                            const int row = i * ir_dim + lm;
+                            x_adj(i, in_offset + kin * ir_dim + lm) +=
+                                static_cast<AccumPrecision>(xg(row, kin));
+                        });
+                }
+                return;
+            }
+        }
+
+#if defined(KOKKOS_ENABLE_CUDA) && defined(SYMMETRIX_HAVE_CUBLAS)
+        if (rrnlb_cublas_enabled()
+            && Kokkos::SpaceAccessibility<
+                Kokkos::CudaSpace,
+                typename decltype(y_adj_precision)::memory_space>::accessible
+            && Kokkos::SpaceAccessibility<
+                Kokkos::CudaSpace,
+                typename decltype(rrnlb_transpose_x_precision_workspace)::memory_space>::accessible) {
+            if (num_nodes > 0) {
+                auto exec = Kokkos::DefaultExecutionSpace();
+                auto handle = rrnlb_get_cublas_handle();
+                cublasLtHandle_t lt_handle = nullptr;
+                if constexpr (std::is_same_v<Precision, float>) {
+                    if (!rrnlb_cublas_tf32_enabled()) {
+                        lt_handle = rrnlb_get_cublaslt_handle();
+                    }
+                }
+                rrnlb_throw_cublas_error(
+                    cublasSetPointerMode(handle, CUBLAS_POINTER_MODE_HOST),
+                    "rrnlb_apply_linear_transpose(mixed cublasSetPointerMode)");
+                rrnlb_throw_cublas_error(
+                    cublasSetStream(handle, exec.cuda_stream()),
+                    "rrnlb_apply_linear_transpose(mixed cublasSetStream)");
+
+                const std::size_t y_row_stride_sz = y_adj_precision.stride(0);
+                const std::size_t y_col_stride_sz = y_adj_precision.stride(1);
+                if (y_col_stride_sz != 1) {
+                    throw std::runtime_error(
+                        "RRNLB mixed linear transpose requires contiguous Y column stride.");
+                }
+                const long long int y_row_stride = static_cast<long long int>(y_row_stride_sz);
+                const auto& h_ins_out_offset = linear.h_ins_out_offset;
+                const auto& h_ins_mul_out = linear.h_ins_mul_out;
+                const auto& h_ins_weight_offset = linear.h_ins_weight_offset;
+                const auto& h_ins_path_weight = linear.h_ins_path_weight;
+                const auto ins_weights = linear.ins_weights;
+                const int num_groups = static_cast<int>(linear.h_rev_group_first_ins.size());
+                const Precision beta = static_cast<Precision>(1.0);
+
+                for (int g = 0; g < num_groups; ++g) {
+                    const int ir_dim = linear.h_rev_group_ir_dim[g];
+                    const int k_in = linear.h_rev_group_mul_in[g];
+                    const int in_offset = linear.h_rev_group_in_offset[g];
+                    const int first = linear.h_rev_group_first_ins[g];
+                    const int count = linear.h_rev_group_num_ins[g];
+                    const int cols = k_in * ir_dim;
+
+                    auto x_group = Kokkos::subview(
+                        rrnlb_transpose_x_precision_workspace,
+                        Kokkos::make_pair(0, num_nodes),
+                        Kokkos::make_pair(0, cols));
+                    Kokkos::deep_copy(x_group, static_cast<Precision>(0.0));
+
+                    const std::size_t x_row_stride_sz = x_group.stride(0);
+                    const std::size_t x_col_stride_sz = x_group.stride(1);
+                    if (x_col_stride_sz != 1) {
+                        throw std::runtime_error(
+                            "RRNLB mixed linear transpose requires contiguous X column stride.");
+                    }
+                    const long long int x_row_stride = static_cast<long long int>(x_row_stride_sz);
+
+                    for (int t = 0; t < count; ++t) {
+                        const int idx = first + t;
+                        const int q = linear.h_rev_group_ins_index[idx];
+                        const int mul_out = h_ins_mul_out[q];
+                        const int out_offset = h_ins_out_offset[q];
+                        const int w_offset = h_ins_weight_offset[q];
+                        const Precision alpha = h_ins_path_weight[q];
+                        const Precision* y_base = y_adj_precision.data() + out_offset;
+                        const Precision* w_base = ins_weights.data() + w_offset;
+                        Precision* x_base = x_group.data();
+                        cublasStatus_t gemm_status = CUBLAS_STATUS_NOT_SUPPORTED;
+                        if constexpr (std::is_same_v<Precision, float>) {
+                            if (!rrnlb_cublas_tf32_enabled() && lt_handle != nullptr) {
+                                gemm_status = rrnlb_cublaslt_gemm_strided_batched_fp32(
+                                    lt_handle,
+                                    exec.cuda_stream(),
+                                    CUBLAS_OP_N,
+                                    CUBLAS_OP_N,
+                                    ir_dim,
+                                    k_in,
+                                    mul_out,
+                                    &alpha,
+                                    y_base,
+                                    ir_dim,
+                                    y_row_stride,
+                                    w_base,
+                                    mul_out,
+                                    0,
+                                    &beta,
+                                    x_base,
+                                    ir_dim,
+                                    x_row_stride,
+                                    num_nodes);
+                                if (rrnlb_cublaslt_strict_enabled()
+                                    && gemm_status != CUBLAS_STATUS_SUCCESS) {
+                                    rrnlb_throw_cublas_error(
+                                        gemm_status,
+                                        "rrnlb_apply_linear_transpose(mixed cublasLtMatmul)");
+                                }
+                            }
+                        }
+                        if (gemm_status != CUBLAS_STATUS_SUCCESS) {
+                            gemm_status = rrnlb_cublas_gemm_strided_batched<Precision>(
+                                handle,
+                                CUBLAS_OP_N,
+                                CUBLAS_OP_N,
+                                ir_dim,
+                                k_in,
+                                mul_out,
+                                &alpha,
+                                y_base,
+                                ir_dim,
+                                y_row_stride,
+                                w_base,
+                                mul_out,
+                                0,
+                                &beta,
+                                x_base,
+                                ir_dim,
+                                x_row_stride,
+                                num_nodes);
+                        }
+                        rrnlb_throw_cublas_error(
+                            gemm_status,
+                            "rrnlb_apply_linear_transpose(mixed cublasGemmStridedBatched)");
+                    }
+
+                    Kokkos::parallel_for(
+                        "RRNLB mixed transpose accum (cublas)",
+                        Kokkos::RangePolicy<Kokkos::DefaultExecutionSpace>(
+                            0,
+                            num_nodes * cols),
+                        KOKKOS_LAMBDA (const int ik) {
+                            const int i = ik / cols;
+                            const int rem = ik - i * cols;
+                            const int kin = rem / ir_dim;
+                            const int lm = rem - kin * ir_dim;
+                            x_adj(i, in_offset + kin * ir_dim + lm) +=
+                                static_cast<AccumPrecision>(x_group(i, rem));
+                        });
+                }
+            }
+            return;
+        }
+#endif
+
+        const auto ins_out_offset = linear.ins_out_offset;
+        const auto ins_mul_in = linear.ins_mul_in;
+        const auto ins_mul_out = linear.ins_mul_out;
+        const auto ins_ir_dim = linear.ins_ir_dim;
+        const auto ins_weight_offset = linear.ins_weight_offset;
+        const auto ins_path_weight = linear.ins_path_weight;
+        const auto ins_weights = linear.ins_weights;
+        const auto rev_group_first_ins = linear.rev_group_first_ins;
+        const auto rev_group_num_ins = linear.rev_group_num_ins;
+        const auto rev_group_ins_index = linear.rev_group_ins_index;
+        const int num_groups = rev_group_first_ins.extent_int(0);
+
+        for (int g = 0; g < num_groups; ++g) {
+            const int ir_dim = linear.h_rev_group_ir_dim[g];
+            const int k_in = linear.h_rev_group_mul_in[g];
+            const int in_offset = linear.h_rev_group_in_offset[g];
+            const int cols = k_in * ir_dim;
+            auto x_group = Kokkos::subview(
+                rrnlb_transpose_x_precision_workspace,
+                Kokkos::make_pair(0, num_nodes),
+                Kokkos::make_pair(0, cols));
+            Kokkos::deep_copy(x_group, static_cast<Precision>(0.0));
+
+            if (num_nodes > 0) {
+                Kokkos::parallel_for(
+                    "RRNLB linear transpose mixed fallback",
+                    Kokkos::TeamPolicy<>(num_nodes, Kokkos::AUTO, 32),
+                    KOKKOS_LAMBDA (Kokkos::TeamPolicy<>::member_type team_member) {
+                        const int i = team_member.league_rank();
+                        auto y_i = Kokkos::subview(y_adj_precision, i, Kokkos::ALL);
+                        auto x_i = Kokkos::subview(x_group, i, Kokkos::ALL);
+                        const int first = rev_group_first_ins(g);
+                        const int count = rev_group_num_ins(g);
+                        for (int t = 0; t < count; ++t) {
+                            const int q = rev_group_ins_index(first + t);
+                            const int mul_in = ins_mul_in(q);
+                            const int mul_out = ins_mul_out(q);
+                            const int ir_dim_q = ins_ir_dim(q);
+                            const int out_offset = ins_out_offset(q);
+                            const int w_offset = ins_weight_offset(q);
+                            auto X =
+                                Kokkos::View<Precision**,Kokkos::LayoutRight,Kokkos::MemoryUnmanaged>(
+                                    x_i.data(),
+                                    mul_in,
+                                    ir_dim_q);
+                            const auto W = Kokkos::View<
+                                const Precision**,
+                                Kokkos::LayoutRight,
+                                Kokkos::MemoryUnmanaged>(
+                                    ins_weights.data() + w_offset,
+                                    mul_in,
+                                    mul_out);
+                            const auto Y = Kokkos::View<
+                                const Precision**,
+                                Kokkos::LayoutRight,
+                                Kokkos::MemoryUnmanaged>(
+                                    y_i.data() + out_offset,
+                                    mul_out,
+                                    ir_dim_q);
+                            KokkosBatched::TeamGemm<Kokkos::TeamPolicy<>::member_type,
+                                                    KokkosBatched::Trans::NoTranspose,
+                                                    KokkosBatched::Trans::NoTranspose,
+                                                    KokkosBatched::Algo::Gemm::Blocked>
+                                ::invoke(
+                                    team_member,
+                                    ins_path_weight(q),
+                                    W,
+                                    Y,
+                                    static_cast<Precision>(1.0),
+                                    X);
+                            team_member.team_barrier();
+                        }
+                    });
+            }
+
+            Kokkos::parallel_for(
+                "RRNLB mixed transpose accum (fallback)",
+                Kokkos::RangePolicy<Kokkos::DefaultExecutionSpace>(0, num_nodes * cols),
+                KOKKOS_LAMBDA (const int ik) {
+                    const int i = ik / cols;
+                    const int rem = ik - i * cols;
+                    const int kin = rem / ir_dim;
+                    const int lm = rem - kin * ir_dim;
+                    x_adj(i, in_offset + kin * ir_dim + lm) +=
+                        static_cast<AccumPrecision>(x_group(i, rem));
+                });
+        }
+        return;
+    } else {
+        run_transpose_precision(y_adj, x_adj);
+    }
+}
+
+template <typename Precision, typename AccumPrecision>
+void MACEKokkos<Precision, AccumPrecision>::rrnlb_apply_gate_forward(
+    const RRNLBLayerKokkos& layer,
+    const int num_nodes,
+    Kokkos::View<const Precision**,Kokkos::LayoutRight> x,
+    Kokkos::View<Precision**,Kokkos::LayoutRight> y)
+{
+    if (x.extent(0) < num_nodes || x.extent(1) != layer.linear_1.dim_out) {
+        throw std::runtime_error("RRNLB gate forward input has invalid shape.");
+    }
+    if (y.extent(0) < num_nodes || y.extent(1) != layer.linear_2.dim_in) {
+        throw std::runtime_error("RRNLB gate forward output has invalid shape.");
+    }
+    Kokkos::deep_copy(y, static_cast<Precision>(0.0));
+
+    const auto target_offset = layer.target_offset;
+    const auto target_mul = layer.target_mul;
+    const auto target_l = layer.target_l;
+    const auto nonlin_offset = layer.nonlin_offset;
+    const auto nonlin_mul = layer.nonlin_mul;
+    const auto nonlin_l = layer.nonlin_l;
+    const auto gate_gate_cst = layer.gate_gate_cst;
+    const Precision gate_scalar_cst = static_cast<Precision>(layer.gate_scalar_cst);
+    const bool gate_identity_mode =
+        rrnlb_nonlinear_ablation_mode() == RRNLBNonlinearAblationMode::GateIdentity;
+
+    Kokkos::parallel_for(
+        "RRNLB gate forward",
+        Kokkos::TeamPolicy<>(num_nodes, Kokkos::AUTO, 32),
+        KOKKOS_LAMBDA (Kokkos::TeamPolicy<>::member_type team_member) {
+            const int i = team_member.league_rank();
+            auto x_i = Kokkos::subview(x, i, Kokkos::ALL);
+            auto y_i = Kokkos::subview(y, i, Kokkos::ALL);
+
+            const int scalar_mul = target_mul(0);
+            const int scalar_nonlin_offset = nonlin_offset(0);
+            const int scalar_target_offset = target_offset(0);
+            Kokkos::parallel_for(
+                Kokkos::TeamThreadRange(team_member, scalar_mul),
+                [&] (const int k) {
+                    const Precision v = x_i(scalar_nonlin_offset + k);
+                    y_i(scalar_target_offset + k) = gate_identity_mode
+                        ? gate_scalar_cst * v
+                        : gate_scalar_cst * rrnlb_silu(v);
+                });
+            team_member.team_barrier();
+
+            int gate_offset = scalar_nonlin_offset + scalar_mul;
+            for (int p = 1; p < target_offset.extent(0); ++p) {
+                const int out_offset = target_offset(p);
+                const int in_offset = nonlin_offset(p);
+                const int mul = target_mul(p);
+                const int ir_dim = 2 * target_l(p) + 1;
+                const Precision cst =
+                    p - 1 < gate_gate_cst.extent(0) ? gate_gate_cst(p - 1) : static_cast<Precision>(1.0);
+                Kokkos::parallel_for(
+                    Kokkos::TeamThreadRange(team_member, mul),
+                    [&] (const int k) {
+                        const Precision g = gate_identity_mode
+                            ? cst
+                            : cst * rrnlb_sigmoid(x_i(gate_offset + k));
+                        for (int m = 0; m < ir_dim; ++m) {
+                            y_i(out_offset + k * ir_dim + m) = g * x_i(in_offset + k * ir_dim + m);
+                        }
+                    });
+                team_member.team_barrier();
+                gate_offset += mul;
+            }
+        });
+}
+
+template <typename Precision, typename AccumPrecision>
+void MACEKokkos<Precision, AccumPrecision>::rrnlb_apply_gate_reverse(
+    const RRNLBLayerKokkos& layer,
+    const int num_nodes,
+    Kokkos::View<const Precision**,Kokkos::LayoutRight> x,
+    Kokkos::View<const AccumPrecision**,Kokkos::LayoutRight> y_adj,
+    Kokkos::View<AccumPrecision**,Kokkos::LayoutRight> x_adj)
+{
+    if (x.extent(0) < num_nodes || x.extent(1) != layer.linear_1.dim_out) {
+        throw std::runtime_error("RRNLB gate reverse input has invalid shape.");
+    }
+    if (y_adj.extent(0) < num_nodes || y_adj.extent(1) != layer.linear_2.dim_in) {
+        throw std::runtime_error("RRNLB gate reverse output adjoint has invalid shape.");
+    }
+    if (x_adj.extent(0) < num_nodes || x_adj.extent(1) != layer.linear_1.dim_out) {
+        throw std::runtime_error("RRNLB gate reverse input adjoint has invalid shape.");
+    }
+    Kokkos::deep_copy(x_adj, static_cast<AccumPrecision>(0.0));
+
+    const auto target_offset = layer.target_offset;
+    const auto target_mul = layer.target_mul;
+    const auto target_l = layer.target_l;
+    const auto nonlin_offset = layer.nonlin_offset;
+    const auto nonlin_mul = layer.nonlin_mul;
+    const auto nonlin_l = layer.nonlin_l;
+    const auto gate_gate_cst = layer.gate_gate_cst;
+    const AccumPrecision gate_scalar_cst = static_cast<AccumPrecision>(layer.gate_scalar_cst);
+    const bool gate_identity_mode =
+        rrnlb_nonlinear_ablation_mode() == RRNLBNonlinearAblationMode::GateIdentity;
+
+    Kokkos::parallel_for(
+        "RRNLB gate reverse",
+        Kokkos::TeamPolicy<>(num_nodes, Kokkos::AUTO, 32),
+        KOKKOS_LAMBDA (Kokkos::TeamPolicy<>::member_type team_member) {
+            const int i = team_member.league_rank();
+            auto x_i = Kokkos::subview(x, i, Kokkos::ALL);
+            auto y_adj_i = Kokkos::subview(y_adj, i, Kokkos::ALL);
+            auto x_adj_i = Kokkos::subview(x_adj, i, Kokkos::ALL);
+
+            const int scalar_mul = target_mul(0);
+            const int scalar_nonlin_offset = nonlin_offset(0);
+            const int scalar_target_offset = target_offset(0);
+            Kokkos::parallel_for(
+                Kokkos::TeamThreadRange(team_member, scalar_mul),
+                [&] (const int k) {
+                    const int in_idx = scalar_nonlin_offset + k;
+                    const int out_idx = scalar_target_offset + k;
+                    x_adj_i(in_idx) += y_adj_i(out_idx) * gate_scalar_cst
+                        * (gate_identity_mode
+                            ? static_cast<AccumPrecision>(1.0)
+                            : static_cast<AccumPrecision>(rrnlb_silu_deriv(x_i(in_idx))));
+                });
+            team_member.team_barrier();
+
+            int gate_offset = scalar_nonlin_offset + scalar_mul;
+            for (int p = 1; p < target_offset.extent(0); ++p) {
+                const int out_offset = target_offset(p);
+                const int in_offset = nonlin_offset(p);
+                const int mul = target_mul(p);
+                const int ir_dim = 2 * target_l(p) + 1;
+                const AccumPrecision cst =
+                    p - 1 < gate_gate_cst.extent(0)
+                        ? static_cast<AccumPrecision>(gate_gate_cst(p - 1))
+                        : static_cast<AccumPrecision>(1.0);
+                Kokkos::parallel_for(
+                    Kokkos::TeamThreadRange(team_member, mul),
+                    [&] (const int k) {
+                        const AccumPrecision sig = static_cast<AccumPrecision>(rrnlb_sigmoid(x_i(gate_offset + k)));
+                        const AccumPrecision g = gate_identity_mode
+                            ? cst
+                            : cst * sig;
+                        AccumPrecision dg = static_cast<AccumPrecision>(0.0);
+                        for (int m = 0; m < ir_dim; ++m) {
+                            const int out_idx = out_offset + k * ir_dim + m;
+                            const int in_idx = in_offset + k * ir_dim + m;
+                            x_adj_i(in_idx) += y_adj_i(out_idx) * g;
+                            if (!gate_identity_mode) {
+                                dg += y_adj_i(out_idx) * static_cast<AccumPrecision>(x_i(in_idx));
+                            }
+                        }
+                        if (!gate_identity_mode) {
+                            x_adj_i(gate_offset + k) += dg * cst * sig
+                                * (static_cast<AccumPrecision>(1.0) - sig);
+                        }
+                    });
+                team_member.team_barrier();
+                gate_offset += mul;
+            }
+        });
+}
+
+template <typename Precision, typename AccumPrecision>
+void MACEKokkos<Precision, AccumPrecision>::compute_rrnlb_interaction_layer_forward(
+    const int layer_index,
+    const int num_nodes,
+    Kokkos::View<const int*> node_types,
+    Kokkos::View<const int*> num_neigh,
+    Kokkos::View<const int*> neigh_indices,
+    Kokkos::View<const int*> neigh_types,
+    Kokkos::View<const double*> r,
+    Kokkos::View<const int*> first_neigh,
+    Kokkos::View<const Precision**,Kokkos::LayoutRight> node_feats_in,
+    Kokkos::View<Precision**,Kokkos::LayoutRight> layer_output,
+    Kokkos::View<Precision**,Kokkos::LayoutRight> layer_skip,
+    RRNLBLayerCacheKokkos& cache,
+    int num_sender_nodes,
+    Kokkos::View<const int*> target_node_indices,
+    int total_edges,
+    Kokkos::View<const int*> edge_to_receiver)
+{
+    if (layer_index < 0 || layer_index >= static_cast<int>(rrnlb_layers_kokkos.size())) {
+        throw std::runtime_error("RRNLB layer index out of bounds.");
+    }
+    const auto& layer = rrnlb_layers_kokkos[layer_index];
+    const int in_dim = layer.linear_up.dim_in;
+    const int sender_nodes = (num_sender_nodes > 0) ? num_sender_nodes : num_nodes;
+    if (node_feats_in.extent(0) < sender_nodes || node_feats_in.extent(1) != in_dim) {
+        throw std::runtime_error("RRNLB interaction forward input has invalid shape.");
+    }
+    if (layer_output.extent(0) < num_nodes || layer_output.extent(1) != layer.linear_2.dim_out) {
+        throw std::runtime_error("RRNLB interaction forward output has invalid shape.");
+    }
+    if (layer_skip.extent(0) < num_nodes || layer_skip.extent(1) != layer.skip_tp.dim_out) {
+        throw std::runtime_error("RRNLB interaction forward skip has invalid shape.");
+    }
+    const bool has_target_map = target_node_indices.extent(0) > 0;
+    if (has_target_map && target_node_indices.extent(0) < num_nodes) {
+        throw std::runtime_error("RRNLB interaction forward target index map has invalid shape.");
+    }
+    const bool use_edge_parallel = total_edges > 0 && edge_to_receiver.extent(0) >= total_edges;
+
+    auto ensure_cache_2d = [](auto& view, const int d0, const int d1) {
+        if (view.extent(0) != static_cast<std::size_t>(d0)
+            || view.extent(1) != static_cast<std::size_t>(d1)) {
+            Kokkos::realloc(view, d0, d1);
+        }
+    };
+    auto ensure_cache_1d = [](auto& view, const int d0) {
+        if (view.extent(0) != static_cast<std::size_t>(d0)) {
+            Kokkos::realloc(view, d0);
+        }
+    };
+
+    ensure_cache_2d(cache.h_up, sender_nodes, layer.linear_up.dim_out);
+    ensure_cache_2d(cache.h_up_targets, num_nodes, layer.linear_up.dim_out);
+    ensure_cache_2d(cache.x_targets, num_nodes, in_dim);
+    ensure_cache_2d(cache.h_res, num_nodes, layer.linear_res.dim_out);
+    ensure_cache_2d(cache.conv_accum, num_nodes, layer.linear_1.dim_in);
+    ensure_cache_1d(cache.density, num_nodes);
+    ensure_cache_2d(cache.lin1_raw, num_nodes, layer.linear_1.dim_out);
+    ensure_cache_2d(cache.pre_gate, num_nodes, layer.linear_1.dim_out);
+    ensure_cache_2d(cache.gated, num_nodes, layer.linear_2.dim_in);
+
+    auto h_up_targets = cache.h_up_targets;
+    auto x_targets = cache.x_targets;
+    auto h_res = cache.h_res;
+    auto conv_accum = cache.conv_accum;
+    auto gated = cache.gated;
+
+    rrnlb_apply_linear_forward(layer.linear_up, sender_nodes, node_feats_in, cache.h_up);
+    const auto target_map = target_node_indices;
+    const auto h_up_all = cache.h_up;
+    Kokkos::parallel_for(
+        "RRNLB gather targets",
+        num_nodes,
+        KOKKOS_LAMBDA (const int i) {
+            const int sender_i = has_target_map ? target_map(i) : i;
+            for (int p = 0; p < h_up_targets.extent_int(1); ++p) {
+                h_up_targets(i, p) = h_up_all(sender_i, p);
+            }
+            for (int p = 0; p < x_targets.extent_int(1); ++p) {
+                x_targets(i, p) = node_feats_in(sender_i, p);
+            }
+        });
+    rrnlb_apply_linear_forward(layer.linear_res, num_nodes, h_up_targets, h_res);
+    rrnlb_apply_linear_forward(layer.skip_tp, num_nodes, x_targets, layer_skip);
+    Kokkos::deep_copy(conv_accum, static_cast<Precision>(0.0));
+    Kokkos::deep_copy(cache.density, static_cast<Precision>(0.0));
+
+    const auto conv_in_offset = layer.conv_in_offset;
+    const auto conv_out_offset = layer.conv_out_offset;
+    const auto conv_mul = layer.conv_mul;
+    const auto conv_weight_offset = layer.conv_weight_offset;
+    const auto conv_in_ir_dim = layer.conv_in_ir_dim;
+    const auto conv_out_ir_dim = layer.conv_out_ir_dim;
+    const auto conv_term_offset = layer.conv_term_offset;
+    const auto conv_term_count = layer.conv_term_count;
+    const auto conv_term_m_out = layer.conv_term_m_out;
+    const auto conv_term_m_in1 = layer.conv_term_m_in1;
+    const auto conv_term_y_lm = layer.conv_term_y_lm;
+    const auto conv_term_coeff = layer.conv_term_coeff;
+    const int num_conv_ins = conv_in_offset.extent(0);
+    const auto tp_spline_coeff = layer.tp_spline_coeff;
+    const auto density_spline_coeff = layer.density_spline_coeff;
+    const double radial_h = layer.radial_h;
+    const int radial_num_intervals = layer.radial_num_intervals;
+    const int tp_weight_numel = layer.tp_weight_numel;
+    const int conv_out_dim = layer.linear_1.dim_in;
+    const int num_elements = this->num_elements;
+    const auto Y = this->Y;
+    const int num_lm = this->num_lm;
+
+    if (use_edge_parallel) {
+        // Edge-parallel forward: one team per edge for maximum GPU occupancy.
+        // Prefer compact receiver-local accumulation for outputs to reduce
+        // global atomics into conv_accum, with a fallback to direct atomics.
+        const auto edge_recv = edge_to_receiver;
+        auto density_view = cache.density;
+        const auto conv_active_out_indices = layer.conv_active_out_indices;
+        const auto conv_active_out_inverse = layer.conv_active_out_inverse;
+        const int compact_out_count =
+            layer.conv_active_out_count > 0 ? layer.conv_active_out_count : conv_out_dim;
+        const bool compact_auto_edge = compact_out_count * 5 <= conv_out_dim * 4;
+        const auto compact_mode = rrnlb_interaction_compact_mode();
+        const bool use_compact_out =
+            compact_mode == RRNLBInteractionCompactMode::On
+                ? true
+                : (compact_mode == RRNLBInteractionCompactMode::Auto && compact_auto_edge);
+        if (use_compact_out) {
+            Kokkos::parallel_for(
+                "RRNLB conv forward (edge-parallel compact-out)",
+                Kokkos::TeamPolicy<>(total_edges, Kokkos::AUTO, rrnlb_forward_vector_length())
+                    .set_scratch_size(
+                        0,
+                        Kokkos::PerTeam((tp_weight_numel + compact_out_count) * sizeof(Precision))),
+                KOKKOS_LAMBDA (Kokkos::TeamPolicy<>::member_type team_member) {
+                    const int ij = team_member.league_rank();
+                    const int i = edge_recv(ij);
+                    auto scratch = Kokkos::View<Precision*,Kokkos::MemoryUnmanaged>(
+                        team_member.team_scratch(0), tp_weight_numel + compact_out_count);
+                    auto tp_values = Kokkos::subview(scratch, Kokkos::make_pair(0, tp_weight_numel));
+                    auto conv_edge_local =
+                        Kokkos::subview(scratch, Kokkos::make_pair(tp_weight_numel, tp_weight_numel + compact_out_count));
+
+                    const int sender = neigh_indices(ij);
+                    const int pair_index = neigh_types(ij) * num_elements + node_types(i);
+                    const Precision r_ij = static_cast<Precision>(r(ij));
+                    int interval = static_cast<int>(r_ij / static_cast<Precision>(radial_h));
+                    if (interval < 0) interval = 0;
+                    if (interval >= radial_num_intervals) interval = radial_num_intervals - 1;
+                    const Precision x = r_ij - static_cast<Precision>(radial_h) * interval;
+                    const Precision xx = x * x;
+                    const Precision xxx = xx * x;
+
+                    Kokkos::parallel_for(
+                        Kokkos::TeamThreadRange(team_member, compact_out_count),
+                        [&] (const int p_local) {
+                            conv_edge_local(p_local) = static_cast<Precision>(0.0);
+                        });
+                    Kokkos::parallel_for(
+                        Kokkos::TeamThreadRange(team_member, tp_weight_numel),
+                        [&] (const int w) {
+                            tp_values(w) = rrnlb_eval_spline(
+                                tp_spline_coeff, pair_index, interval, w, x, xx, xxx);
+                        });
+                    team_member.team_barrier();
+
+                    Kokkos::single(Kokkos::PerTeam(team_member), [&] () {
+                        Kokkos::atomic_add(
+                            &density_view(i),
+                            rrnlb_eval_spline_scalar(
+                                density_spline_coeff, pair_index, interval, x, xx, xxx));
+                    });
+
+                    const auto up_sender = Kokkos::subview(h_up_all, sender, Kokkos::ALL);
+                    for (int q = 0; q < num_conv_ins; ++q) {
+                        const int in_off = conv_in_offset(q);
+                        const int out_off = conv_out_offset(q);
+                        const int mul = conv_mul(q);
+                        const int w_off = conv_weight_offset(q);
+                        const int in_ir = conv_in_ir_dim(q);
+                        const int out_ir = conv_out_ir_dim(q);
+                        const int term0 = conv_term_offset(q);
+                        const int termN = conv_term_count(q);
+                        for (int t_local = 0; t_local < termN; ++t_local) {
+                            const int t = term0 + t_local;
+                            const Precision coeff =
+                                conv_term_coeff(t) * Y(ij * num_lm + conv_term_y_lm(t));
+                            const int m_out = conv_term_m_out(t);
+                            const int m_in1 = conv_term_m_in1(t);
+                            Kokkos::parallel_for(
+                                Kokkos::TeamThreadRange(team_member, mul),
+                                [&] (const int k) {
+                                    const int out_idx = out_off + k * out_ir + m_out;
+                                    const int out_slot = conv_active_out_inverse(out_idx);
+                                    if (out_slot >= 0) {
+                                        const int in_idx = in_off + k * in_ir + m_in1;
+                                        conv_edge_local(out_slot) +=
+                                            coeff * tp_values(w_off + k) * up_sender(in_idx);
+                                    }
+                                });
+                        }
+                    }
+
+                    Kokkos::parallel_for(
+                        Kokkos::TeamThreadRange(team_member, compact_out_count),
+                        [&] (const int p_local) {
+                            const Precision val = conv_edge_local(p_local);
+                            if (val != static_cast<Precision>(0.0)) {
+                                const int p = conv_active_out_indices(p_local);
+                                Kokkos::atomic_add(&conv_accum(i, p), val);
+                            }
+                        });
+                });
+        } else {
+            Kokkos::parallel_for(
+                "RRNLB conv forward (edge-parallel)",
+                Kokkos::TeamPolicy<>(total_edges, Kokkos::AUTO, rrnlb_forward_vector_length())
+                    .set_scratch_size(0, Kokkos::PerTeam(tp_weight_numel * sizeof(Precision))),
+                KOKKOS_LAMBDA (Kokkos::TeamPolicy<>::member_type team_member) {
+                    const int ij = team_member.league_rank();
+                    const int i = edge_recv(ij);
+                    auto tp_values = Kokkos::View<Precision*,Kokkos::MemoryUnmanaged>(
+                        team_member.team_scratch(0), tp_weight_numel);
+
+                    const int sender = neigh_indices(ij);
+                    const int pair_index = neigh_types(ij) * num_elements + node_types(i);
+                    const Precision r_ij = static_cast<Precision>(r(ij));
+                    int interval = static_cast<int>(r_ij / static_cast<Precision>(radial_h));
+                    if (interval < 0) interval = 0;
+                    if (interval >= radial_num_intervals) interval = radial_num_intervals - 1;
+                    const Precision x = r_ij - static_cast<Precision>(radial_h) * interval;
+                    const Precision xx = x * x;
+                    const Precision xxx = xx * x;
+
+                    Kokkos::parallel_for(
+                        Kokkos::TeamThreadRange(team_member, tp_weight_numel),
+                        [&] (const int w) {
+                            tp_values(w) = rrnlb_eval_spline(tp_spline_coeff, pair_index, interval, w, x, xx, xxx);
+                        });
+                    team_member.team_barrier();
+
+                    Kokkos::single(Kokkos::PerTeam(team_member), [&] () {
+                        Kokkos::atomic_add(&density_view(i),
+                            rrnlb_eval_spline_scalar(density_spline_coeff, pair_index, interval, x, xx, xxx));
+                    });
+
+                    const auto up_sender = Kokkos::subview(h_up_all, sender, Kokkos::ALL);
+                    for (int q = 0; q < num_conv_ins; ++q) {
+                        const int in_off = conv_in_offset(q);
+                        const int out_off = conv_out_offset(q);
+                        const int mul = conv_mul(q);
+                        const int w_off = conv_weight_offset(q);
+                        const int in_ir = conv_in_ir_dim(q);
+                        const int out_ir = conv_out_ir_dim(q);
+                        const int term0 = conv_term_offset(q);
+                        const int termN = conv_term_count(q);
+                        // Flatten term*mul for better thread utilization.
+                        const int total_work = termN * mul;
+                        Kokkos::parallel_for(
+                            Kokkos::TeamThreadRange(team_member, total_work),
+                            [&] (const int tk) {
+                                const int t_local = tk / mul;
+                                const int k = tk % mul;
+                                const int t = term0 + t_local;
+                                const Precision coeff =
+                                    conv_term_coeff(t) * Y(ij * num_lm + conv_term_y_lm(t));
+                                const int m_out = conv_term_m_out(t);
+                                const int m_in1 = conv_term_m_in1(t);
+                                const int out_idx = out_off + k * out_ir + m_out;
+                                const int in_idx = in_off + k * in_ir + m_in1;
+                                Kokkos::atomic_add(&conv_accum(i, out_idx),
+                                    coeff * tp_values(w_off + k) * up_sender(in_idx));
+                            });
+                    }
+                });
+        }
+    } else {
+        // Fallback: original node-parallel forward (for MPI paths without edge map)
+        const auto conv_active_out_indices = layer.conv_active_out_indices;
+        const auto conv_active_out_inverse = layer.conv_active_out_inverse;
+        const int compact_out_count =
+            layer.conv_active_out_count > 0 ? layer.conv_active_out_count : conv_out_dim;
+        const bool compact_auto_node =
+            compact_out_count * 5 <= conv_out_dim * 4 && compact_out_count <= 2048;
+        const auto compact_mode = rrnlb_interaction_compact_mode();
+        const bool use_compact_out_node =
+            compact_mode == RRNLBInteractionCompactMode::On
+                ? (compact_out_count <= 2048)
+                : (compact_mode == RRNLBInteractionCompactMode::Auto && compact_auto_node);
+        if (use_compact_out_node) {
+            Kokkos::parallel_for(
+                "RRNLB conv forward (node-parallel compact-out)",
+                Kokkos::TeamPolicy<>(num_nodes, Kokkos::AUTO, rrnlb_forward_vector_length())
+                    .set_scratch_size(
+                        0,
+                        Kokkos::PerTeam((tp_weight_numel + compact_out_count) * sizeof(Precision))),
+                KOKKOS_LAMBDA (Kokkos::TeamPolicy<>::member_type team_member) {
+                    const int i = team_member.league_rank();
+                    auto scratch = Kokkos::View<Precision*,Kokkos::MemoryUnmanaged>(
+                        team_member.team_scratch(0), tp_weight_numel + compact_out_count);
+                    auto tp_values = Kokkos::subview(scratch, Kokkos::make_pair(0, tp_weight_numel));
+                    auto conv_local =
+                        Kokkos::subview(scratch, Kokkos::make_pair(tp_weight_numel, tp_weight_numel + compact_out_count));
+                    auto conv_i = Kokkos::subview(conv_accum, i, Kokkos::ALL);
+                    Precision density_i = static_cast<Precision>(0.0);
+
+                    Kokkos::parallel_for(
+                        Kokkos::TeamThreadRange(team_member, compact_out_count),
+                        [&] (const int p_local) {
+                            conv_local(p_local) = static_cast<Precision>(0.0);
+                        });
+                    team_member.team_barrier();
+
+                    const int i0 = first_neigh(i);
+                    for (int j = 0; j < num_neigh(i); ++j) {
+                        const int ij = i0 + j;
+                        const int sender = neigh_indices(ij);
+                        const int pair_index = neigh_types(ij) * num_elements + node_types(i);
+                        const Precision r_ij = static_cast<Precision>(r(ij));
+                        int interval = static_cast<int>(r_ij / static_cast<Precision>(radial_h));
+                        if (interval < 0) interval = 0;
+                        if (interval >= radial_num_intervals) interval = radial_num_intervals - 1;
+                        const Precision x = r_ij - static_cast<Precision>(radial_h) * interval;
+                        const Precision xx = x * x;
+                        const Precision xxx = xx * x;
+
+                        Kokkos::parallel_for(
+                            Kokkos::TeamThreadRange(team_member, tp_weight_numel),
+                            [&] (const int w) {
+                                tp_values(w) = rrnlb_eval_spline(tp_spline_coeff, pair_index, interval, w, x, xx, xxx);
+                            });
+                        team_member.team_barrier();
+
+                        density_i += rrnlb_eval_spline_scalar(density_spline_coeff, pair_index, interval, x, xx, xxx);
+                        const auto up_sender = Kokkos::subview(h_up_all, sender, Kokkos::ALL);
+
+                        for (int q = 0; q < num_conv_ins; ++q) {
+                            const int in_offset = conv_in_offset(q);
+                            const int out_offset = conv_out_offset(q);
+                            const int mul = conv_mul(q);
+                            const int weight_offset = conv_weight_offset(q);
+                            const int in_ir_dim = conv_in_ir_dim(q);
+                            const int out_ir_dim = conv_out_ir_dim(q);
+                            const int term0 = conv_term_offset(q);
+                            const int termN = conv_term_count(q);
+                            for (int t = term0; t < term0 + termN; ++t) {
+                                const Precision coeff =
+                                    conv_term_coeff(t) * Y(ij * num_lm + conv_term_y_lm(t));
+                                const int m_out = conv_term_m_out(t);
+                                const int m_in1 = conv_term_m_in1(t);
+                                Kokkos::parallel_for(
+                                    Kokkos::TeamThreadRange(team_member, mul),
+                                    [&] (const int k) {
+                                        const int out_idx = out_offset + k * out_ir_dim + m_out;
+                                        const int out_slot = conv_active_out_inverse(out_idx);
+                                        if (out_slot >= 0) {
+                                            const int in_idx = in_offset + k * in_ir_dim + m_in1;
+                                            Kokkos::atomic_add(
+                                                &conv_local(out_slot),
+                                                coeff * tp_values(weight_offset + k) * up_sender(in_idx));
+                                        }
+                                    });
+                            }
+                        }
+                    }
+
+                    Kokkos::parallel_for(
+                        Kokkos::TeamThreadRange(team_member, compact_out_count),
+                        [&] (const int p_local) {
+                            const Precision val = conv_local(p_local);
+                            if (val != static_cast<Precision>(0.0)) {
+                                conv_i(conv_active_out_indices(p_local)) += val;
+                            }
+                        });
+
+                    Kokkos::single(Kokkos::PerTeam(team_member), [&] () {
+                        cache.density(i) = density_i;
+                    });
+                });
+        } else {
+            Kokkos::parallel_for(
+                "RRNLB conv forward",
+                Kokkos::TeamPolicy<>(num_nodes, Kokkos::AUTO, rrnlb_forward_vector_length())
+                    .set_scratch_size(0, Kokkos::PerTeam(tp_weight_numel * sizeof(Precision))),
+                KOKKOS_LAMBDA (Kokkos::TeamPolicy<>::member_type team_member) {
+                    const int i = team_member.league_rank();
+                    auto tp_values = Kokkos::View<Precision*,Kokkos::MemoryUnmanaged>(
+                        team_member.team_scratch(0), tp_weight_numel);
+                    auto conv_i = Kokkos::subview(conv_accum, i, Kokkos::ALL);
+                    Precision density_i = static_cast<Precision>(0.0);
+
+                    const int i0 = first_neigh(i);
+                    for (int j = 0; j < num_neigh(i); ++j) {
+                        const int ij = i0 + j;
+                        const int sender = neigh_indices(ij);
+                        const int pair_index = neigh_types(ij) * num_elements + node_types(i);
+                        const Precision r_ij = static_cast<Precision>(r(ij));
+                        int interval = static_cast<int>(r_ij / static_cast<Precision>(radial_h));
+                        if (interval < 0) interval = 0;
+                        if (interval >= radial_num_intervals) interval = radial_num_intervals - 1;
+                        const Precision x = r_ij - static_cast<Precision>(radial_h) * interval;
+                        const Precision xx = x * x;
+                        const Precision xxx = xx * x;
+
+                        Kokkos::parallel_for(
+                            Kokkos::TeamThreadRange(team_member, tp_weight_numel),
+                            [&] (const int w) {
+                                tp_values(w) = rrnlb_eval_spline(tp_spline_coeff, pair_index, interval, w, x, xx, xxx);
+                            });
+                        team_member.team_barrier();
+
+                        density_i += rrnlb_eval_spline_scalar(density_spline_coeff, pair_index, interval, x, xx, xxx);
+                        const auto up_sender = Kokkos::subview(h_up_all, sender, Kokkos::ALL);
+
+                        for (int q = 0; q < num_conv_ins; ++q) {
+                            const int in_offset = conv_in_offset(q);
+                            const int out_offset = conv_out_offset(q);
+                            const int mul = conv_mul(q);
+                            const int weight_offset = conv_weight_offset(q);
+                            const int in_ir_dim = conv_in_ir_dim(q);
+                            const int out_ir_dim = conv_out_ir_dim(q);
+                            const int term0 = conv_term_offset(q);
+                            const int termN = conv_term_count(q);
+                            for (int t = term0; t < term0 + termN; ++t) {
+                                const Precision coeff =
+                                    conv_term_coeff(t) * Y(ij * num_lm + conv_term_y_lm(t));
+                                const int m_out = conv_term_m_out(t);
+                                const int m_in1 = conv_term_m_in1(t);
+                                Kokkos::parallel_for(
+                                    Kokkos::TeamThreadRange(team_member, mul),
+                                    [&] (const int k) {
+                                        const int out_idx = out_offset + k * out_ir_dim + m_out;
+                                        const int in_idx = in_offset + k * in_ir_dim + m_in1;
+                                        conv_i(out_idx) += coeff * tp_values(weight_offset + k) * up_sender(in_idx);
+                                    });
+                            }
+                        }
+                    }
+
+                    Kokkos::single(Kokkos::PerTeam(team_member), [&] () {
+                        cache.density(i) = density_i;
+                    });
+                });
+        }
+    }
+    rrnlb_apply_linear_forward(layer.linear_1, num_nodes, conv_accum, cache.lin1_raw);
+    const auto density = cache.density;
+    const auto lin1_raw = cache.lin1_raw;
+    const auto pre_gate = cache.pre_gate;
+    const double alpha = layer.alpha;
+    const double beta = layer.beta;
+    Kokkos::parallel_for(
+        "RRNLB normalize/residual",
+        num_nodes * layer.linear_1.dim_out,
+        KOKKOS_LAMBDA (const int ip) {
+            const int i = ip / layer.linear_1.dim_out;
+            const int p = ip % layer.linear_1.dim_out;
+            const Precision denom = static_cast<Precision>(alpha) + static_cast<Precision>(beta) * density(i);
+            pre_gate(i, p) = lin1_raw(i, p) / denom + h_res(i, p);
+        });
+    rrnlb_apply_gate_forward(layer, num_nodes, cache.pre_gate, gated);
+    rrnlb_apply_linear_forward(layer.linear_2, num_nodes, gated, layer_output);
+}
+
+template <typename Precision, typename AccumPrecision>
+void MACEKokkos<Precision, AccumPrecision>::reverse_rrnlb_interaction_layer(
+    const int layer_index,
+    const int num_nodes,
+    Kokkos::View<const int*> node_types,
+    Kokkos::View<const int*> num_neigh,
+    Kokkos::View<const int*> neigh_indices,
+    Kokkos::View<const int*> neigh_types,
+    Kokkos::View<const double*> xyz,
+    Kokkos::View<const double*> r,
+    Kokkos::View<const int*> first_neigh,
+    Kokkos::View<const Precision**,Kokkos::LayoutRight> node_feats_in,
+    RRNLBLayerCacheKokkos& cache,
+    Kokkos::View<const AccumPrecision**,Kokkos::LayoutRight> layer_output_adj,
+    Kokkos::View<const AccumPrecision**,Kokkos::LayoutRight> layer_skip_adj,
+    Kokkos::View<AccumPrecision**,Kokkos::LayoutRight> node_feats_in_adj,
+    int num_sender_nodes,
+    Kokkos::View<const int*> target_node_indices,
+    int total_edges,
+    Kokkos::View<const int*> edge_to_receiver)
+{
+    if (layer_index < 0 || layer_index >= static_cast<int>(rrnlb_layers_kokkos.size())) {
+        throw std::runtime_error("RRNLB reverse layer index out of bounds.");
+    }
+    const auto& layer = rrnlb_layers_kokkos[layer_index];
+    const int in_dim = layer.linear_up.dim_in;
+    const int sender_nodes = (num_sender_nodes > 0) ? num_sender_nodes : num_nodes;
+    const bool has_target_map = target_node_indices.extent(0) > 0;
+
+    if (node_feats_in.extent(0) < sender_nodes || node_feats_in.extent(1) != in_dim) {
+        throw std::runtime_error("RRNLB reverse input has invalid shape.");
+    }
+    if (node_feats_in_adj.extent(0) < sender_nodes || node_feats_in_adj.extent(1) != in_dim) {
+        throw std::runtime_error("RRNLB reverse input adjoint has invalid shape.");
+    }
+    if (has_target_map && target_node_indices.extent(0) < num_nodes) {
+        throw std::runtime_error("RRNLB reverse target index map has invalid shape.");
+    }
+    if (cache.h_up.extent(0) < sender_nodes
+        || cache.h_up.extent(1) != layer.linear_up.dim_out
+        || cache.density.extent(0) < num_nodes
+        || cache.lin1_raw.extent(0) < num_nodes
+        || cache.lin1_raw.extent(1) != layer.linear_1.dim_out
+        || cache.pre_gate.extent(0) < num_nodes
+        || cache.pre_gate.extent(1) != layer.linear_1.dim_out) {
+        throw std::runtime_error("RRNLB reverse cache has invalid shape.");
+    }
+
+    auto ensure_cache_2d = [](auto& view, const int d0, const int d1) {
+        if (view.extent(0) != static_cast<std::size_t>(d0)
+            || view.extent(1) != static_cast<std::size_t>(d1)) {
+            Kokkos::realloc(view, d0, d1);
+        }
+    };
+    auto ensure_cache_1d = [](auto& view, const int d0) {
+        if (view.extent(0) != static_cast<std::size_t>(d0)) {
+            Kokkos::realloc(view, d0);
+        }
+    };
+
+    ensure_cache_2d(cache.gated_adj, num_nodes, layer.linear_2.dim_in);
+    ensure_cache_2d(cache.pre_gate_adj, num_nodes, layer.linear_1.dim_out);
+    ensure_cache_2d(cache.lin1_raw_adj, num_nodes, layer.linear_1.dim_out);
+    ensure_cache_2d(cache.h_res_adj, num_nodes, layer.linear_res.dim_out);
+    ensure_cache_2d(cache.conv_adj, num_nodes, layer.linear_1.dim_in);
+    ensure_cache_2d(cache.h_up_adj, sender_nodes, layer.linear_up.dim_out);
+    ensure_cache_2d(cache.h_up_adj_targets, num_nodes, layer.linear_up.dim_out);
+    ensure_cache_2d(cache.skip_input_adj_targets, num_nodes, in_dim);
+    ensure_cache_1d(cache.density_adj, num_nodes);
+    ensure_cache_2d(cache.x_up_adj, sender_nodes, in_dim);
+
+    auto gated_adj = cache.gated_adj;
+    auto pre_gate_adj = cache.pre_gate_adj;
+    auto lin1_raw_adj = cache.lin1_raw_adj;
+    auto h_res_adj = cache.h_res_adj;
+    auto conv_adj = cache.conv_adj;
+    auto h_up_adj = cache.h_up_adj;
+    auto h_up_adj_targets = cache.h_up_adj_targets;
+    auto skip_input_adj_targets = cache.skip_input_adj_targets;
+    auto density_adj = cache.density_adj;
+
+    Kokkos::deep_copy(lin1_raw_adj, static_cast<AccumPrecision>(0.0));
+    Kokkos::deep_copy(h_res_adj, static_cast<AccumPrecision>(0.0));
+    Kokkos::deep_copy(density_adj, static_cast<AccumPrecision>(0.0));
+
+    rrnlb_apply_linear_transpose(layer.linear_2, num_nodes, layer_output_adj, gated_adj);
+    rrnlb_apply_gate_reverse(layer, num_nodes, cache.pre_gate, gated_adj, pre_gate_adj);
+
+    const auto lin1_raw = cache.lin1_raw;
+    const auto density = cache.density;
+    const double alpha = layer.alpha;
+    const double beta = layer.beta;
+    Kokkos::parallel_for(
+        "RRNLB normalize reverse",
+        Kokkos::TeamPolicy<>(num_nodes, Kokkos::AUTO, 32),
+        KOKKOS_LAMBDA (Kokkos::TeamPolicy<>::member_type team_member) {
+            const int i = team_member.league_rank();
+            const AccumPrecision denom =
+                static_cast<AccumPrecision>(alpha)
+                + static_cast<AccumPrecision>(beta) * static_cast<AccumPrecision>(density(i));
+            const AccumPrecision inv = static_cast<AccumPrecision>(1.0) / denom;
+            const AccumPrecision inv2 = inv * inv;
+            AccumPrecision density_contrib = static_cast<AccumPrecision>(0.0);
+            Kokkos::parallel_reduce(
+                Kokkos::TeamThreadRange(team_member, layer.linear_1.dim_out),
+                [&] (const int p, AccumPrecision& lsum) {
+                    const AccumPrecision upstream = pre_gate_adj(i, p);
+                    lin1_raw_adj(i, p) = upstream * inv;
+                    h_res_adj(i, p) = upstream;
+                    lsum += upstream
+                        * (-static_cast<AccumPrecision>(beta)
+                           * static_cast<AccumPrecision>(lin1_raw(i, p)) * inv2);
+                },
+                density_contrib);
+            Kokkos::single(Kokkos::PerTeam(team_member), [&] () {
+                density_adj(i) = density_contrib;
+            });
+        });
+    rrnlb_apply_linear_transpose(layer.linear_res, num_nodes, h_res_adj, h_up_adj_targets);
+    const auto target_map = target_node_indices;
+    if (!has_target_map) {
+        Kokkos::parallel_for(
+            "RRNLB scatter h_up_adj (unique)",
+            num_nodes,
+            KOKKOS_LAMBDA (const int i) {
+                const int sender_i = i;
+                for (int p = 0; p < h_up_adj_targets.extent_int(1); ++p) {
+                    h_up_adj(sender_i, p) += h_up_adj_targets(i, p);
+                }
+            });
+    } else {
+        Kokkos::parallel_for(
+            "RRNLB scatter h_up_adj",
+            num_nodes,
+            KOKKOS_LAMBDA (const int i) {
+                const int sender_i = target_map(i);
+                for (int p = 0; p < h_up_adj_targets.extent_int(1); ++p) {
+                    Kokkos::atomic_add(&h_up_adj(sender_i, p), h_up_adj_targets(i, p));
+                }
+            });
+    }
+    rrnlb_apply_linear_transpose(layer.linear_1, num_nodes, lin1_raw_adj, conv_adj);
+
+    const auto conv_in_offset = layer.conv_in_offset;
+    const auto conv_out_offset = layer.conv_out_offset;
+    const auto conv_mul = layer.conv_mul;
+    const auto conv_weight_offset = layer.conv_weight_offset;
+    const auto conv_in_ir_dim = layer.conv_in_ir_dim;
+    const auto conv_out_ir_dim = layer.conv_out_ir_dim;
+    const auto conv_term_offset = layer.conv_term_offset;
+    const auto conv_term_count = layer.conv_term_count;
+    const auto conv_term_m_out = layer.conv_term_m_out;
+    const auto conv_term_m_in1 = layer.conv_term_m_in1;
+    const auto conv_term_y_lm = layer.conv_term_y_lm;
+    const auto conv_term_coeff = layer.conv_term_coeff;
+    const int num_conv_ins = conv_in_offset.extent(0);
+    const auto tp_spline_coeff = layer.tp_spline_coeff;
+    const auto density_spline_coeff = layer.density_spline_coeff;
+    const double radial_h = layer.radial_h;
+    const int radial_num_intervals = layer.radial_num_intervals;
+    const int tp_weight_numel = layer.tp_weight_numel;
+    const int tp_local_numel = layer.conv_max_mul > 0 ? layer.conv_max_mul : tp_weight_numel;
+    const int h_up_dim = layer.linear_up.dim_out;
+    const int num_elements = this->num_elements;
+    const int num_lm = this->num_lm;
+    const auto Y = this->Y;
+    const auto Y_grad = this->Y_grad;
+    auto node_forces = this->node_forces;
+    using ForceAccumPrecision = AccumPrecision;
+    const auto h_up = cache.h_up;
+    const bool use_edge_parallel_rev = total_edges > 0 && edge_to_receiver.extent(0) >= total_edges;
+
+    if (use_edge_parallel_rev) {
+        const auto conv_active_in_indices = layer.conv_active_in_indices;
+        const auto conv_active_in_inverse = layer.conv_active_in_inverse;
+        const int compact_active_count = layer.conv_active_in_count > 0 ? layer.conv_active_in_count : h_up_dim;
+        const bool use_compact_active = compact_active_count * 5 <= h_up_dim * 4;
+        const int active_in_count = use_compact_active ? compact_active_count : h_up_dim;
+        const auto edge_recv = edge_to_receiver;
+        const int scratch_size = 2 * tp_local_numel + num_lm + active_in_count + 1;
+        Kokkos::parallel_for(
+            "RRNLB conv reverse (edge-parallel)",
+            Kokkos::TeamPolicy<>(total_edges, Kokkos::AUTO, rrnlb_reverse_vector_length())
+                .set_scratch_size(0, Kokkos::PerTeam(scratch_size * sizeof(AccumPrecision))),
+            KOKKOS_LAMBDA (Kokkos::TeamPolicy<>::member_type team_member) {
+                const int ij = team_member.league_rank();
+                const int i = edge_recv(ij);
+                const int sender = neigh_indices(ij);
+                auto scratch = Kokkos::View<AccumPrecision*,Kokkos::MemoryUnmanaged>(
+                    team_member.team_scratch(0), scratch_size);
+                auto tp_values = Kokkos::subview(scratch, Kokkos::make_pair(0, tp_local_numel));
+                auto tp_derivs = Kokkos::subview(scratch,
+                    Kokkos::make_pair(tp_local_numel, 2 * tp_local_numel));
+                auto y_adj_s = Kokkos::subview(scratch,
+                    Kokkos::make_pair(2 * tp_local_numel, 2 * tp_local_numel + num_lm));
+                auto sender_adj_local = Kokkos::subview(scratch,
+                    Kokkos::make_pair(2 * tp_local_numel + num_lm, 2 * tp_local_numel + num_lm + active_in_count));
+                auto dE_dr_shared = Kokkos::View<AccumPrecision*,Kokkos::MemoryUnmanaged>(
+                    scratch.data() + (2 * tp_local_numel + num_lm + active_in_count), 1);
+
+                const int pair_index = neigh_types(ij) * num_elements + node_types(i);
+                const Precision r_ij = static_cast<Precision>(r(ij));
+                int interval = static_cast<int>(r_ij / static_cast<Precision>(radial_h));
+                if (interval < 0) interval = 0;
+                if (interval >= radial_num_intervals) interval = radial_num_intervals - 1;
+                const Precision x_val = r_ij - static_cast<Precision>(radial_h) * interval;
+                const Precision xx = x_val * x_val;
+                const Precision xxx = xx * x_val;
+
+                auto conv_adj_i = Kokkos::subview(conv_adj, i, Kokkos::ALL);
+                const auto h_up_sender = Kokkos::subview(h_up, sender, Kokkos::ALL);
+                auto h_up_sender_adj = Kokkos::subview(h_up_adj, sender, Kokkos::ALL);
+
+                Kokkos::parallel_for(
+                    Kokkos::TeamThreadRange(team_member, active_in_count),
+                    [&] (const int p) {
+                        sender_adj_local(p) = static_cast<AccumPrecision>(0.0);
+                    });
+                Kokkos::parallel_for(
+                    Kokkos::TeamThreadRange(team_member, num_lm),
+                    [&] (const int lm) {
+                        y_adj_s(lm) = static_cast<AccumPrecision>(0.0);
+                    });
+                Kokkos::single(Kokkos::PerTeam(team_member), [&] () {
+                    dE_dr_shared(0) = density_adj(i)
+                        * static_cast<AccumPrecision>(
+                            rrnlb_eval_spline_scalar_deriv(
+                                density_spline_coeff, pair_index, interval, x_val, xx));
+                });
+
+                if (use_compact_active) {
+                    for (int q = 0; q < num_conv_ins; ++q) {
+                        const int in_offset = conv_in_offset(q);
+                        const int out_offset = conv_out_offset(q);
+                        const int mul = conv_mul(q);
+                        const int weight_offset = conv_weight_offset(q);
+                        const int in_ir_dim_q = conv_in_ir_dim(q);
+                        const int out_ir_dim_q = conv_out_ir_dim(q);
+                        const int term0 = conv_term_offset(q);
+                        const int termN = conv_term_count(q);
+                        Kokkos::parallel_for(
+                            Kokkos::TeamThreadRange(team_member, mul),
+                            [&] (const int k) {
+                                const int w_idx = weight_offset + k;
+                                tp_values(k) = static_cast<AccumPrecision>(
+                                    rrnlb_eval_spline(
+                                        tp_spline_coeff, pair_index, interval, w_idx, x_val, xx, xxx));
+                                tp_derivs(k) = static_cast<AccumPrecision>(
+                                    rrnlb_eval_spline_deriv(
+                                        tp_spline_coeff, pair_index, interval, w_idx, x_val, xx));
+                            });
+                        team_member.team_barrier();
+                        for (int t = term0; t < term0 + termN; ++t) {
+                            const int y_lm = conv_term_y_lm(t);
+                            const AccumPrecision y_lm_value =
+                                static_cast<AccumPrecision>(Y(ij * num_lm + y_lm));
+                            const int m_out = conv_term_m_out(t);
+                            const int m_in1 = conv_term_m_in1(t);
+                            const AccumPrecision coeff =
+                                static_cast<AccumPrecision>(conv_term_coeff(t));
+                            RRNLBTermReduction<AccumPrecision> term_reduce;
+                            Kokkos::parallel_reduce(
+                                Kokkos::TeamThreadRange(team_member, mul),
+                                [&] (const int k, RRNLBTermReduction<AccumPrecision>& lsum) {
+                                    const int out_idx = out_offset + k * out_ir_dim_q + m_out;
+                                    const int in_idx = in_offset + k * in_ir_dim_q + m_in1;
+                                    const AccumPrecision upstream = conv_adj_i(out_idx);
+                                    const AccumPrecision tp_val = tp_values(k);
+                                    const AccumPrecision up_val =
+                                        static_cast<AccumPrecision>(h_up_sender(in_idx));
+                                    const AccumPrecision contrib = upstream * coeff;
+                                    const int in_local_idx = conv_active_in_inverse(in_idx);
+                                    sender_adj_local(in_local_idx) += contrib * y_lm_value * tp_val;
+                                    lsum.dE_dr += contrib * y_lm_value * up_val * tp_derivs(k);
+                                    lsum.y_adj += contrib * tp_val * up_val;
+                                },
+                                term_reduce);
+                            Kokkos::single(Kokkos::PerTeam(team_member), [&] () {
+                                dE_dr_shared(0) += term_reduce.dE_dr;
+                                y_adj_s(y_lm) += term_reduce.y_adj;
+                            });
+                        }
+                    }
+                    Kokkos::parallel_for(
+                        Kokkos::TeamThreadRange(team_member, active_in_count),
+                        [&] (const int p_local) {
+                            const AccumPrecision val = sender_adj_local(p_local);
+                            if (val != static_cast<AccumPrecision>(0.0)) {
+                                const int p = conv_active_in_indices(p_local);
+                                Kokkos::atomic_add(&h_up_sender_adj(p), val);
+                            }
+                        });
+                } else {
+                    for (int q = 0; q < num_conv_ins; ++q) {
+                        const int in_offset = conv_in_offset(q);
+                        const int out_offset = conv_out_offset(q);
+                        const int mul = conv_mul(q);
+                        const int weight_offset = conv_weight_offset(q);
+                        const int in_ir_dim_q = conv_in_ir_dim(q);
+                        const int out_ir_dim_q = conv_out_ir_dim(q);
+                        const int term0 = conv_term_offset(q);
+                        const int termN = conv_term_count(q);
+                        Kokkos::parallel_for(
+                            Kokkos::TeamThreadRange(team_member, mul),
+                            [&] (const int k) {
+                                const int w_idx = weight_offset + k;
+                                tp_values(k) = static_cast<AccumPrecision>(
+                                    rrnlb_eval_spline(
+                                        tp_spline_coeff, pair_index, interval, w_idx, x_val, xx, xxx));
+                                tp_derivs(k) = static_cast<AccumPrecision>(
+                                    rrnlb_eval_spline_deriv(
+                                        tp_spline_coeff, pair_index, interval, w_idx, x_val, xx));
+                            });
+                        team_member.team_barrier();
+                        for (int t = term0; t < term0 + termN; ++t) {
+                            const int y_lm = conv_term_y_lm(t);
+                            const AccumPrecision y_lm_value =
+                                static_cast<AccumPrecision>(Y(ij * num_lm + y_lm));
+                            const int m_out = conv_term_m_out(t);
+                            const int m_in1 = conv_term_m_in1(t);
+                            const AccumPrecision coeff =
+                                static_cast<AccumPrecision>(conv_term_coeff(t));
+                            RRNLBTermReduction<AccumPrecision> term_reduce;
+                            Kokkos::parallel_reduce(
+                                Kokkos::TeamThreadRange(team_member, mul),
+                                [&] (const int k, RRNLBTermReduction<AccumPrecision>& lsum) {
+                                    const int out_idx = out_offset + k * out_ir_dim_q + m_out;
+                                    const int in_idx = in_offset + k * in_ir_dim_q + m_in1;
+                                    const AccumPrecision upstream = conv_adj_i(out_idx);
+                                    const AccumPrecision tp_val = tp_values(k);
+                                    const AccumPrecision up_val =
+                                        static_cast<AccumPrecision>(h_up_sender(in_idx));
+                                    const AccumPrecision contrib = upstream * coeff;
+                                    sender_adj_local(in_idx) += contrib * y_lm_value * tp_val;
+                                    lsum.dE_dr += contrib * y_lm_value * up_val * tp_derivs(k);
+                                    lsum.y_adj += contrib * tp_val * up_val;
+                                },
+                                term_reduce);
+                            Kokkos::single(Kokkos::PerTeam(team_member), [&] () {
+                                dE_dr_shared(0) += term_reduce.dE_dr;
+                                y_adj_s(y_lm) += term_reduce.y_adj;
+                            });
+                        }
+                    }
+                    Kokkos::parallel_for(
+                        Kokkos::TeamThreadRange(team_member, active_in_count),
+                        [&] (const int p) {
+                            const AccumPrecision val = sender_adj_local(p);
+                            if (val != static_cast<AccumPrecision>(0.0)) {
+                                Kokkos::atomic_add(&h_up_sender_adj(p), val);
+                            }
+                        });
+                }
+
+                Kokkos::single(Kokkos::PerTeam(team_member), [&] () {
+                    const ForceAccumPrecision inv_r =
+                        static_cast<ForceAccumPrecision>(1.0) / static_cast<ForceAccumPrecision>(r_ij);
+                    const ForceAccumPrecision dE_dr_total =
+                        static_cast<ForceAccumPrecision>(dE_dr_shared(0));
+                    ForceAccumPrecision dxyz_x =
+                        dE_dr_total * static_cast<ForceAccumPrecision>(xyz(3 * ij + 0)) * inv_r;
+                    ForceAccumPrecision dxyz_y =
+                        dE_dr_total * static_cast<ForceAccumPrecision>(xyz(3 * ij + 1)) * inv_r;
+                    ForceAccumPrecision dxyz_z =
+                        dE_dr_total * static_cast<ForceAccumPrecision>(xyz(3 * ij + 2)) * inv_r;
+                    for (int lm = 0; lm < num_lm; ++lm) {
+                        dxyz_x += static_cast<ForceAccumPrecision>(y_adj_s(lm))
+                            * static_cast<ForceAccumPrecision>(Y_grad(ij * 3 * num_lm + lm));
+                        dxyz_y += static_cast<ForceAccumPrecision>(y_adj_s(lm))
+                            * static_cast<ForceAccumPrecision>(Y_grad(ij * 3 * num_lm + num_lm + lm));
+                        dxyz_z += static_cast<ForceAccumPrecision>(y_adj_s(lm))
+                            * static_cast<ForceAccumPrecision>(Y_grad(ij * 3 * num_lm + 2 * num_lm + lm));
+                    }
+                    node_forces(3 * ij + 0) -= static_cast<double>(dxyz_x);
+                    node_forces(3 * ij + 1) -= static_cast<double>(dxyz_y);
+                    node_forces(3 * ij + 2) -= static_cast<double>(dxyz_z);
+                });
+            });
+    } else {
+        // Fallback: original node-parallel reverse (for MPI paths without edge map)
+        const auto conv_active_in_indices = layer.conv_active_in_indices;
+        const auto conv_active_in_inverse = layer.conv_active_in_inverse;
+        const int compact_active_count = layer.conv_active_in_count > 0 ? layer.conv_active_in_count : h_up_dim;
+        const bool use_compact_active = compact_active_count * 5 <= h_up_dim * 4;
+        const int active_in_count = use_compact_active ? compact_active_count : h_up_dim;
+        Kokkos::parallel_for(
+            "RRNLB conv reverse",
+            Kokkos::TeamPolicy<>(num_nodes, Kokkos::AUTO, rrnlb_reverse_vector_length())
+                .set_scratch_size(
+                    0,
+                    Kokkos::PerTeam((2 * tp_local_numel + num_lm + active_in_count + 1) * sizeof(AccumPrecision))),
+            KOKKOS_LAMBDA (Kokkos::TeamPolicy<>::member_type team_member) {
+                const int i = team_member.league_rank();
+                auto scratch = Kokkos::View<AccumPrecision*,Kokkos::MemoryUnmanaged>(
+                    team_member.team_scratch(0), 2 * tp_local_numel + num_lm + active_in_count + 1);
+                auto tp_values = Kokkos::subview(scratch, Kokkos::make_pair(0, tp_local_numel));
+                auto tp_derivs = Kokkos::subview(
+                    scratch,
+                    Kokkos::make_pair(tp_local_numel, 2 * tp_local_numel));
+                auto y_adj_s = Kokkos::subview(
+                    scratch,
+                    Kokkos::make_pair(2 * tp_local_numel, 2 * tp_local_numel + num_lm));
+                auto sender_adj_local = Kokkos::subview(
+                    scratch,
+                    Kokkos::make_pair(2 * tp_local_numel + num_lm, 2 * tp_local_numel + num_lm + active_in_count));
+                auto dE_dr_shared = Kokkos::View<AccumPrecision*,Kokkos::MemoryUnmanaged>(
+                    scratch.data() + (2 * tp_local_numel + num_lm + active_in_count), 1);
+
+                const int i0 = first_neigh(i);
+                auto conv_adj_i = Kokkos::subview(conv_adj, i, Kokkos::ALL);
+                for (int j = 0; j < num_neigh(i); ++j) {
+                    const int ij = i0 + j;
+                    const int sender = neigh_indices(ij);
+                    const int pair_index = neigh_types(ij) * num_elements + node_types(i);
+                    const Precision r_ij = static_cast<Precision>(r(ij));
+                    int interval = static_cast<int>(r_ij / static_cast<Precision>(radial_h));
+                    if (interval < 0) interval = 0;
+                    if (interval >= radial_num_intervals) interval = radial_num_intervals - 1;
+                    const Precision x_val = r_ij - static_cast<Precision>(radial_h) * interval;
+                    const Precision xx = x_val * x_val;
+                    const Precision xxx = xx * x_val;
+
+                    Kokkos::parallel_for(
+                        Kokkos::TeamThreadRange(team_member, active_in_count),
+                        [&] (const int p) {
+                            sender_adj_local(p) = static_cast<AccumPrecision>(0.0);
+                        });
+                    Kokkos::parallel_for(
+                        Kokkos::TeamThreadRange(team_member, num_lm),
+                        [&] (const int lm) {
+                            y_adj_s(lm) = static_cast<AccumPrecision>(0.0);
+                        });
+                    Kokkos::single(Kokkos::PerTeam(team_member), [&] () {
+                        dE_dr_shared(0) = density_adj(i)
+                            * static_cast<AccumPrecision>(
+                                rrnlb_eval_spline_scalar_deriv(
+                                    density_spline_coeff, pair_index, interval, x_val, xx));
+                    });
+
+                    const auto h_up_sender = Kokkos::subview(h_up, sender, Kokkos::ALL);
+                    auto h_up_sender_adj = Kokkos::subview(h_up_adj, sender, Kokkos::ALL);
+                    if (use_compact_active) {
+                        for (int q = 0; q < num_conv_ins; ++q) {
+                            const int in_offset = conv_in_offset(q);
+                            const int out_offset = conv_out_offset(q);
+                            const int mul = conv_mul(q);
+                            const int weight_offset = conv_weight_offset(q);
+                            const int in_ir_dim_q = conv_in_ir_dim(q);
+                            const int out_ir_dim_q = conv_out_ir_dim(q);
+                            const int term0 = conv_term_offset(q);
+                            const int termN = conv_term_count(q);
+                            Kokkos::parallel_for(
+                                Kokkos::TeamThreadRange(team_member, mul),
+                                [&] (const int k) {
+                                    const int w_idx = weight_offset + k;
+                                    tp_values(k) = static_cast<AccumPrecision>(
+                                        rrnlb_eval_spline(
+                                            tp_spline_coeff, pair_index, interval, w_idx, x_val, xx, xxx));
+                                    tp_derivs(k) = static_cast<AccumPrecision>(
+                                        rrnlb_eval_spline_deriv(
+                                            tp_spline_coeff, pair_index, interval, w_idx, x_val, xx));
+                                });
+                            team_member.team_barrier();
+                            for (int t = term0; t < term0 + termN; ++t) {
+                                const int y_lm = conv_term_y_lm(t);
+                                const AccumPrecision y_lm_value =
+                                    static_cast<AccumPrecision>(Y(ij * num_lm + y_lm));
+                                const int m_out = conv_term_m_out(t);
+                                const int m_in1 = conv_term_m_in1(t);
+                                const AccumPrecision coeff =
+                                    static_cast<AccumPrecision>(conv_term_coeff(t));
+                                RRNLBTermReduction<AccumPrecision> term_reduce;
+                                Kokkos::parallel_reduce(
+                                    Kokkos::TeamThreadRange(team_member, mul),
+                                    [&] (const int k, RRNLBTermReduction<AccumPrecision>& lsum) {
+                                        const int out_idx = out_offset + k * out_ir_dim_q + m_out;
+                                        const int in_idx = in_offset + k * in_ir_dim_q + m_in1;
+                                        const AccumPrecision upstream = conv_adj_i(out_idx);
+                                        const AccumPrecision tp_val = tp_values(k);
+                                        const AccumPrecision up_val =
+                                            static_cast<AccumPrecision>(h_up_sender(in_idx));
+                                        const AccumPrecision contrib = upstream * coeff;
+                                        const int in_local_idx = conv_active_in_inverse(in_idx);
+                                        sender_adj_local(in_local_idx) += contrib * y_lm_value * tp_val;
+                                        lsum.dE_dr += contrib * y_lm_value * up_val * tp_derivs(k);
+                                        lsum.y_adj += contrib * tp_val * up_val;
+                                    },
+                                    term_reduce);
+                                Kokkos::single(Kokkos::PerTeam(team_member), [&] () {
+                                    dE_dr_shared(0) += term_reduce.dE_dr;
+                                    y_adj_s(y_lm) += term_reduce.y_adj;
+                                });
+                            }
+                        }
+                        Kokkos::parallel_for(
+                            Kokkos::TeamThreadRange(team_member, active_in_count),
+                            [&] (const int p_local) {
+                                const AccumPrecision val = sender_adj_local(p_local);
+                                if (val != static_cast<AccumPrecision>(0.0)) {
+                                    const int p = conv_active_in_indices(p_local);
+                                    Kokkos::atomic_add(&h_up_sender_adj(p), val);
+                                }
+                            });
+                    } else {
+                        for (int q = 0; q < num_conv_ins; ++q) {
+                            const int in_offset = conv_in_offset(q);
+                            const int out_offset = conv_out_offset(q);
+                            const int mul = conv_mul(q);
+                            const int weight_offset = conv_weight_offset(q);
+                            const int in_ir_dim_q = conv_in_ir_dim(q);
+                            const int out_ir_dim_q = conv_out_ir_dim(q);
+                            const int term0 = conv_term_offset(q);
+                            const int termN = conv_term_count(q);
+                            Kokkos::parallel_for(
+                                Kokkos::TeamThreadRange(team_member, mul),
+                                [&] (const int k) {
+                                    const int w_idx = weight_offset + k;
+                                    tp_values(k) = static_cast<AccumPrecision>(
+                                        rrnlb_eval_spline(
+                                            tp_spline_coeff, pair_index, interval, w_idx, x_val, xx, xxx));
+                                    tp_derivs(k) = static_cast<AccumPrecision>(
+                                        rrnlb_eval_spline_deriv(
+                                            tp_spline_coeff, pair_index, interval, w_idx, x_val, xx));
+                                });
+                            team_member.team_barrier();
+                            for (int t = term0; t < term0 + termN; ++t) {
+                                const int y_lm = conv_term_y_lm(t);
+                                const AccumPrecision y_lm_value =
+                                    static_cast<AccumPrecision>(Y(ij * num_lm + y_lm));
+                                const int m_out = conv_term_m_out(t);
+                                const int m_in1 = conv_term_m_in1(t);
+                                const AccumPrecision coeff =
+                                    static_cast<AccumPrecision>(conv_term_coeff(t));
+                                RRNLBTermReduction<AccumPrecision> term_reduce;
+                                Kokkos::parallel_reduce(
+                                    Kokkos::TeamThreadRange(team_member, mul),
+                                    [&] (const int k, RRNLBTermReduction<AccumPrecision>& lsum) {
+                                        const int out_idx = out_offset + k * out_ir_dim_q + m_out;
+                                        const int in_idx = in_offset + k * in_ir_dim_q + m_in1;
+                                        const AccumPrecision upstream = conv_adj_i(out_idx);
+                                        const AccumPrecision tp_val = tp_values(k);
+                                        const AccumPrecision up_val =
+                                            static_cast<AccumPrecision>(h_up_sender(in_idx));
+                                        const AccumPrecision contrib = upstream * coeff;
+                                        sender_adj_local(in_idx) += contrib * y_lm_value * tp_val;
+                                        lsum.dE_dr += contrib * y_lm_value * up_val * tp_derivs(k);
+                                        lsum.y_adj += contrib * tp_val * up_val;
+                                    },
+                                    term_reduce);
+                                Kokkos::single(Kokkos::PerTeam(team_member), [&] () {
+                                    dE_dr_shared(0) += term_reduce.dE_dr;
+                                    y_adj_s(y_lm) += term_reduce.y_adj;
+                                });
+                            }
+                        }
+                        Kokkos::parallel_for(
+                            Kokkos::TeamThreadRange(team_member, active_in_count),
+                            [&] (const int p) {
+                                const AccumPrecision val = sender_adj_local(p);
+                                if (val != static_cast<AccumPrecision>(0.0)) {
+                                    Kokkos::atomic_add(&h_up_sender_adj(p), val);
+                                }
+                            });
+                    }
+
+                    Kokkos::single(Kokkos::PerTeam(team_member), [&] () {
+                        const ForceAccumPrecision inv_r =
+                            static_cast<ForceAccumPrecision>(1.0) / static_cast<ForceAccumPrecision>(r_ij);
+                        const ForceAccumPrecision dE_dr_total =
+                            static_cast<ForceAccumPrecision>(dE_dr_shared(0));
+                        ForceAccumPrecision dxyz_x =
+                            dE_dr_total * static_cast<ForceAccumPrecision>(xyz(3 * ij + 0)) * inv_r;
+                        ForceAccumPrecision dxyz_y =
+                            dE_dr_total * static_cast<ForceAccumPrecision>(xyz(3 * ij + 1)) * inv_r;
+                        ForceAccumPrecision dxyz_z =
+                            dE_dr_total * static_cast<ForceAccumPrecision>(xyz(3 * ij + 2)) * inv_r;
+                        for (int lm = 0; lm < num_lm; ++lm) {
+                            dxyz_x += static_cast<ForceAccumPrecision>(y_adj_s(lm))
+                                * static_cast<ForceAccumPrecision>(Y_grad(ij * 3 * num_lm + lm));
+                            dxyz_y += static_cast<ForceAccumPrecision>(y_adj_s(lm))
+                                * static_cast<ForceAccumPrecision>(Y_grad(ij * 3 * num_lm + num_lm + lm));
+                            dxyz_z += static_cast<ForceAccumPrecision>(y_adj_s(lm))
+                                * static_cast<ForceAccumPrecision>(Y_grad(ij * 3 * num_lm + 2 * num_lm + lm));
+                        }
+                        node_forces(3 * ij + 0) -= static_cast<double>(dxyz_x);
+                        node_forces(3 * ij + 1) -= static_cast<double>(dxyz_y);
+                        node_forces(3 * ij + 2) -= static_cast<double>(dxyz_z);
+                    });
+                }
+            });
+    }
+    rrnlb_apply_linear_transpose(layer.skip_tp, num_nodes, layer_skip_adj, skip_input_adj_targets);
+    if (!has_target_map) {
+        Kokkos::parallel_for(
+            "RRNLB scatter skip adj (unique)",
+            num_nodes,
+            KOKKOS_LAMBDA (const int i) {
+                const int sender_i = i;
+                for (int p = 0; p < skip_input_adj_targets.extent_int(1); ++p) {
+                    node_feats_in_adj(sender_i, p) += skip_input_adj_targets(i, p);
+                }
+            });
+    } else {
+        Kokkos::parallel_for(
+            "RRNLB scatter skip adj",
+            num_nodes,
+            KOKKOS_LAMBDA (const int i) {
+                const int sender_i = target_map(i);
+                for (int p = 0; p < skip_input_adj_targets.extent_int(1); ++p) {
+                    Kokkos::atomic_add(&node_feats_in_adj(sender_i, p), skip_input_adj_targets(i, p));
+                }
+            });
+    }
+    auto x_up_adj = cache.x_up_adj;
+    rrnlb_apply_linear_transpose(layer.linear_up, sender_nodes, h_up_adj, x_up_adj);
+    Kokkos::parallel_for(
+        "RRNLB sum input adjoints",
+        sender_nodes * in_dim,
+        KOKKOS_LAMBDA (const int ip) {
+            const int i = ip / in_dim;
+            const int p = ip % in_dim;
+            node_feats_in_adj(i, p) += x_up_adj(i, p);
+        });
+}
+
+template <typename Precision, typename AccumPrecision>
+void MACEKokkos<Precision, AccumPrecision>::compute_rrnlb_node_energies_forces(
+    const int num_nodes,
+    Kokkos::View<const int*> node_types,
+    Kokkos::View<const int*> num_neigh,
+    Kokkos::View<const int*> neigh_indices,
+    Kokkos::View<const int*> neigh_types,
+    Kokkos::View<const double*> xyz,
+    Kokkos::View<const double*> r)
+{
+    static bool rrnlb_gpu_debug_once = false;
+    const bool rrnlb_gpu_debug = std::getenv("SYMMETRIX_RRNLB_GPU_DEBUG") != nullptr;
+    auto rrnlb_debug = [&](const char* msg) {
+        if (!rrnlb_gpu_debug) return;
+        if (!rrnlb_gpu_debug_once) {
+            std::cerr << "[RRNLB-GPU-DEBUG] " << msg << std::endl;
+        }
+    };
+
+    if (rrnlb_layers_kokkos.size() != 2) {
+        throw std::runtime_error("RRNLB Kokkos path currently expects exactly two interaction layers.");
+    }
+    if (num_nodes == 0) return;
+    const int num_channels_local = num_channels;
+    const int num_lm_local = num_lm;
+    const int num_LM_local = num_LM;
+    const int product0_dim_in = rrnlb_product_linear_0.dim_in;
+    const int product0_dim_out = rrnlb_product_linear_0.dim_out;
+    const int product1_dim_in = rrnlb_product_linear_1.dim_in;
+    const int product1_dim_out = rrnlb_product_linear_1.dim_out;
+
+    if (rrnlb_first_neigh.extent(0) < num_nodes) {
+        Kokkos::realloc(rrnlb_first_neigh, num_nodes);
+    }
+    auto rrnlb_first_neigh_view = rrnlb_first_neigh;
+#if defined(KOKKOS_ENABLE_CUDA)
+    if (rrnlb_gpu_debug && !rrnlb_gpu_debug_once) {
+        cudaPointerAttributes num_neigh_attr {};
+        const auto num_neigh_err = cudaPointerGetAttributes(&num_neigh_attr, num_neigh.data());
+        cudaPointerAttributes first_neigh_attr {};
+        const auto first_neigh_err = cudaPointerGetAttributes(&first_neigh_attr, rrnlb_first_neigh_view.data());
+        auto h_num_neigh_dbg = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace(), num_neigh);
+        std::cerr << "[RRNLB-GPU-DEBUG] num_neigh ptr=" << num_neigh.data()
+                  << " err=" << cudaGetErrorString(num_neigh_err)
+                  << " type=" << static_cast<int>(num_neigh_attr.type)
+                  << " device=" << num_neigh_attr.device << std::endl;
+        std::cerr << "[RRNLB-GPU-DEBUG] first_neigh ptr=" << rrnlb_first_neigh_view.data()
+                  << " err=" << cudaGetErrorString(first_neigh_err)
+                  << " type=" << static_cast<int>(first_neigh_attr.type)
+                  << " device=" << first_neigh_attr.device << std::endl;
+        std::cerr << "[RRNLB-GPU-DEBUG] num_nodes=" << num_nodes
+                  << " num_neigh.extent(0)=" << num_neigh.extent(0)
+                  << " first values:";
+        const int dbg_count = std::min<int>(num_neigh.extent(0), 8);
+        for (int ii = 0; ii < dbg_count; ++ii) {
+            std::cerr << " " << h_num_neigh_dbg(ii);
+        }
+        std::cerr << std::endl;
+    }
+#endif
+    rrnlb_debug("first_neigh scan begin");
+    Kokkos::parallel_scan(
+        "rrnlb_first_neigh",
+        num_nodes,
+        KOKKOS_LAMBDA (const int i, int& update, const bool final) {
+            if (final) rrnlb_first_neigh_view(i) = update;
+            update += num_neigh(i);
+        });
+    rrnlb_debug("first_neigh scan launched");
+    rrnlb_debug("first_neigh scan done");
+
+    // Compute total_edges and edge_to_receiver map for edge-parallel kernels.
+    int total_edges_local = 0;
+    Kokkos::parallel_reduce(
+        "rrnlb_total_edges",
+        num_nodes,
+        KOKKOS_LAMBDA (const int i, int& lsum) {
+            lsum += num_neigh(i);
+        },
+        total_edges_local);
+    rrnlb_total_edges = total_edges_local;
+    if (rrnlb_edge_to_receiver.extent(0) < total_edges_local) {
+        Kokkos::realloc(rrnlb_edge_to_receiver, total_edges_local);
+    }
+    auto edge_recv_view = rrnlb_edge_to_receiver;
+    Kokkos::parallel_for(
+        "rrnlb_edge_to_receiver",
+        num_nodes,
+        KOKKOS_LAMBDA (const int i) {
+            const int start = rrnlb_first_neigh_view(i);
+            const int count = num_neigh(i);
+            for (int j = 0; j < count; ++j) {
+                edge_recv_view(start + j) = i;
+            }
+        });
+    rrnlb_debug("edge_to_receiver done");
+
+    auto node_embed = Kokkos::View<Precision**,Kokkos::LayoutRight>(
+        "rrnlb_node_embed", num_nodes, num_channels_local);
+    const auto node_embedding = rrnlb_node_embedding;
+    rrnlb_debug("node_embed begin");
+    Kokkos::parallel_for(
+        "rrnlb_embed",
+        num_nodes * num_channels_local,
+        KOKKOS_LAMBDA (const int ik) {
+            const int i = ik / num_channels_local;
+            const int k = ik % num_channels_local;
+            node_embed(i, k) = node_embedding(node_types(i), k);
+        });
+    rrnlb_debug("node_embed launched");
+    rrnlb_debug("node_embed done");
+
+    const auto& layer0 = rrnlb_layers_kokkos[0];
+    const auto& layer1 = rrnlb_layers_kokkos[1];
+    auto interaction0_out = Kokkos::View<Precision**,Kokkos::LayoutRight>(
+        "rrnlb_interaction0_out", num_nodes, layer0.linear_2.dim_out);
+    auto skip0 = Kokkos::View<Precision**,Kokkos::LayoutRight>(
+        "rrnlb_skip0", num_nodes, layer0.skip_tp.dim_out);
+    auto interaction1_out = Kokkos::View<Precision**,Kokkos::LayoutRight>(
+        "rrnlb_interaction1_out", num_nodes, layer1.linear_2.dim_out);
+    auto skip1 = Kokkos::View<Precision**,Kokkos::LayoutRight>(
+        "rrnlb_skip1", num_nodes, layer1.skip_tp.dim_out);
+
+    auto& cache0 = rrnlb_cache_0;
+    auto& cache1 = rrnlb_cache_1;
+    rrnlb_debug("layer0 forward begin");
+    compute_rrnlb_interaction_layer_forward(
+        0, num_nodes, node_types, num_neigh, neigh_indices, neigh_types, r, rrnlb_first_neigh_view,
+        node_embed, interaction0_out, skip0, cache0, -1, Kokkos::View<const int*>(),
+        rrnlb_total_edges, rrnlb_edge_to_receiver);
+    rrnlb_debug("layer0 forward done");
+
+    // RRNLB interaction outputs are in multiplicity-major irrep blocks; legacy M0/M1 kernels
+    // consume lm-major channels, so we map through A0/A1 views around polynomial evaluation.
+    if (A0.extent(0) < num_nodes || A0.extent(1) != num_lm_local || A0.extent(2) != num_channels_local) {
+        Kokkos::realloc(A0, num_nodes, num_lm_local, num_channels_local);
+    }
+    Kokkos::deep_copy(A0, static_cast<Precision>(0.0));
+    auto A0_view = A0;
+    const auto& h_l0_out_offset = layer0.linear_2.h_parts_out_offset;
+    const auto& h_l0_out_mul = layer0.linear_2.h_parts_out_mul;
+    const auto& h_l0_out_l = layer0.linear_2.h_parts_out_l;
+    for (std::size_t p = 0; p < h_l0_out_offset.size(); ++p) {
+        const int offset = h_l0_out_offset[p];
+        const int mul = h_l0_out_mul[p];
+        const int l = h_l0_out_l[p];
+        const int ir_dim = 2 * l + 1;
+        Kokkos::parallel_for(
+            "rrnlb_layer0_to_A0",
+            num_nodes * mul * ir_dim,
+            KOKKOS_LAMBDA (const int ikm) {
+                const int i = ikm / (mul * ir_dim);
+                const int km = ikm % (mul * ir_dim);
+                const int k = km / ir_dim;
+                const int m = km % ir_dim;
+                A0_view(i, l * l + m, k) = interaction0_out(i, offset + k * ir_dim + m);
+            });
+    }
+    rrnlb_debug("M0 forward begin");
+    compute_M0(num_nodes, node_types);
+    rrnlb_debug("M0 forward done");
+
+    auto product0_in = Kokkos::View<Precision**,Kokkos::LayoutRight>(
+        "rrnlb_product0_in", num_nodes, product0_dim_in);
+    // Kokkos::View constructor zero-initializes; explicit deep_copy removed.
+    auto M0_view = M0;
+    const auto& h_p0_in_offset = rrnlb_product_linear_0.h_parts_in_offset;
+    const auto& h_p0_in_mul = rrnlb_product_linear_0.h_parts_in_mul;
+    const auto& h_p0_in_l = rrnlb_product_linear_0.h_parts_in_l;
+    for (std::size_t p = 0; p < h_p0_in_offset.size(); ++p) {
+        const int offset = h_p0_in_offset[p];
+        const int mul = h_p0_in_mul[p];
+        const int l = h_p0_in_l[p];
+        const int ir_dim = 2 * l + 1;
+        Kokkos::parallel_for(
+            "rrnlb_M0_to_product0",
+            num_nodes * mul * ir_dim,
+            KOKKOS_LAMBDA (const int ikm) {
+                const int i = ikm / (mul * ir_dim);
+                const int km = ikm % (mul * ir_dim);
+                const int k = km / ir_dim;
+                const int m = km % ir_dim;
+                product0_in(i, offset + k * ir_dim + m) = M0_view(i, l * l + m, k);
+            });
+    }
+    auto feat0 = Kokkos::View<Precision**,Kokkos::LayoutRight>(
+        "rrnlb_feat0", num_nodes, product0_dim_out);
+    rrnlb_apply_linear_forward(rrnlb_product_linear_0, num_nodes, product0_in, feat0);
+    Kokkos::parallel_for(
+        "rrnlb_add_skip0",
+        num_nodes * product0_dim_out,
+        KOKKOS_LAMBDA (const int ip) {
+            const int i = ip / product0_dim_out;
+            const int p = ip % product0_dim_out;
+            feat0(i, p) += skip0(i, p);
+        });
+    rrnlb_debug("layer1 forward begin");
+    compute_rrnlb_interaction_layer_forward(
+        1, num_nodes, node_types, num_neigh, neigh_indices, neigh_types, r, rrnlb_first_neigh_view,
+        feat0, interaction1_out, skip1, cache1, -1, Kokkos::View<const int*>(),
+        rrnlb_total_edges, rrnlb_edge_to_receiver);
+    rrnlb_debug("layer1 forward done");
+
+    if (A1.extent(0) < num_nodes || A1.extent(1) != num_lm_local || A1.extent(2) != num_channels_local) {
+        Kokkos::realloc(A1, num_nodes, num_lm_local, num_channels_local);
+    }
+    Kokkos::deep_copy(A1, static_cast<Precision>(0.0));
+    auto A1_view = A1;
+    const auto& h_l1_out_offset = layer1.linear_2.h_parts_out_offset;
+    const auto& h_l1_out_mul = layer1.linear_2.h_parts_out_mul;
+    const auto& h_l1_out_l = layer1.linear_2.h_parts_out_l;
+    for (std::size_t p = 0; p < h_l1_out_offset.size(); ++p) {
+        const int offset = h_l1_out_offset[p];
+        const int mul = h_l1_out_mul[p];
+        const int l = h_l1_out_l[p];
+        const int ir_dim = 2 * l + 1;
+        Kokkos::parallel_for(
+            "rrnlb_layer1_to_A1",
+            num_nodes * mul * ir_dim,
+            KOKKOS_LAMBDA (const int ikm) {
+                const int i = ikm / (mul * ir_dim);
+                const int km = ikm % (mul * ir_dim);
+                const int k = km / ir_dim;
+                const int m = km % ir_dim;
+                A1_view(i, l * l + m, k) = interaction1_out(i, offset + k * ir_dim + m);
+            });
+    }
+    rrnlb_debug("M1 forward begin");
+    compute_M1(num_nodes, node_types);
+    rrnlb_debug("M1 forward done");
+
+    auto product1_in = Kokkos::View<Precision**,Kokkos::LayoutRight>(
+        "rrnlb_product1_in", num_nodes, product1_dim_in);
+    // Kokkos::View constructor zero-initializes; explicit deep_copy removed.
+    auto M1_view = M1;
+    const auto& h_p1_in_offset = rrnlb_product_linear_1.h_parts_in_offset;
+    const auto& h_p1_in_mul = rrnlb_product_linear_1.h_parts_in_mul;
+    const auto& h_p1_in_l = rrnlb_product_linear_1.h_parts_in_l;
+    for (std::size_t p = 0; p < h_p1_in_l.size(); ++p) {
+        if (h_p1_in_l[p] != 0) {
+            throw std::runtime_error("RRNLB Kokkos path currently expects scalar-only product_linear_1 input.");
+        }
+    }
+    for (std::size_t p = 0; p < h_p1_in_offset.size(); ++p) {
+        const int offset = h_p1_in_offset[p];
+        const int mul = h_p1_in_mul[p];
+        const int l = h_p1_in_l[p];
+        const int ir_dim = 2 * l + 1;
+        Kokkos::parallel_for(
+            "rrnlb_M1_to_product1",
+            num_nodes * mul * ir_dim,
+            KOKKOS_LAMBDA (const int ikm) {
+                const int i = ikm / (mul * ir_dim);
+                const int km = ikm % (mul * ir_dim);
+                const int k = km / ir_dim;
+                const int m = km % ir_dim;
+                product1_in(i, offset + k * ir_dim + m) = M1_view(i, k);
+            });
+    }
+    auto feat1 = Kokkos::View<Precision**,Kokkos::LayoutRight>(
+        "rrnlb_feat1", num_nodes, product1_dim_out);
+    rrnlb_apply_linear_forward(rrnlb_product_linear_1, num_nodes, product1_in, feat1);
+    Kokkos::parallel_for(
+        "rrnlb_add_skip1",
+        num_nodes * product1_dim_out,
+        KOKKOS_LAMBDA (const int ip) {
+            const int i = ip / product1_dim_out;
+            const int p = ip % product1_dim_out;
+            feat1(i, p) += skip1(i, p);
+        });
+    auto feat0_adj = Kokkos::View<AccumPrecision**,Kokkos::LayoutRight>(
+        "rrnlb_feat0_adj", num_nodes, product0_dim_out);
+    auto feat1_adj = Kokkos::View<AccumPrecision**,Kokkos::LayoutRight>(
+        "rrnlb_feat1_adj", num_nodes, product1_dim_out);
+    // Kokkos::View constructor zero-initializes; explicit deep_copy removed.
+    auto node_energies_view = node_energies;
+    auto atomic_energies_view = atomic_energies;
+    auto readout_1_weights_view = readout_1_weights;
+
+    Kokkos::parallel_for(
+        "rrnlb_readout0",
+        num_nodes,
+        KOKKOS_LAMBDA (const int i) {
+            double e_i = atomic_energies_view(node_types(i));
+            for (int k = 0; k < num_channels_local; ++k) {
+                e_i += readout_1_weights_view(k) * static_cast<double>(feat0(i, k));
+                feat0_adj(i, k) = static_cast<AccumPrecision>(readout_1_weights_view(k));
+            }
+            node_energies_view(i) += e_i;
+        });
+    auto feat1_double = Kokkos::View<double**,Kokkos::LayoutRight>(
+        "rrnlb_feat1_double", num_nodes, product1_dim_out);
+    Kokkos::parallel_for(
+        "rrnlb_feat1_cast",
+        num_nodes * product1_dim_out,
+        KOKKOS_LAMBDA (const int ip) {
+            const int i = ip / product1_dim_out;
+            const int p = ip % product1_dim_out;
+            feat1_double(i, p) = static_cast<double>(feat1(i, p));
+        });
+    auto readout2_out = Kokkos::View<double*>("rrnlb_readout2_out", num_nodes);
+    auto readout2_adj = Kokkos::View<double**,Kokkos::LayoutRight>(
+        "rrnlb_readout2_adj", num_nodes, product1_dim_out);
+    readout_2.evaluate_gradient(feat1_double, readout2_out, readout2_adj);
+    Kokkos::parallel_for(
+        "rrnlb_readout2_accum",
+        num_nodes * product1_dim_out,
+        KOKKOS_LAMBDA (const int ip) {
+            const int i = ip / product1_dim_out;
+            const int p = ip % product1_dim_out;
+            if (p == 0) {
+                node_energies_view(i) += readout2_out(i);
+            }
+            feat1_adj(i, p) = static_cast<AccumPrecision>(readout2_adj(i, p));
+        });
+    auto skip1_adj = feat1_adj;
+    auto product1_in_adj = Kokkos::View<AccumPrecision**,Kokkos::LayoutRight>(
+        "rrnlb_product1_in_adj", num_nodes, product1_dim_in);
+    rrnlb_apply_linear_transpose(rrnlb_product_linear_1, num_nodes, feat1_adj, product1_in_adj);
+
+    if constexpr (!std::is_same_v<Precision, AccumPrecision>) {
+        if (rrnlb_M1_adj_ap.extent_int(0) < num_nodes
+            || rrnlb_M1_adj_ap.extent_int(1) != num_channels_local) {
+            Kokkos::realloc(rrnlb_M1_adj_ap, num_nodes, num_channels_local);
+        }
+        Kokkos::deep_copy(rrnlb_M1_adj_ap, static_cast<AccumPrecision>(0.0));
+        auto M1_adj_ap_view = rrnlb_M1_adj_ap;
+        for (std::size_t p = 0; p < h_p1_in_offset.size(); ++p) {
+            const int offset = h_p1_in_offset[p];
+            const int mul = h_p1_in_mul[p];
+            const int l = h_p1_in_l[p];
+            const int ir_dim = 2 * l + 1;
+            Kokkos::parallel_for(
+                "rrnlb_product1_adj_to_M1_adj_ap",
+                num_nodes * mul * ir_dim,
+                KOKKOS_LAMBDA (const int ikm) {
+                    const int i = ikm / (mul * ir_dim);
+                    const int km = ikm % (mul * ir_dim);
+                    const int k = km / ir_dim;
+                    const int m = km % ir_dim;
+                    (void)m;
+                    M1_adj_ap_view(i, k) = product1_in_adj(i, offset + k * ir_dim);
+                });
+        }
+        rrnlb_debug("M1 reverse (mixed AP) begin");
+        reverse_M1_mixed_rrnlb(num_nodes, node_types, rrnlb_M1_adj_ap, rrnlb_A1_adj_ap);
+        rrnlb_debug("M1 reverse (mixed AP) done");
+    } else {
+        if (M1_adj.extent(0) < num_nodes || M1_adj.extent(1) != num_channels_local) {
+            Kokkos::realloc(M1_adj, num_nodes, num_channels_local);
+        }
+        Kokkos::deep_copy(M1_adj, static_cast<Precision>(0.0));
+        auto M1_adj_view = M1_adj;
+        for (std::size_t p = 0; p < h_p1_in_offset.size(); ++p) {
+            const int offset = h_p1_in_offset[p];
+            const int mul = h_p1_in_mul[p];
+            const int l = h_p1_in_l[p];
+            const int ir_dim = 2 * l + 1;
+            Kokkos::parallel_for(
+                "rrnlb_product1_adj_to_M1_adj",
+                num_nodes * mul * ir_dim,
+                KOKKOS_LAMBDA (const int ikm) {
+                    const int i = ikm / (mul * ir_dim);
+                    const int km = ikm % (mul * ir_dim);
+                    const int k = km / ir_dim;
+                    const int m = km % ir_dim;
+                    (void)m;
+                    M1_adj_view(i, k) = product1_in_adj(i, offset + k * ir_dim);
+                });
+        }
+        rrnlb_debug("M1 reverse begin");
+        reverse_M1(num_nodes, node_types);
+        rrnlb_debug("M1 reverse done");
+    }
+    auto interaction1_adj = Kokkos::View<AccumPrecision**,Kokkos::LayoutRight>(
+        "rrnlb_interaction1_adj", num_nodes, layer1.linear_2.dim_out);
+    // Kokkos::View constructor zero-initializes; explicit deep_copy removed.
+    if constexpr (!std::is_same_v<Precision, AccumPrecision>) {
+        auto A1_adj_ap_view = rrnlb_A1_adj_ap;
+        for (std::size_t p = 0; p < h_l1_out_offset.size(); ++p) {
+            const int offset = h_l1_out_offset[p];
+            const int mul = h_l1_out_mul[p];
+            const int l = h_l1_out_l[p];
+            const int ir_dim = 2 * l + 1;
+            Kokkos::parallel_for(
+                "rrnlb_A1_adj_ap_to_layer1",
+                num_nodes * mul * ir_dim,
+                KOKKOS_LAMBDA (const int ikm) {
+                    const int i = ikm / (mul * ir_dim);
+                    const int km = ikm % (mul * ir_dim);
+                    const int k = km / ir_dim;
+                    const int m = km % ir_dim;
+                    interaction1_adj(i, offset + k * ir_dim + m) =
+                        A1_adj_ap_view(i, l * l + m, k);
+                });
+        }
+    } else {
+        auto A1_adj_view = A1_adj;
+        for (std::size_t p = 0; p < h_l1_out_offset.size(); ++p) {
+            const int offset = h_l1_out_offset[p];
+            const int mul = h_l1_out_mul[p];
+            const int l = h_l1_out_l[p];
+            const int ir_dim = 2 * l + 1;
+            Kokkos::parallel_for(
+                "rrnlb_A1_adj_to_layer1",
+                num_nodes * mul * ir_dim,
+                KOKKOS_LAMBDA (const int ikm) {
+                    const int i = ikm / (mul * ir_dim);
+                    const int km = ikm % (mul * ir_dim);
+                    const int k = km / ir_dim;
+                    const int m = km % ir_dim;
+                    interaction1_adj(i, offset + k * ir_dim + m) =
+                        static_cast<AccumPrecision>(A1_adj_view(i, l * l + m, k));
+                });
+        }
+    }
+    auto feat0_from_layer1_adj = Kokkos::View<AccumPrecision**,Kokkos::LayoutRight>(
+        "rrnlb_feat0_from_layer1_adj", num_nodes, rrnlb_product_linear_0.dim_out);
+    rrnlb_debug("layer1 reverse begin");
+    reverse_rrnlb_interaction_layer(
+        1, num_nodes, node_types, num_neigh, neigh_indices, neigh_types, xyz, r, rrnlb_first_neigh_view,
+        feat0, cache1, interaction1_adj, skip1_adj, feat0_from_layer1_adj, -1, Kokkos::View<const int*>(),
+        rrnlb_total_edges, rrnlb_edge_to_receiver);
+    rrnlb_debug("layer1 reverse done");
+    Kokkos::parallel_for(
+        "rrnlb_accum_feat0_adj",
+        num_nodes * product0_dim_out,
+        KOKKOS_LAMBDA (const int ip) {
+            const int i = ip / product0_dim_out;
+            const int p = ip % product0_dim_out;
+            feat0_adj(i, p) += feat0_from_layer1_adj(i, p);
+        });
+    auto skip0_adj = feat0_adj;
+    auto product0_in_adj = Kokkos::View<AccumPrecision**,Kokkos::LayoutRight>(
+        "rrnlb_product0_in_adj", num_nodes, product0_dim_in);
+    rrnlb_apply_linear_transpose(rrnlb_product_linear_0, num_nodes, feat0_adj, product0_in_adj);
+
+    if constexpr (!std::is_same_v<Precision, AccumPrecision>) {
+        if (rrnlb_M0_adj_ap.extent_int(0) < num_nodes
+            || rrnlb_M0_adj_ap.extent_int(1) != num_LM_local
+            || rrnlb_M0_adj_ap.extent_int(2) != num_channels_local) {
+            Kokkos::realloc(rrnlb_M0_adj_ap, num_nodes, num_LM_local, num_channels_local);
+        }
+        Kokkos::deep_copy(rrnlb_M0_adj_ap, static_cast<AccumPrecision>(0.0));
+        auto M0_adj_ap_view = rrnlb_M0_adj_ap;
+        for (std::size_t p = 0; p < h_p0_in_offset.size(); ++p) {
+            const int offset = h_p0_in_offset[p];
+            const int mul = h_p0_in_mul[p];
+            const int l = h_p0_in_l[p];
+            const int ir_dim = 2 * l + 1;
+            Kokkos::parallel_for(
+                "rrnlb_product0_adj_to_M0_adj_ap",
+                num_nodes * mul * ir_dim,
+                KOKKOS_LAMBDA (const int ikm) {
+                    const int i = ikm / (mul * ir_dim);
+                    const int km = ikm % (mul * ir_dim);
+                    const int k = km / ir_dim;
+                    const int m = km % ir_dim;
+                    M0_adj_ap_view(i, l * l + m, k) =
+                        product0_in_adj(i, offset + k * ir_dim + m);
+                });
+        }
+        rrnlb_debug("M0 reverse (mixed AP) begin");
+        reverse_M0_mixed_rrnlb(num_nodes, node_types, rrnlb_M0_adj_ap, rrnlb_A0_adj_ap);
+        rrnlb_debug("M0 reverse (mixed AP) done");
+    } else {
+        if (M0_adj.extent(0) < num_nodes
+            || M0_adj.extent(1) != num_LM_local
+            || M0_adj.extent(2) != num_channels_local) {
+            Kokkos::realloc(M0_adj, num_nodes, num_LM_local, num_channels_local);
+        }
+        Kokkos::deep_copy(M0_adj, static_cast<Precision>(0.0));
+        auto M0_adj_view = M0_adj;
+        for (std::size_t p = 0; p < h_p0_in_offset.size(); ++p) {
+            const int offset = h_p0_in_offset[p];
+            const int mul = h_p0_in_mul[p];
+            const int l = h_p0_in_l[p];
+            const int ir_dim = 2 * l + 1;
+            Kokkos::parallel_for(
+                "rrnlb_product0_adj_to_M0_adj",
+                num_nodes * mul * ir_dim,
+                KOKKOS_LAMBDA (const int ikm) {
+                    const int i = ikm / (mul * ir_dim);
+                    const int km = ikm % (mul * ir_dim);
+                    const int k = km / ir_dim;
+                    const int m = km % ir_dim;
+                    M0_adj_view(i, l * l + m, k) = product0_in_adj(i, offset + k * ir_dim + m);
+                });
+        }
+        rrnlb_debug("M0 reverse begin");
+        reverse_M0(num_nodes, node_types);
+        rrnlb_debug("M0 reverse done");
+    }
+    auto interaction0_adj = Kokkos::View<AccumPrecision**,Kokkos::LayoutRight>(
+        "rrnlb_interaction0_adj", num_nodes, layer0.linear_2.dim_out);
+    // Kokkos::View constructor zero-initializes; explicit deep_copy removed.
+    if constexpr (!std::is_same_v<Precision, AccumPrecision>) {
+        auto A0_adj_ap_view = rrnlb_A0_adj_ap;
+        for (std::size_t p = 0; p < h_l0_out_offset.size(); ++p) {
+            const int offset = h_l0_out_offset[p];
+            const int mul = h_l0_out_mul[p];
+            const int l = h_l0_out_l[p];
+            const int ir_dim = 2 * l + 1;
+            Kokkos::parallel_for(
+                "rrnlb_A0_adj_ap_to_layer0",
+                num_nodes * mul * ir_dim,
+                KOKKOS_LAMBDA (const int ikm) {
+                    const int i = ikm / (mul * ir_dim);
+                    const int km = ikm % (mul * ir_dim);
+                    const int k = km / ir_dim;
+                    const int m = km % ir_dim;
+                    interaction0_adj(i, offset + k * ir_dim + m) =
+                        A0_adj_ap_view(i, l * l + m, k);
+                });
+        }
+    } else {
+        auto A0_adj_view = A0_adj;
+        for (std::size_t p = 0; p < h_l0_out_offset.size(); ++p) {
+            const int offset = h_l0_out_offset[p];
+            const int mul = h_l0_out_mul[p];
+            const int l = h_l0_out_l[p];
+            const int ir_dim = 2 * l + 1;
+            Kokkos::parallel_for(
+                "rrnlb_A0_adj_to_layer0",
+                num_nodes * mul * ir_dim,
+                KOKKOS_LAMBDA (const int ikm) {
+                    const int i = ikm / (mul * ir_dim);
+                    const int km = ikm % (mul * ir_dim);
+                    const int k = km / ir_dim;
+                    const int m = km % ir_dim;
+                    interaction0_adj(i, offset + k * ir_dim + m) =
+                        static_cast<AccumPrecision>(A0_adj_view(i, l * l + m, k));
+                });
+        }
+    }
+    auto node_embed_adj = Kokkos::View<AccumPrecision**,Kokkos::LayoutRight>(
+        "rrnlb_node_embed_adj", num_nodes, num_channels_local);
+    rrnlb_debug("layer0 reverse begin");
+    reverse_rrnlb_interaction_layer(
+        0, num_nodes, node_types, num_neigh, neigh_indices, neigh_types, xyz, r, rrnlb_first_neigh_view,
+        node_embed, cache0, interaction0_adj, skip0_adj, node_embed_adj, -1, Kokkos::View<const int*>(),
+        rrnlb_total_edges, rrnlb_edge_to_receiver);
+    rrnlb_debug("layer0 reverse done");
+    rrnlb_gpu_debug_once = true;
+}
+
+template <typename Precision, typename AccumPrecision>
+void MACEKokkos<Precision, AccumPrecision>::compute_node_energies_forces(
     const int num_nodes,
     Kokkos::View<const int*> node_types,
     Kokkos::View<const int*> num_neigh,
@@ -67,6 +4111,13 @@ void MACEKokkos<Precision>::compute_node_energies_forces(
         zbl.compute_ZBL(
             num_nodes, node_types, num_neigh, neigh_types,
             atomic_numbers, r, xyz, node_energies, node_forces);
+
+    if (interaction_mode_rrnlb) {
+        compute_Y(xyz);
+        compute_rrnlb_node_energies_forces(
+            num_nodes, node_types, num_neigh, neigh_indices, neigh_types, xyz, r);
+        return;
+    }
 
     compute_R0(num_nodes, node_types, num_neigh, neigh_types, r);
     compute_R1(num_nodes, node_types, num_neigh, neigh_types, r);
@@ -97,8 +4148,8 @@ void MACEKokkos<Precision>::compute_node_energies_forces(
     reverse_A0(num_nodes, node_types, num_neigh, neigh_types, xyz, r);
 }
 
-template <typename Precision>
-void MACEKokkos<Precision>::compute_R0(
+template <typename Precision, typename AccumPrecision>
+void MACEKokkos<Precision, AccumPrecision>::compute_R0(
     const int num_nodes,
     Kokkos::View<const int*> node_types,
     Kokkos::View<const int*> num_neigh,
@@ -172,8 +4223,8 @@ void MACEKokkos<Precision>::compute_R0(
     Kokkos::fence();
 }
 
-template <typename Precision>
-void MACEKokkos<Precision>::compute_R1(
+template <typename Precision, typename AccumPrecision>
+void MACEKokkos<Precision, AccumPrecision>::compute_R1(
     const int num_nodes,
     Kokkos::View<const int*> node_types,
     Kokkos::View<const int*> num_neigh,
@@ -188,8 +4239,8 @@ void MACEKokkos<Precision>::compute_R1(
     Kokkos::fence();
 }
 
-template <typename Precision>
-void MACEKokkos<Precision>::compute_Y(Kokkos::View<const double*> xyz) {
+template <typename Precision, typename AccumPrecision>
+void MACEKokkos<Precision, AccumPrecision>::compute_Y(Kokkos::View<const double*> xyz) {
 
 #ifndef SYMMETRIX_SPHERICART_CUDA
 
@@ -302,8 +4353,8 @@ void MACEKokkos<Precision>::compute_Y(Kokkos::View<const double*> xyz) {
     Kokkos::fence();
 }
 
-template <typename Precision>
-void MACEKokkos<Precision>::compute_A0(
+template <typename Precision, typename AccumPrecision>
+void MACEKokkos<Precision, AccumPrecision>::compute_A0(
     const int num_nodes,
     View<const int*> node_types,
     View<const int*> num_neigh,
@@ -350,8 +4401,8 @@ void MACEKokkos<Precision>::compute_A0(
     Kokkos::fence();
 }
 
-template <typename Precision>
-void MACEKokkos<Precision>::reverse_A0(
+template <typename Precision, typename AccumPrecision>
+void MACEKokkos<Precision, AccumPrecision>::reverse_A0(
     const int num_nodes,
     Kokkos::View<const int*> node_types,
     Kokkos::View<const int*> num_neigh,
@@ -418,8 +4469,8 @@ void MACEKokkos<Precision>::reverse_A0(
     Kokkos::fence();
 }
 
-template <typename Precision>
-void MACEKokkos<Precision>::compute_A0_scaled(
+template <typename Precision, typename AccumPrecision>
+void MACEKokkos<Precision, AccumPrecision>::compute_A0_scaled(
     const int num_nodes,
     Kokkos::View<const int*> node_types,
     Kokkos::View<const int*> num_neigh,
@@ -474,8 +4525,8 @@ void MACEKokkos<Precision>::compute_A0_scaled(
     Kokkos::fence();
 }
 
-template <typename Precision>
-void MACEKokkos<Precision>::reverse_A0_scaled(
+template <typename Precision, typename AccumPrecision>
+void MACEKokkos<Precision, AccumPrecision>::reverse_A0_scaled(
     const int num_nodes,
     Kokkos::View<const int*> node_types,
     Kokkos::View<const int*> num_neigh,
@@ -548,8 +4599,8 @@ void MACEKokkos<Precision>::reverse_A0_scaled(
 }
 
 #if 0
-template <typename Precision>
-void MACEKokkos<Precision>::compute_M0(
+template <typename Precision, typename AccumPrecision>
+void MACEKokkos<Precision, AccumPrecision>::compute_M0(
     const int num_nodes,
     Kokkos::View<const int*> node_types)
 {
@@ -584,12 +4635,11 @@ void MACEKokkos<Precision>::compute_M0(
 #endif
 
 //#if 0
-template <typename Precision>
-void MACEKokkos<Precision>::compute_M0(int num_nodes, Kokkos::View<const int*> node_types)
+template <typename Precision, typename AccumPrecision>
+void MACEKokkos<Precision, AccumPrecision>::compute_M0(int num_nodes, Kokkos::View<const int*> node_types)
 {
     if (M0.extent(0) < num_nodes)
         Kokkos::realloc(M0, num_nodes, num_LM, num_channels);
-    Kokkos::deep_copy(M0, 0.0);
     for (int LM=0; LM<num_LM; ++LM) {
         if (M0_poly_values(LM).extent(0) < num_nodes)
             M0_poly_values(LM) = Kokkos::View<Precision***,Kokkos::LayoutRight>(
@@ -598,8 +4648,6 @@ void MACEKokkos<Precision>::compute_M0(int num_nodes, Kokkos::View<const int*> n
     }
 
     const auto A0 = this->A0;
-    const auto M0_monomials = this->M0_monomials;
-    const auto M0_weights = this->M0_weights;
     const auto M0_poly_spec = this->M0_poly_spec;
     const auto M0_poly_coeff = this->M0_poly_coeff;
     const auto M0_poly_values = this->M0_poly_values;
@@ -613,34 +4661,36 @@ void MACEKokkos<Precision>::compute_M0(int num_nodes, Kokkos::View<const int*> n
         KOKKOS_LAMBDA (Kokkos::TeamPolicy<>::member_type team_member) {
             const int i = team_member.league_rank() / num_LM;
             const int LM = team_member.league_rank() % num_LM;
-            // initialize
+            const int type_i = node_types(i);
+            const int num_edges = M0_poly_spec(LM).extent_int(0);
+            const auto poly_vals = M0_poly_values(LM);
+            const auto poly_coeff = M0_poly_coeff(LM);
+            const auto poly_spec = M0_poly_spec(LM);
             Kokkos::parallel_for(
-                Kokkos::TeamVectorMDRange<Kokkos::Rank<2,Kokkos::Iterate::Right>,Kokkos::TeamPolicy<>::member_type>(
-                    team_member, num_lm, num_channels),
-                [&] (const int lm, const int k) {
-                    M0_poly_values(LM)(i,lm,k) = A0(i,lm,k);
-                    Kokkos::atomic_add(&M0(i,LM,k), M0_poly_coeff(LM)(node_types(i),lm,k) * M0_poly_values(LM)(i,lm,k));
+                Kokkos::TeamVectorRange(team_member, num_channels),
+                [&] (const int k) {
+                    Precision acc = static_cast<Precision>(0.0);
+                    for (int lm = 0; lm < num_lm; ++lm) {
+                        const Precision v = A0(i, lm, k);
+                        poly_vals(i, lm, k) = v;
+                        acc += poly_coeff(type_i, lm, k) * v;
+                    }
+                    for (int p = 0; p < num_edges; ++p) {
+                        const int p0 = poly_spec(p, 0);
+                        const int p1 = poly_spec(p, 1);
+                        const Precision v = poly_vals(i, p0, k) * poly_vals(i, p1, k);
+                        poly_vals(i, num_lm + p, k) = v;
+                        acc += poly_coeff(type_i, num_lm + p, k) * v;
+                    }
+                    M0(i, LM, k) = acc;
                 });
-            team_member.team_barrier();
-            // forward pass
-            for (int p=0; p<M0_poly_spec(LM).extent(0); ++p) {
-                const int p0 = M0_poly_spec(LM)(p,0);
-                const int p1 = M0_poly_spec(LM)(p,1);
-                Kokkos::parallel_for(
-                    Kokkos::TeamVectorRange(team_member, num_channels),
-                    [&] (const int k) {
-                        M0_poly_values(LM)(i,num_lm+p,k) = M0_poly_values(LM)(i,p0,k) * M0_poly_values(LM)(i,p1,k);
-                        M0(i,LM,k) += M0_poly_coeff(LM)(node_types(i),num_lm+p,k) * M0_poly_values(LM)(i,num_lm+p,k);
-                    });
-            }
         });
-    Kokkos::fence();
 }
 //#endif
 
 #if 0
-template <typename Precision>
-void MACEKokkos<Precision>::reverse_M0(
+template <typename Precision, typename AccumPrecision>
+void MACEKokkos<Precision, AccumPrecision>::reverse_M0(
     const int num_nodes,
     Kokkos::View<const int*> node_types)
 {
@@ -681,8 +4731,8 @@ void MACEKokkos<Precision>::reverse_M0(
 #endif
 
 //#if 0
-template <typename Precision>
-void MACEKokkos<Precision>::reverse_M0(int num_nodes, Kokkos::View<const int*> node_types)
+template <typename Precision, typename AccumPrecision>
+void MACEKokkos<Precision, AccumPrecision>::reverse_M0(int num_nodes, Kokkos::View<const int*> node_types)
 {
     if (A0_adj.extent(0) < num_nodes)
         Kokkos::realloc(A0_adj, A0.extent(0), A0.extent(1), A0.extent(2));
@@ -740,12 +4790,104 @@ void MACEKokkos<Precision>::reverse_M0(int num_nodes, Kokkos::View<const int*> n
                     Kokkos::atomic_add(&A0_adj(i,lm,k), M0_poly_adjoints(LM)(i,lm,k) * M0_adj(i,LM,k));
                 });
         });
-    Kokkos::fence();
 }
 //#endif
 
-template <typename Precision>
-void MACEKokkos<Precision>::compute_H1(
+template <typename Precision, typename AccumPrecision>
+void MACEKokkos<Precision, AccumPrecision>::reverse_M0_mixed_rrnlb(
+    const int num_nodes,
+    Kokkos::View<const int*> node_types,
+    Kokkos::View<const AccumPrecision***,Kokkos::LayoutRight> M0_adj_in,
+    Kokkos::View<AccumPrecision***,Kokkos::LayoutRight> A0_adj_out)
+{
+    if (A0_adj_out.extent_int(0) < num_nodes
+        || A0_adj_out.extent_int(1) != A0.extent_int(1)
+        || A0_adj_out.extent_int(2) != A0.extent_int(2)) {
+        Kokkos::realloc(A0_adj_out, A0.extent_int(0), A0.extent_int(1), A0.extent_int(2));
+    }
+    Kokkos::deep_copy(A0_adj_out, static_cast<AccumPrecision>(0.0));
+
+    if (rrnlb_M0_poly_adjoints_ap.extent_int(0) != num_LM) {
+        rrnlb_M0_poly_adjoints_ap =
+            Kokkos::View<Kokkos::View<AccumPrecision***,Kokkos::LayoutRight>*,Kokkos::SharedSpace>(
+                Kokkos::view_alloc("rrnlb_M0_poly_adjoints_ap", Kokkos::SequentialHostInit),
+                num_LM);
+    }
+    for (int LM = 0; LM < num_LM; ++LM) {
+        const int need_p = M0_poly_coeff(LM).extent_int(1);
+        if (rrnlb_M0_poly_adjoints_ap(LM).extent_int(0) < num_nodes
+            || rrnlb_M0_poly_adjoints_ap(LM).extent_int(1) != need_p
+            || rrnlb_M0_poly_adjoints_ap(LM).extent_int(2) != num_channels) {
+            rrnlb_M0_poly_adjoints_ap(LM) = Kokkos::View<AccumPrecision***,Kokkos::LayoutRight>(
+                Kokkos::view_alloc(
+                    std::string("rrnlb_M0_poly_adjoints_ap_") + std::to_string(LM),
+                    Kokkos::WithoutInitializing),
+                num_nodes,
+                need_p,
+                num_channels);
+        }
+    }
+
+    const auto M0_poly_spec = this->M0_poly_spec;
+    const auto M0_poly_coeff = this->M0_poly_coeff;
+    const auto M0_poly_values = this->M0_poly_values;
+    const auto M0_poly_adjoints_ap = this->rrnlb_M0_poly_adjoints_ap;
+    const auto num_channels = this->num_channels;
+    const auto num_lm = this->num_lm;
+    const auto num_LM = this->num_LM;
+
+    Kokkos::parallel_for(
+        "Reverse M0 mixed rrnlb",
+        Kokkos::TeamPolicy<>(num_nodes * num_LM, Kokkos::AUTO, 32),
+        KOKKOS_LAMBDA (Kokkos::TeamPolicy<>::member_type team_member) {
+            const int i = team_member.league_rank() / num_LM;
+            const int LM = team_member.league_rank() % num_LM;
+            const int type_i = node_types(i);
+
+            Kokkos::parallel_for(
+                Kokkos::TeamVectorMDRange<
+                    Kokkos::Rank<2, Kokkos::Iterate::Right>,
+                    Kokkos::TeamPolicy<>::member_type>(
+                    team_member, M0_poly_coeff(LM).extent_int(1), num_channels),
+                [&] (const int p, const int k) {
+                    M0_poly_adjoints_ap(LM)(i, p, k) =
+                        static_cast<AccumPrecision>(M0_poly_coeff(LM)(type_i, p, k));
+                });
+            team_member.team_barrier();
+
+            for (int p = M0_poly_spec(LM).extent_int(0) - 1; p >= 0; --p) {
+                const int p0 = M0_poly_spec(LM)(p, 0);
+                const int p1 = M0_poly_spec(LM)(p, 1);
+                Kokkos::parallel_for(
+                    Kokkos::TeamVectorRange(team_member, num_channels),
+                    [&] (const int k) {
+                        const AccumPrecision upstream =
+                            M0_poly_adjoints_ap(LM)(i, num_lm + p, k);
+                        M0_poly_adjoints_ap(LM)(i, p0, k) +=
+                            upstream
+                            * static_cast<AccumPrecision>(M0_poly_values(LM)(i, p1, k));
+                        M0_poly_adjoints_ap(LM)(i, p1, k) +=
+                            upstream
+                            * static_cast<AccumPrecision>(M0_poly_values(LM)(i, p0, k));
+                    });
+            }
+            team_member.team_barrier();
+
+            Kokkos::parallel_for(
+                Kokkos::TeamVectorMDRange<
+                    Kokkos::Rank<2, Kokkos::Iterate::Right>,
+                    Kokkos::TeamPolicy<>::member_type>(
+                    team_member, num_lm, num_channels),
+                [&] (const int lm, const int k) {
+                    Kokkos::atomic_add(
+                        &A0_adj_out(i, lm, k),
+                        M0_poly_adjoints_ap(LM)(i, lm, k) * M0_adj_in(i, LM, k));
+                });
+        });
+}
+
+template <typename Precision, typename AccumPrecision>
+void MACEKokkos<Precision, AccumPrecision>::compute_H1(
     const int num_nodes)
 {
     if (H1.extent(0) < M0.extent(0))
@@ -773,8 +4915,8 @@ void MACEKokkos<Precision>::compute_H1(
     Kokkos::fence();
 }
 
-template <typename Precision>
-void MACEKokkos<Precision>::reverse_H1(
+template <typename Precision, typename AccumPrecision>
+void MACEKokkos<Precision, AccumPrecision>::reverse_H1(
     const int num_nodes)
 {
     if (M0_adj.extent(0) < M0.extent(0))
@@ -802,8 +4944,8 @@ void MACEKokkos<Precision>::reverse_H1(
     Kokkos::fence();
 }
 
-template <typename Precision>
-void MACEKokkos<Precision>::compute_Phi1(
+template <typename Precision, typename AccumPrecision>
+void MACEKokkos<Precision, AccumPrecision>::compute_Phi1(
     const int num_nodes,
     Kokkos::View<const int*> num_neigh,
     Kokkos::View<const int*> neigh_indices)
@@ -918,8 +5060,8 @@ void MACEKokkos<Precision>::compute_Phi1(
     Kokkos::fence();
 }
 
-template <typename Precision>
-void MACEKokkos<Precision>::reverse_Phi1(
+template <typename Precision, typename AccumPrecision>
+void MACEKokkos<Precision, AccumPrecision>::reverse_Phi1(
     const int num_nodes,
     Kokkos::View<const int*> num_neigh,
     Kokkos::View<const int*> neigh_indices,
@@ -1024,8 +5166,8 @@ void MACEKokkos<Precision>::reverse_Phi1(
     Kokkos::fence();
 }
 
-template <typename Precision>
-void MACEKokkos<Precision>::compute_A1(int num_nodes)
+template <typename Precision, typename AccumPrecision>
+void MACEKokkos<Precision, AccumPrecision>::compute_A1(int num_nodes)
 {
     // The core matrix multiplication is:
     //         [A1_il]_mk = \sum_(ek') [Phi1_il]_m(ek') [W_il]_(ek')k
@@ -1065,8 +5207,8 @@ void MACEKokkos<Precision>::compute_A1(int num_nodes)
     Kokkos::fence();
 }
 
-template <typename Precision>
-void MACEKokkos<Precision>::reverse_A1(int num_nodes)
+template <typename Precision, typename AccumPrecision>
+void MACEKokkos<Precision, AccumPrecision>::reverse_A1(int num_nodes)
 {
     // The core matrix multiplication is:
     //         [dE/dPhi1_il]_m(ek) = \sum_k' [dE/dA1_il]_mk' [trans(W_il)]_k'(ek)
@@ -1106,8 +5248,8 @@ void MACEKokkos<Precision>::reverse_A1(int num_nodes)
     Kokkos::fence();
 }
 
-template <typename Precision>
-void MACEKokkos<Precision>::compute_A1_scaled(
+template <typename Precision, typename AccumPrecision>
+void MACEKokkos<Precision, AccumPrecision>::compute_A1_scaled(
     const int num_nodes,
     Kokkos::View<const int*> node_types,
     Kokkos::View<const int*> num_neigh,
@@ -1164,8 +5306,8 @@ void MACEKokkos<Precision>::compute_A1_scaled(
     Kokkos::fence();
 }
 
-template <typename Precision>
-void MACEKokkos<Precision>::reverse_A1_scaled(
+template <typename Precision, typename AccumPrecision>
+void MACEKokkos<Precision, AccumPrecision>::reverse_A1_scaled(
     const int num_nodes,
     Kokkos::View<const int*> node_types,
     Kokkos::View<const int*> num_neigh,
@@ -1239,8 +5381,8 @@ void MACEKokkos<Precision>::reverse_A1_scaled(
 }
 
 #if 0
-template <typename Precision>
-void MACEKokkos<Precision>::compute_M1(int num_nodes, Kokkos::View<const int*> node_types)
+template <typename Precision, typename AccumPrecision>
+void MACEKokkos<Precision, AccumPrecision>::compute_M1(int num_nodes, Kokkos::View<const int*> node_types)
 {
     Kokkos::realloc(M1, num_nodes, num_channels);
 
@@ -1271,18 +5413,15 @@ void MACEKokkos<Precision>::compute_M1(int num_nodes, Kokkos::View<const int*> n
 #endif
 
 //#if 0
-template <typename Precision>
-void MACEKokkos<Precision>::compute_M1(int num_nodes, Kokkos::View<const int*> node_types)
+template <typename Precision, typename AccumPrecision>
+void MACEKokkos<Precision, AccumPrecision>::compute_M1(int num_nodes, Kokkos::View<const int*> node_types)
 {
     if (M1.extent(0) < num_nodes)
         Kokkos::realloc(M1, num_nodes, num_channels);
     if (M1_poly_values.extent(0) < num_nodes)
         Kokkos::realloc(M1_poly_values, num_nodes, num_lm+M1_poly_spec.extent(0), num_channels); 
-    Kokkos::deep_copy(M1, 0.0);
 
     const auto A1 = this->A1;
-    const auto M1_monomials = this->M1_monomials;
-    const auto M1_weights = this->M1_weights;
     const auto M1_poly_spec = this->M1_poly_spec;
     const auto M1_poly_coeff = this->M1_poly_coeff;
     const auto M1_poly_values = this->M1_poly_values;
@@ -1294,35 +5433,33 @@ void MACEKokkos<Precision>::compute_M1(int num_nodes, Kokkos::View<const int*> n
         Kokkos::TeamPolicy<>(num_nodes, Kokkos::AUTO, 32),
         KOKKOS_LAMBDA (Kokkos::TeamPolicy<>::member_type team_member) {
             const int i = team_member.league_rank();
-            // initialize
+            const int type_i = node_types(i);
+            const int num_edges = M1_poly_spec.extent_int(0);
             Kokkos::parallel_for(
-                Kokkos::TeamVectorMDRange<
-                    Kokkos::Rank<2,Kokkos::Iterate::Right>,Kokkos::TeamPolicy<>::member_type>(
-                        team_member, num_lm, num_channels),
-                [&] (const int p, const int k) {
-                    M1_poly_values(i,p,k) = A1(i,p,k);
-                    Kokkos::atomic_add(&M1(i,k), M1_poly_coeff(node_types(i),p,k) * M1_poly_values(i,p,k));
+                Kokkos::TeamVectorRange(team_member, num_channels),
+                [&] (const int k) {
+                    Precision acc = static_cast<Precision>(0.0);
+                    for (int p = 0; p < num_lm; ++p) {
+                        const Precision v = A1(i, p, k);
+                        M1_poly_values(i, p, k) = v;
+                        acc += M1_poly_coeff(type_i, p, k) * v;
+                    }
+                    for (int p = 0; p < num_edges; ++p) {
+                        const int p0 = M1_poly_spec(p, 0);
+                        const int p1 = M1_poly_spec(p, 1);
+                        const Precision v = M1_poly_values(i, p0, k) * M1_poly_values(i, p1, k);
+                        M1_poly_values(i, num_lm + p, k) = v;
+                        acc += M1_poly_coeff(type_i, num_lm + p, k) * v;
+                    }
+                    M1(i, k) = acc;
                 });
-            team_member.team_barrier();
-            // forward pass
-            for (int p=0; p<M1_poly_spec.extent(0); ++p) {
-                const int p0 = M1_poly_spec(p,0);
-                const int p1 = M1_poly_spec(p,1);
-                Kokkos::parallel_for(
-                    Kokkos::TeamVectorRange(team_member, num_channels),
-                    [&] (const int k) {
-                        M1_poly_values(i,num_lm+p,k) = M1_poly_values(i,p0,k) * M1_poly_values(i,p1,k);
-                        M1(i,k) += M1_poly_coeff(node_types(i),num_lm+p,k) * M1_poly_values(i,num_lm+p,k);
-                    });
-            }
         });
-    Kokkos::fence();
 }
 //#endif
 
 #if 0
-template <typename Precision>
-void MACEKokkos<Precision>::reverse_M1(int num_nodes, Kokkos::View<const int*> node_types)
+template <typename Precision, typename AccumPrecision>
+void MACEKokkos<Precision, AccumPrecision>::reverse_M1(int num_nodes, Kokkos::View<const int*> node_types)
 {
     Kokkos::realloc(A1_adj, A1.extent(0), A1.extent(1), A1.extent(2));
     Kokkos::deep_copy(A1_adj, 0.0);
@@ -1358,8 +5495,8 @@ void MACEKokkos<Precision>::reverse_M1(int num_nodes, Kokkos::View<const int*> n
 }
 #endif
 
-template <typename Precision>
-void MACEKokkos<Precision>::reverse_M1(int num_nodes, Kokkos::View<const int*> node_types)
+template <typename Precision, typename AccumPrecision>
+void MACEKokkos<Precision, AccumPrecision>::reverse_M1(int num_nodes, Kokkos::View<const int*> node_types)
 {
     if (A1_adj.extent(0) < num_nodes)
         Kokkos::realloc(A1_adj, A1.extent(0), A1.extent(1), A1.extent(2));
@@ -1413,11 +5550,85 @@ void MACEKokkos<Precision>::reverse_M1(int num_nodes, Kokkos::View<const int*> n
                     A1_adj(i,lm,k) = M1_poly_adjoints(i,lm,k) * M1_adj(i,k);
                 });
         });
-    Kokkos::fence();
 }
 
-template <typename Precision>
-void MACEKokkos<Precision>::compute_H2(int num_nodes, Kokkos::View<const int*> node_types)
+template <typename Precision, typename AccumPrecision>
+void MACEKokkos<Precision, AccumPrecision>::reverse_M1_mixed_rrnlb(
+    const int num_nodes,
+    Kokkos::View<const int*> node_types,
+    Kokkos::View<const AccumPrecision**,Kokkos::LayoutRight> M1_adj_in,
+    Kokkos::View<AccumPrecision***,Kokkos::LayoutRight> A1_adj_out)
+{
+    if (A1_adj_out.extent_int(0) < num_nodes
+        || A1_adj_out.extent_int(1) != A1.extent_int(1)
+        || A1_adj_out.extent_int(2) != A1.extent_int(2)) {
+        Kokkos::realloc(A1_adj_out, A1.extent_int(0), A1.extent_int(1), A1.extent_int(2));
+    }
+    Kokkos::deep_copy(A1_adj_out, static_cast<AccumPrecision>(0.0));
+
+    if (rrnlb_M1_poly_adjoints_ap.extent_int(0) < num_nodes
+        || rrnlb_M1_poly_adjoints_ap.extent_int(1) != M1_poly_coeff.extent_int(1)
+        || rrnlb_M1_poly_adjoints_ap.extent_int(2) != num_channels) {
+        Kokkos::realloc(
+            rrnlb_M1_poly_adjoints_ap,
+            num_nodes,
+            M1_poly_coeff.extent_int(1),
+            num_channels);
+    }
+
+    const auto M1_poly_spec = this->M1_poly_spec;
+    const auto M1_poly_coeff = this->M1_poly_coeff;
+    const auto M1_poly_values = this->M1_poly_values;
+    const auto M1_poly_adjoints_ap = this->rrnlb_M1_poly_adjoints_ap;
+    const auto num_channels = this->num_channels;
+    const auto num_lm = this->num_lm;
+
+    Kokkos::parallel_for(
+        "Reverse M1 mixed rrnlb",
+        Kokkos::TeamPolicy<>(num_nodes, Kokkos::AUTO, 32),
+        KOKKOS_LAMBDA (Kokkos::TeamPolicy<>::member_type team_member) {
+            const int i = team_member.league_rank();
+            const int type_i = node_types(i);
+
+            Kokkos::parallel_for(
+                Kokkos::TeamVectorMDRange<
+                    Kokkos::Rank<2, Kokkos::Iterate::Right>,
+                    Kokkos::TeamPolicy<>::member_type>(
+                    team_member, M1_poly_coeff.extent_int(1), num_channels),
+                [&] (const int p, const int k) {
+                    M1_poly_adjoints_ap(i, p, k) =
+                        static_cast<AccumPrecision>(M1_poly_coeff(type_i, p, k));
+                });
+            team_member.team_barrier();
+
+            for (int p = M1_poly_spec.extent_int(0) - 1; p >= 0; --p) {
+                const int p0 = M1_poly_spec(p, 0);
+                const int p1 = M1_poly_spec(p, 1);
+                Kokkos::parallel_for(
+                    Kokkos::TeamVectorRange(team_member, num_channels),
+                    [&] (const int k) {
+                        const AccumPrecision upstream = M1_poly_adjoints_ap(i, num_lm + p, k);
+                        M1_poly_adjoints_ap(i, p0, k) +=
+                            upstream * static_cast<AccumPrecision>(M1_poly_values(i, p1, k));
+                        M1_poly_adjoints_ap(i, p1, k) +=
+                            upstream * static_cast<AccumPrecision>(M1_poly_values(i, p0, k));
+                    });
+            }
+            team_member.team_barrier();
+
+            Kokkos::parallel_for(
+                Kokkos::TeamVectorMDRange<
+                    Kokkos::Rank<2, Kokkos::Iterate::Right>,
+                    Kokkos::TeamPolicy<>::member_type>(
+                    team_member, num_lm, num_channels),
+                [&] (const int lm, const int k) {
+                    A1_adj_out(i, lm, k) = M1_poly_adjoints_ap(i, lm, k) * M1_adj_in(i, k);
+                });
+        });
+}
+
+template <typename Precision, typename AccumPrecision>
+void MACEKokkos<Precision, AccumPrecision>::compute_H2(int num_nodes, Kokkos::View<const int*> node_types)
 {
     if (H2.extent(0) < num_nodes or H2.extent(1) != num_channels)
         Kokkos::realloc(H2, num_nodes, num_channels);
@@ -1454,8 +5665,8 @@ void MACEKokkos<Precision>::compute_H2(int num_nodes, Kokkos::View<const int*> n
     Kokkos::fence();
 }
 
-template <typename Precision>
-void MACEKokkos<Precision>::reverse_H2(int num_nodes, Kokkos::View<const int*> node_types, bool zero_H1_adj)
+template <typename Precision, typename AccumPrecision>
+void MACEKokkos<Precision, AccumPrecision>::reverse_H2(int num_nodes, Kokkos::View<const int*> node_types, bool zero_H1_adj)
 {
     if (H1_adj.extent(0) < H1.extent(0))
         Kokkos::resize(H1_adj, H1.extent(0), H1.extent(1), H1.extent(2));
@@ -1487,8 +5698,8 @@ void MACEKokkos<Precision>::reverse_H2(int num_nodes, Kokkos::View<const int*> n
     Kokkos::fence();
 }
 
-template <typename Precision>
-double MACEKokkos<Precision>::compute_readouts(int num_nodes, const Kokkos::View<const int*> node_types)
+template <typename Precision, typename AccumPrecision>
+double MACEKokkos<Precision, AccumPrecision>::compute_readouts(int num_nodes, const Kokkos::View<const int*> node_types)
 {
     if (H1_adj.extent(0) < H1.extent(0))
         Kokkos::realloc(H1_adj, H1.extent(0), H1.extent(1), H1.extent(2));
@@ -1541,11 +5752,395 @@ double MACEKokkos<Precision>::compute_readouts(int num_nodes, const Kokkos::View
     return energy;
 }
 
-template <typename Precision>
-void MACEKokkos<Precision>::load_from_json(std::string filename)
+template <typename Precision, typename AccumPrecision>
+void MACEKokkos<Precision, AccumPrecision>::load_from_json(std::string filename)
 {
     std::ifstream f(filename);
     nlohmann::json file = nlohmann::json::parse(f);
+    interaction_mode_rrnlb = false;
+    rrnlb_layers_kokkos.clear();
+    const std::string interaction_mode = file.value("interaction_mode", "legacy");
+    if (interaction_mode != "legacy") {
+        if (interaction_mode == "rrnlb") {
+            interaction_mode_rrnlb = true;
+            MACE rrnlb_host(filename);
+
+            num_elements = rrnlb_host.num_elements;
+            num_channels = rrnlb_host.num_channels;
+            r_cut = rrnlb_host.r_cut;
+            l_max = rrnlb_host.l_max;
+            num_lm = rrnlb_host.num_lm;
+            L_max = rrnlb_host.L_max;
+            num_LM = rrnlb_host.num_LM;
+            atomic_numbers = toKokkosView("atomic_numbers", rrnlb_host.atomic_numbers);
+            atomic_energies = toKokkosView("atomic_energies", rrnlb_host.atomic_energies);
+
+            has_zbl = rrnlb_host.has_zbl;
+            if (has_zbl) {
+                zbl = ZBLKokkos(
+                    file["zbl_a_exp"].get<double>(),
+                    file["zbl_a_prefactor"].get<double>(),
+                    file["zbl_c"].get<std::vector<double>>(),
+                    file["zbl_covalent_radii"].get<std::vector<double>>(),
+                    file["zbl_p"].get<int>());
+            }
+
+            auto node_embedding = std::vector<Precision>(
+                rrnlb_host.node_embedding_species_values.begin(),
+                rrnlb_host.node_embedding_species_values.end());
+            set_kokkos_view(
+                rrnlb_node_embedding,
+                node_embedding,
+                num_elements,
+                num_channels);
+
+            rrnlb_product_linear_0 = make_rrnlb_linear_kokkos<Precision, AccumPrecision>(
+                rrnlb_host.product_linear_0, "rrnlb_product_linear_0");
+            rrnlb_product_linear_1 = make_rrnlb_linear_kokkos<Precision, AccumPrecision>(
+                rrnlb_host.product_linear_1, "rrnlb_product_linear_1");
+
+            if (!file.contains("interaction_layers") || !file["interaction_layers"].is_array()) {
+                throw std::runtime_error("RRNLB JSON missing interaction_layers.");
+            }
+            const auto& layers_json = file.at("interaction_layers");
+            if (layers_json.size() != rrnlb_host.rrnlb_layers.size()) {
+                throw std::runtime_error("RRNLB interaction layer count mismatch.");
+            }
+
+            rrnlb_layers_kokkos.clear();
+            rrnlb_layers_kokkos.reserve(rrnlb_host.rrnlb_layers.size());
+            for (int li = 0; li < static_cast<int>(rrnlb_host.rrnlb_layers.size()); ++li) {
+                const auto& src = rrnlb_host.rrnlb_layers[li];
+                const auto& layer_json = layers_json.at(li);
+
+                RRNLBLayerKokkos layer;
+                layer.alpha = src.alpha;
+                layer.beta = src.beta;
+                layer.avg_num_neighbors = src.avg_num_neighbors;
+                layer.tp_weight_numel = src.tp_weight_numel;
+                layer.gate_scalar_cst = src.gate_scalar_cst;
+                layer.linear_up = make_rrnlb_linear_kokkos<Precision, AccumPrecision>(
+                    src.linear_up, "rrnlb_layer" + std::to_string(li) + "_linear_up");
+                layer.linear_res = make_rrnlb_linear_kokkos<Precision, AccumPrecision>(
+                    src.linear_res, "rrnlb_layer" + std::to_string(li) + "_linear_res");
+                layer.linear_1 = make_rrnlb_linear_kokkos<Precision, AccumPrecision>(
+                    src.linear_1, "rrnlb_layer" + std::to_string(li) + "_linear_1");
+                layer.linear_2 = make_rrnlb_linear_kokkos<Precision, AccumPrecision>(
+                    src.linear_2, "rrnlb_layer" + std::to_string(li) + "_linear_2");
+                layer.skip_tp = make_rrnlb_linear_kokkos<Precision, AccumPrecision>(
+                    src.skip_tp, "rrnlb_layer" + std::to_string(li) + "_skip_tp");
+
+                const int num_target = static_cast<int>(src.target_parts.size());
+                Kokkos::realloc(layer.target_offset, num_target);
+                Kokkos::realloc(layer.target_mul, num_target);
+                Kokkos::realloc(layer.target_l, num_target);
+                Kokkos::realloc(layer.nonlin_offset, num_target);
+                Kokkos::realloc(layer.nonlin_mul, num_target);
+                Kokkos::realloc(layer.nonlin_l, num_target);
+                auto h_target_offset = Kokkos::create_mirror_view(layer.target_offset);
+                auto h_target_mul = Kokkos::create_mirror_view(layer.target_mul);
+                auto h_target_l = Kokkos::create_mirror_view(layer.target_l);
+                auto h_nonlin_offset = Kokkos::create_mirror_view(layer.nonlin_offset);
+                auto h_nonlin_mul = Kokkos::create_mirror_view(layer.nonlin_mul);
+                auto h_nonlin_l = Kokkos::create_mirror_view(layer.nonlin_l);
+                for (int p = 0; p < num_target; ++p) {
+                    h_target_offset(p) = src.target_parts[p].offset;
+                    h_target_mul(p) = src.target_parts[p].mul;
+                    h_target_l(p) = src.target_parts[p].l;
+                    h_nonlin_offset(p) = src.nonlin_parts[p].offset;
+                    h_nonlin_mul(p) = src.nonlin_parts[p].mul;
+                    h_nonlin_l(p) = src.nonlin_parts[p].l;
+                }
+                Kokkos::deep_copy(layer.target_offset, h_target_offset);
+                Kokkos::deep_copy(layer.target_mul, h_target_mul);
+                Kokkos::deep_copy(layer.target_l, h_target_l);
+                Kokkos::deep_copy(layer.nonlin_offset, h_nonlin_offset);
+                Kokkos::deep_copy(layer.nonlin_mul, h_nonlin_mul);
+                Kokkos::deep_copy(layer.nonlin_l, h_nonlin_l);
+                layer.gate_gate_cst = toKokkosView(
+                    ("rrnlb_layer" + std::to_string(li) + "_gate_gate_cst").c_str(),
+                    std::vector<Precision>(src.gate_gate_cst.begin(), src.gate_gate_cst.end()));
+
+                const int num_conv = static_cast<int>(src.conv_instructions.size());
+                Kokkos::realloc(layer.conv_in_offset, num_conv);
+                Kokkos::realloc(layer.conv_out_offset, num_conv);
+                Kokkos::realloc(layer.conv_mul, num_conv);
+                Kokkos::realloc(layer.conv_weight_offset, num_conv);
+                Kokkos::realloc(layer.conv_in_ir_dim, num_conv);
+                Kokkos::realloc(layer.conv_out_ir_dim, num_conv);
+                Kokkos::realloc(layer.conv_term_offset, num_conv);
+                Kokkos::realloc(layer.conv_term_count, num_conv);
+                auto h_conv_in_offset = Kokkos::create_mirror_view(layer.conv_in_offset);
+                auto h_conv_out_offset = Kokkos::create_mirror_view(layer.conv_out_offset);
+                auto h_conv_mul = Kokkos::create_mirror_view(layer.conv_mul);
+                auto h_conv_weight_offset = Kokkos::create_mirror_view(layer.conv_weight_offset);
+                auto h_conv_in_ir_dim = Kokkos::create_mirror_view(layer.conv_in_ir_dim);
+                auto h_conv_out_ir_dim = Kokkos::create_mirror_view(layer.conv_out_ir_dim);
+                auto h_conv_term_offset = Kokkos::create_mirror_view(layer.conv_term_offset);
+                auto h_conv_term_count = Kokkos::create_mirror_view(layer.conv_term_count);
+                const int h_up_dim = layer.linear_up.dim_out;
+                const int conv_out_dim = layer.linear_1.dim_in;
+                std::vector<unsigned char> active_in_mask(h_up_dim, static_cast<unsigned char>(0));
+                std::vector<unsigned char> active_out_mask(conv_out_dim, static_cast<unsigned char>(0));
+
+                int total_terms = 0;
+                int max_mul = 0;
+                for (const auto& ins : src.conv_instructions) {
+                    total_terms += static_cast<int>(ins.terms.size());
+                    if (ins.mul > max_mul) max_mul = ins.mul;
+                }
+                layer.conv_max_mul = max_mul;
+                Kokkos::realloc(layer.conv_term_m_out, total_terms);
+                Kokkos::realloc(layer.conv_term_m_in1, total_terms);
+                Kokkos::realloc(layer.conv_term_y_lm, total_terms);
+                Kokkos::realloc(layer.conv_term_coeff, total_terms);
+                auto h_term_m_out = Kokkos::create_mirror_view(layer.conv_term_m_out);
+                auto h_term_m_in1 = Kokkos::create_mirror_view(layer.conv_term_m_in1);
+                auto h_term_y_lm = Kokkos::create_mirror_view(layer.conv_term_y_lm);
+                auto h_term_coeff = Kokkos::create_mirror_view(layer.conv_term_coeff);
+
+                int term_offset = 0;
+                for (int q = 0; q < num_conv; ++q) {
+                    const auto& ins = src.conv_instructions[q];
+                    const auto& in_part = src.edge_parts[ins.i_in1];
+                    const auto& out_part = src.linear_1.parts_in[ins.i_out];
+                    const int in_offset = in_part.offset;
+                    const int in_ir_dim = 2 * in_part.l + 1;
+                    h_conv_in_offset(q) = in_offset;
+                    h_conv_out_offset(q) = out_part.offset;
+                    h_conv_mul(q) = ins.mul;
+                    h_conv_weight_offset(q) = ins.weight_offset;
+                    h_conv_in_ir_dim(q) = in_ir_dim;
+                    h_conv_out_ir_dim(q) = 2 * out_part.l + 1;
+                    h_conv_term_offset(q) = term_offset;
+                    h_conv_term_count(q) = ins.terms.size();
+                    for (int t = 0; t < static_cast<int>(ins.terms.size()); ++t) {
+                        h_term_m_out(term_offset + t) = ins.terms[t].m_out;
+                        const int m_in1 = ins.terms[t].m_in1;
+                        h_term_m_in1(term_offset + t) = m_in1;
+                        h_term_y_lm(term_offset + t) = ins.terms[t].y_lm;
+                        h_term_coeff(term_offset + t) = static_cast<Precision>(ins.terms[t].coeff);
+                        for (int k = 0; k < ins.mul; ++k) {
+                            const int in_idx = in_offset + k * in_ir_dim + m_in1;
+                            const int out_idx = out_part.offset + k * (2 * out_part.l + 1) + ins.terms[t].m_out;
+                            if (in_idx < 0 || in_idx >= h_up_dim) {
+                                throw std::runtime_error(
+                                    "RRNLB conv instruction index out of bounds for linear_up output.");
+                            }
+                            if (out_idx < 0 || out_idx >= conv_out_dim) {
+                                throw std::runtime_error(
+                                    "RRNLB conv instruction index out of bounds for linear_1 input.");
+                            }
+                            active_in_mask[in_idx] = static_cast<unsigned char>(1);
+                            active_out_mask[out_idx] = static_cast<unsigned char>(1);
+                        }
+                    }
+                    term_offset += ins.terms.size();
+                }
+
+                std::vector<int> active_in_indices;
+                active_in_indices.reserve(h_up_dim);
+                for (int p = 0; p < h_up_dim; ++p) {
+                    if (active_in_mask[p] != static_cast<unsigned char>(0)) {
+                        active_in_indices.push_back(p);
+                    }
+                }
+                if (active_in_indices.empty()) {
+                    active_in_indices.resize(h_up_dim);
+                    for (int p = 0; p < h_up_dim; ++p) active_in_indices[p] = p;
+                }
+                layer.conv_active_in_count = static_cast<int>(active_in_indices.size());
+                Kokkos::realloc(layer.conv_active_in_indices, layer.conv_active_in_count);
+                Kokkos::realloc(layer.conv_active_in_inverse, h_up_dim);
+                auto h_conv_active_in_indices = Kokkos::create_mirror_view(layer.conv_active_in_indices);
+                auto h_conv_active_in_inverse = Kokkos::create_mirror_view(layer.conv_active_in_inverse);
+                for (int p = 0; p < h_up_dim; ++p) h_conv_active_in_inverse(p) = -1;
+                for (int p_local = 0; p_local < layer.conv_active_in_count; ++p_local) {
+                    const int p = active_in_indices[p_local];
+                    h_conv_active_in_indices(p_local) = p;
+                    h_conv_active_in_inverse(p) = p_local;
+                }
+
+                std::vector<int> active_out_indices;
+                active_out_indices.reserve(conv_out_dim);
+                for (int p = 0; p < conv_out_dim; ++p) {
+                    if (active_out_mask[p] != static_cast<unsigned char>(0)) {
+                        active_out_indices.push_back(p);
+                    }
+                }
+                if (active_out_indices.empty()) {
+                    active_out_indices.resize(conv_out_dim);
+                    for (int p = 0; p < conv_out_dim; ++p) active_out_indices[p] = p;
+                }
+                layer.conv_active_out_count = static_cast<int>(active_out_indices.size());
+                Kokkos::realloc(layer.conv_active_out_indices, layer.conv_active_out_count);
+                Kokkos::realloc(layer.conv_active_out_inverse, conv_out_dim);
+                auto h_conv_active_out_indices = Kokkos::create_mirror_view(layer.conv_active_out_indices);
+                auto h_conv_active_out_inverse = Kokkos::create_mirror_view(layer.conv_active_out_inverse);
+                for (int p = 0; p < conv_out_dim; ++p) h_conv_active_out_inverse(p) = -1;
+                for (int p_local = 0; p_local < layer.conv_active_out_count; ++p_local) {
+                    const int p = active_out_indices[p_local];
+                    h_conv_active_out_indices(p_local) = p;
+                    h_conv_active_out_inverse(p) = p_local;
+                }
+                Kokkos::deep_copy(layer.conv_in_offset, h_conv_in_offset);
+                Kokkos::deep_copy(layer.conv_out_offset, h_conv_out_offset);
+                Kokkos::deep_copy(layer.conv_mul, h_conv_mul);
+                Kokkos::deep_copy(layer.conv_weight_offset, h_conv_weight_offset);
+                Kokkos::deep_copy(layer.conv_in_ir_dim, h_conv_in_ir_dim);
+                Kokkos::deep_copy(layer.conv_out_ir_dim, h_conv_out_ir_dim);
+                Kokkos::deep_copy(layer.conv_term_offset, h_conv_term_offset);
+                Kokkos::deep_copy(layer.conv_term_count, h_conv_term_count);
+                Kokkos::deep_copy(layer.conv_term_m_out, h_term_m_out);
+                Kokkos::deep_copy(layer.conv_term_m_in1, h_term_m_in1);
+                Kokkos::deep_copy(layer.conv_term_y_lm, h_term_y_lm);
+                Kokkos::deep_copy(layer.conv_term_coeff, h_term_coeff);
+                Kokkos::deep_copy(layer.conv_active_in_indices, h_conv_active_in_indices);
+                Kokkos::deep_copy(layer.conv_active_in_inverse, h_conv_active_in_inverse);
+                Kokkos::deep_copy(layer.conv_active_out_indices, h_conv_active_out_indices);
+                Kokkos::deep_copy(layer.conv_active_out_inverse, h_conv_active_out_inverse);
+
+                const auto& radial = layer_json.at("radial");
+                layer.radial_h = radial.at("spline_h").get<double>();
+                auto tp_values = radial.at("tp_weights_values")
+                    .get<std::vector<std::vector<std::vector<double>>>>();
+                auto tp_derivs = radial.at("tp_weights_derivs")
+                    .get<std::vector<std::vector<std::vector<double>>>>();
+                if (tp_values.empty() || tp_values[0].empty()) {
+                    throw std::runtime_error("RRNLB radial tp spline payload is empty.");
+                }
+                const int num_pairs = static_cast<int>(tp_values.size());
+                const int num_nodes_rad = static_cast<int>(tp_values[0][0].size());
+                layer.radial_num_intervals = num_nodes_rad - 1;
+                Kokkos::realloc(
+                    layer.tp_spline_coeff,
+                    num_pairs,
+                    layer.radial_num_intervals,
+                    4,
+                    layer.tp_weight_numel);
+                auto h_tp_coeff = Kokkos::create_mirror_view(layer.tp_spline_coeff);
+                for (int p = 0; p < num_pairs; ++p) {
+                    for (int i = 0; i < layer.radial_num_intervals; ++i) {
+                        for (int w = 0; w < layer.tp_weight_numel; ++w) {
+                            const double v0 = tp_values[p][w][i];
+                            const double v1 = tp_values[p][w][i + 1];
+                            const double d0 = tp_derivs[p][w][i];
+                            const double d1 = tp_derivs[p][w][i + 1];
+                            const double h = layer.radial_h;
+                            h_tp_coeff(p, i, 0, w) = static_cast<Precision>(v0);
+                            h_tp_coeff(p, i, 1, w) = static_cast<Precision>(d0);
+                            h_tp_coeff(p, i, 2, w) = static_cast<Precision>(
+                                (-3.0 * v0 - 2.0 * h * d0 + 3.0 * v1 - h * d1) / (h * h));
+                            h_tp_coeff(p, i, 3, w) = static_cast<Precision>(
+                                (2.0 * v0 + h * d0 - 2.0 * v1 + h * d1) / (h * h * h));
+                        }
+                    }
+                }
+                Kokkos::deep_copy(layer.tp_spline_coeff, h_tp_coeff);
+
+                auto dens_values = radial.at("edge_density_values")
+                    .get<std::vector<std::vector<double>>>();
+                auto dens_derivs = radial.at("edge_density_derivs")
+                    .get<std::vector<std::vector<double>>>();
+                Kokkos::realloc(
+                    layer.density_spline_coeff,
+                    num_pairs,
+                    layer.radial_num_intervals,
+                    4);
+                auto h_density_coeff = Kokkos::create_mirror_view(layer.density_spline_coeff);
+                for (int p = 0; p < num_pairs; ++p) {
+                    for (int i = 0; i < layer.radial_num_intervals; ++i) {
+                        const double v0 = dens_values[p][i];
+                        const double v1 = dens_values[p][i + 1];
+                        const double d0 = dens_derivs[p][i];
+                        const double d1 = dens_derivs[p][i + 1];
+                        const double h = layer.radial_h;
+                        h_density_coeff(p, i, 0) = static_cast<Precision>(v0);
+                        h_density_coeff(p, i, 1) = static_cast<Precision>(d0);
+                        h_density_coeff(p, i, 2) = static_cast<Precision>(
+                            (-3.0 * v0 - 2.0 * h * d0 + 3.0 * v1 - h * d1) / (h * h));
+                        h_density_coeff(p, i, 3) = static_cast<Precision>(
+                            (2.0 * v0 + h * d0 - 2.0 * v1 + h * d1) / (h * h * h));
+                    }
+                }
+                Kokkos::deep_copy(layer.density_spline_coeff, h_density_coeff);
+
+                rrnlb_layers_kokkos.push_back(std::move(layer));
+            }
+
+            // Polynomial graph coefficients for M0
+            M0_poly_spec = Kokkos::View<Kokkos::View<int**,Kokkos::LayoutRight>*,Kokkos::SharedSpace>(
+                Kokkos::view_alloc("M0_poly_spec", Kokkos::SequentialHostInit), num_LM);
+            M0_poly_coeff = Kokkos::View<Kokkos::View<Precision***,Kokkos::LayoutRight>*,Kokkos::SharedSpace>(
+                Kokkos::view_alloc("M0_poly_coeff", Kokkos::SequentialHostInit), num_LM);
+            for (int LM = 0; LM < num_LM; ++LM) {
+                const auto& base_poly = rrnlb_host.P0[LM * num_channels];
+                M0_poly_spec(LM) = Kokkos::View<int**,Kokkos::LayoutRight>(
+                    Kokkos::view_alloc("M0_poly_spec_lm", Kokkos::WithoutInitializing),
+                    base_poly.edges.size(),
+                    2);
+                auto h_spec = Kokkos::create_mirror_view(M0_poly_spec(LM));
+                for (int p = 0; p < static_cast<int>(base_poly.edges.size()); ++p) {
+                    h_spec(p, 0) = base_poly.edges[p][0];
+                    h_spec(p, 1) = base_poly.edges[p][1];
+                }
+                Kokkos::deep_copy(M0_poly_spec(LM), h_spec);
+
+                M0_poly_coeff(LM) = Kokkos::View<Precision***,Kokkos::LayoutRight>(
+                    Kokkos::view_alloc("M0_poly_coeff_lm", Kokkos::WithoutInitializing),
+                    num_elements,
+                    base_poly.node_coefficients.size(),
+                    num_channels);
+                auto h_coeff = Kokkos::create_mirror_view(M0_poly_coeff(LM));
+                for (int a = 0; a < num_elements; ++a) {
+                    for (int k = 0; k < num_channels; ++k) {
+                        const auto& poly =
+                            rrnlb_host.P0[a * num_LM * num_channels + LM * num_channels + k];
+                        for (int p = 0; p < static_cast<int>(poly.node_coefficients.size()); ++p) {
+                            h_coeff(a, p, k) = static_cast<Precision>(poly.node_coefficients[p]);
+                        }
+                    }
+                }
+                Kokkos::deep_copy(M0_poly_coeff(LM), h_coeff);
+            }
+            M0_poly_values = Kokkos::View<Kokkos::View<Precision***,Kokkos::LayoutRight>*,Kokkos::SharedSpace>(
+                Kokkos::view_alloc("M0_poly_values", Kokkos::SequentialHostInit), num_LM);
+            M0_poly_adjoints = Kokkos::View<Kokkos::View<Precision***,Kokkos::LayoutRight>*,Kokkos::SharedSpace>(
+                Kokkos::view_alloc("M0_poly_adjoints", Kokkos::SequentialHostInit), num_LM);
+
+            // Polynomial graph coefficients for M1
+            const auto& base_m1 = rrnlb_host.P1[0];
+            Kokkos::realloc(M1_poly_spec, base_m1.edges.size(), 2);
+            auto h_M1_poly_spec = Kokkos::create_mirror_view(M1_poly_spec);
+            for (int p = 0; p < static_cast<int>(base_m1.edges.size()); ++p) {
+                h_M1_poly_spec(p, 0) = base_m1.edges[p][0];
+                h_M1_poly_spec(p, 1) = base_m1.edges[p][1];
+            }
+            Kokkos::deep_copy(M1_poly_spec, h_M1_poly_spec);
+            Kokkos::realloc(M1_poly_coeff, num_elements, base_m1.node_coefficients.size(), num_channels);
+            auto h_M1_poly_coeff = Kokkos::create_mirror_view(M1_poly_coeff);
+            for (int a = 0; a < num_elements; ++a) {
+                for (int k = 0; k < num_channels; ++k) {
+                    const auto& poly = rrnlb_host.P1[a * num_channels + k];
+                    for (int p = 0; p < static_cast<int>(poly.node_coefficients.size()); ++p) {
+                        h_M1_poly_coeff(a, p, k) = static_cast<Precision>(poly.node_coefficients[p]);
+                    }
+                }
+            }
+            Kokkos::deep_copy(M1_poly_coeff, h_M1_poly_coeff);
+
+            readout_1_weights = toKokkosView("readout_1_weights", rrnlb_host.readout_1_weights);
+            auto readout_2_weights_1 = file["readout_2_weights_1"].get<std::vector<double>>();
+            auto readout_2_weights_2 = file["readout_2_weights_2"].get<std::vector<double>>();
+            readout_2 = MultilayerPerceptronKokkos(
+                std::vector<int>{num_channels, 16, 1},
+                std::vector<std::vector<double>>{readout_2_weights_1, readout_2_weights_2},
+                file["readout_2_scale_factor"]);
+            return;
+        }
+        throw std::runtime_error(
+            std::string("Unsupported interaction_mode '") + interaction_mode + "'.");
+    }
     
     // Basic model information
     num_elements = file["num_elements"];
@@ -1886,5 +6481,6 @@ void MACEKokkos<Precision>::load_from_json(std::string filename)
         file["readout_2_scale_factor"]);
 }
 
-template class MACEKokkos<float>;
-template class MACEKokkos<double>;
+template class MACEKokkos<float, float>;
+template class MACEKokkos<float, double>;
+template class MACEKokkos<double, double>;

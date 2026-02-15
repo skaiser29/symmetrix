@@ -9,6 +9,9 @@
 
 void _init_kokkos()
 {
+    if (Kokkos::is_initialized()) {
+        return;
+    }
     Kokkos::InitializationSettings settings;
     settings.set_num_threads(1);
     settings.set_disable_warnings(true);
@@ -18,6 +21,10 @@ void _init_kokkos()
 
 void _finalize_kokkos()
 {
+    if (!Kokkos::is_initialized()) {
+        return;
+    }
+    Kokkos::fence();
     Kokkos::finalize();
 }
 

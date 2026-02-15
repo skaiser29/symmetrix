@@ -13,10 +13,12 @@
 
 #ifdef PAIR_CLASS
 // clang-format off
-#define PairSymmetrixMACEKokkosDeviceDouble PairSymmetrixMACEKokkos<LMPDeviceType,double>
-#define PairSymmetrixMACEKokkosHostDouble PairSymmetrixMACEKokkos<LMPHostType,double>
-#define PairSymmetrixMACEKokkosDeviceFloat PairSymmetrixMACEKokkos<LMPDeviceType,float>
-#define PairSymmetrixMACEKokkosHostFloat PairSymmetrixMACEKokkos<LMPHostType,float>
+#define PairSymmetrixMACEKokkosDeviceDouble PairSymmetrixMACEKokkos<LMPDeviceType,double,double>
+#define PairSymmetrixMACEKokkosHostDouble PairSymmetrixMACEKokkos<LMPHostType,double,double>
+#define PairSymmetrixMACEKokkosDeviceFloat PairSymmetrixMACEKokkos<LMPDeviceType,float,float>
+#define PairSymmetrixMACEKokkosHostFloat PairSymmetrixMACEKokkos<LMPHostType,float,float>
+#define PairSymmetrixMACEKokkosDeviceMixed PairSymmetrixMACEKokkos<LMPDeviceType,float,double>
+#define PairSymmetrixMACEKokkosHostMixed PairSymmetrixMACEKokkos<LMPHostType,float,double>
 
 PairStyle(symmetrix/mace/kk,PairSymmetrixMACEKokkosDeviceDouble);
 PairStyle(symmetrix/mace/kk/device,PairSymmetrixMACEKokkosDeviceDouble);
@@ -24,11 +26,16 @@ PairStyle(symmetrix/mace/kk/host,PairSymmetrixMACEKokkosHostDouble);
 PairStyle(symmetrix/mace/float32/kk,PairSymmetrixMACEKokkosDeviceFloat);
 PairStyle(symmetrix/mace/float32/kk/device,PairSymmetrixMACEKokkosDeviceFloat);
 PairStyle(symmetrix/mace/float32/kk/host,PairSymmetrixMACEKokkosHostFloat);
+PairStyle(symmetrix/mace/mixed/kk,PairSymmetrixMACEKokkosDeviceMixed);
+PairStyle(symmetrix/mace/mixed/kk/device,PairSymmetrixMACEKokkosDeviceMixed);
+PairStyle(symmetrix/mace/mixed/kk/host,PairSymmetrixMACEKokkosHostMixed);
 
 #undef PairSymmetrixMACEKokkosDeviceDouble
 #undef PairSymmetrixMACEKokkosHostDouble
 #undef PairSymmetrixMACEKokkosDeviceFloat
 #undef PairSymmetrixMACEKokkosHostFloat
+#undef PairSymmetrixMACEKokkosDeviceMixed
+#undef PairSymmetrixMACEKokkosHostMixed
 // clang-format on
 #else
 
@@ -43,7 +50,7 @@ PairStyle(symmetrix/mace/float32/kk/host,PairSymmetrixMACEKokkosHostFloat);
 
 namespace LAMMPS_NS {
 
-template<class DeviceType, typename Precision = double>
+template<class DeviceType, typename Precision = double, typename AccumPrecision = Precision>
 class PairSymmetrixMACEKokkos : public Pair, public KokkosBase {
 
  public:
@@ -69,15 +76,40 @@ class PairSymmetrixMACEKokkos : public Pair, public KokkosBase {
 
  protected:
   std::string mode;
-  std::unique_ptr<MACEKokkos<Precision>> mace;
+  std::unique_ptr<MACEKokkos<Precision, AccumPrecision>> mace;
   Kokkos::View<int*> mace_types;
   Kokkos::View<Precision***,Kokkos::LayoutRight> H1, H1_adj;
+  Kokkos::View<Precision**,Kokkos::LayoutRight> rrnlb_feat0;
+  Kokkos::View<AccumPrecision**,Kokkos::LayoutRight> rrnlb_feat0_adj;
+  typename MACEKokkos<Precision, AccumPrecision>::RRNLBLayerCacheKokkos rrnlb_cache0, rrnlb_cache1;
+  Kokkos::View<Precision**,Kokkos::LayoutRight> rrnlb_sender_embed_ws;
+  Kokkos::View<Precision**,Kokkos::LayoutRight> rrnlb_interaction0_out_ws;
+  Kokkos::View<Precision**,Kokkos::LayoutRight> rrnlb_skip0_ws;
+  Kokkos::View<Precision**,Kokkos::LayoutRight> rrnlb_product0_in_ws;
+  Kokkos::View<Precision**,Kokkos::LayoutRight> rrnlb_feat0_local_ws;
+  Kokkos::View<Precision**,Kokkos::LayoutRight> rrnlb_interaction1_out_ws;
+  Kokkos::View<Precision**,Kokkos::LayoutRight> rrnlb_skip1_ws;
+  Kokkos::View<Precision**,Kokkos::LayoutRight> rrnlb_product1_in_ws;
+  Kokkos::View<Precision**,Kokkos::LayoutRight> rrnlb_feat1_ws;
+  Kokkos::View<AccumPrecision**,Kokkos::LayoutRight> rrnlb_feat0_adj_local_ws;
+  Kokkos::View<AccumPrecision**,Kokkos::LayoutRight> rrnlb_feat1_adj_ws;
+  Kokkos::View<double**,Kokkos::LayoutRight> rrnlb_feat1_double_ws;
+  Kokkos::View<double*> rrnlb_readout2_out_ws;
+  Kokkos::View<double**,Kokkos::LayoutRight> rrnlb_readout2_adj_ws;
+  Kokkos::View<AccumPrecision**,Kokkos::LayoutRight> rrnlb_product1_in_adj_ws;
+  Kokkos::View<AccumPrecision**,Kokkos::LayoutRight> rrnlb_interaction1_adj_ws;
+  Kokkos::View<AccumPrecision**,Kokkos::LayoutRight> rrnlb_feat0_from_layer1_adj_ws;
+  Kokkos::View<AccumPrecision**,Kokkos::LayoutRight> rrnlb_feat0_adj_nodes_ws;
+  Kokkos::View<AccumPrecision**,Kokkos::LayoutRight> rrnlb_product0_in_adj_ws;
+  Kokkos::View<AccumPrecision**,Kokkos::LayoutRight> rrnlb_interaction0_adj_ws;
+  Kokkos::View<AccumPrecision**,Kokkos::LayoutRight> rrnlb_sender_embed_adj_ws;
 
   // neighbor list variables
   Kokkos::View<int*> node_indices;
   Kokkos::View<int*> node_types;
   Kokkos::View<int*> num_neigh;
   Kokkos::View<int*> first_neigh;
+  Kokkos::View<int*> rrnlb_edge_to_receiver;
   Kokkos::View<int*> neigh_types;
   Kokkos::View<int*> neigh_indices;
   Kokkos::View<int*> neigh_ii_indices;

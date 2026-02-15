@@ -19,6 +19,7 @@ ln -sf $(pwd)/pair_symmetrix_mace_kokkos.cpp ${lammps}/src/KOKKOS/pair_symmetrix
 
 # update lammps build instructions
 echo "
+set(SYMMETRIX_BUILD_SHARED OFF CACHE BOOL \"Build symmetrix as shared library\" FORCE)
 add_subdirectory($(pwd)/../libsymmetrix libsymmetrix)
 target_include_directories(lammps PRIVATE $(pwd)/../libsymmetrix/source)
 target_link_libraries(lammps PRIVATE symmetrix)

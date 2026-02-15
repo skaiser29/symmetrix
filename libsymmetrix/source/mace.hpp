@@ -15,6 +15,78 @@ public:
 
 MACE(std::string filename);
 
+struct RRNLBIrrepPart {
+    int mul = 0;
+    int l = 0;
+    int p = 1;
+    int offset = 0;
+    int dim = 0;
+};
+
+struct RRNLBLinearInstruction {
+    int i_in = -1;
+    int i_out = -1;
+    int mul_in = 0;
+    int mul_out = 0;
+    double path_weight = 1.0;
+    std::vector<double> weights;
+};
+
+struct RRNLBLinear {
+    int dim_in = 0;
+    int dim_out = 0;
+    std::vector<RRNLBIrrepPart> parts_in;
+    std::vector<RRNLBIrrepPart> parts_out;
+    std::vector<RRNLBLinearInstruction> instructions;
+    std::vector<double> bias;
+};
+
+struct RRNLBConvTerm {
+    int m_out = 0;
+    int m_in1 = 0;
+    int y_lm = 0;
+    double coeff = 0.0;
+};
+
+struct RRNLBConvInstruction {
+    int i_in1 = -1;
+    int i_in2 = -1;
+    int i_out = -1;
+    int mul = 0;
+    int weight_offset = 0;
+    int l_in1 = 0;
+    int l_in2 = 0;
+    int l_out = 0;
+    std::vector<RRNLBConvTerm> terms;
+};
+
+struct RRNLBLayer {
+    double alpha = 0.0;
+    double beta = 0.0;
+    double avg_num_neighbors = 0.0;
+    int tp_weight_numel = 0;
+    double gate_scalar_cst = 1.0;
+    std::vector<double> gate_gate_cst;
+    std::vector<RRNLBIrrepPart> edge_parts;
+    std::vector<RRNLBIrrepPart> target_parts;
+    std::vector<RRNLBIrrepPart> nonlin_parts;
+    std::vector<RRNLBConvInstruction> conv_instructions;
+    RRNLBLinear linear_up;
+    RRNLBLinear linear_res;
+    RRNLBLinear linear_1;
+    RRNLBLinear linear_2;
+    RRNLBLinear skip_tp;
+    std::vector<std::unique_ptr<CubicSplineSet>> tp_splines;
+    std::vector<CubicSpline> density_splines;
+};
+
+struct RRNLBLayerCache {
+    std::vector<double> h_up;
+    std::vector<double> density;
+    std::vector<double> lin1_raw;
+    std::vector<double> pre_gate;
+};
+
 // Basic model information
 int num_elements;
 int num_channels;
@@ -23,6 +95,13 @@ int l_max, num_lm;
 int L_max, num_LM;
 std::vector<int> atomic_numbers;
 std::vector<double> atomic_energies;
+bool interaction_mode_rrnlb = false;
+std::vector<double> node_embedding_species_values;
+RRNLBLinear product_linear_0;
+RRNLBLinear product_linear_1;
+std::vector<RRNLBLayer> rrnlb_layers;
+std::vector<double> rrnlb_node_feats_0;
+std::vector<double> rrnlb_node_feats_1;
 
 // Node energies and forces
 std::vector<double> node_energies, node_forces;
@@ -33,6 +112,81 @@ void compute_node_energies_forces(const int num_nodes,
                                   std::span<const int> neigh_types,
                                   std::span<const double> xyz,
                                   std::span<const double> r);
+void compute_rrnlb_forward(
+    const int num_nodes,
+    std::span<const int> node_types,
+    std::span<const int> num_neigh,
+    std::span<const int> neigh_indices,
+    std::span<const int> neigh_types,
+    std::span<const double> xyz,
+    std::span<const double> r);
+void apply_rrnlb_linear(
+    const RRNLBLinear& linear,
+    std::span<const double> x,
+    std::span<double> y);
+void apply_rrnlb_linear_transpose(
+    const RRNLBLinear& linear,
+    std::span<const double> y_adj,
+    std::span<double> x_adj);
+void apply_rrnlb_gate(
+    const RRNLBLayer& layer,
+    std::span<const double> x,
+    std::span<double> y);
+void apply_rrnlb_gate_reverse(
+    const RRNLBLayer& layer,
+    std::span<const double> x,
+    std::span<const double> y_adj,
+    std::span<double> x_adj);
+void compute_rrnlb_interaction_layer_forward(
+    const int layer_index,
+    const int num_nodes,
+    std::span<const int> node_types,
+    std::span<const int> num_neigh,
+    std::span<const int> neigh_indices,
+    std::span<const int> neigh_types,
+    std::span<const double> r,
+    std::span<const double> node_feats_in,
+    std::vector<double>& layer_output,
+    std::vector<double>& layer_skip,
+    RRNLBLayerCache* cache = nullptr,
+    int num_sender_nodes = -1,
+    std::span<const int> target_node_indices = {});
+void reverse_rrnlb_interaction_layer(
+    const int layer_index,
+    const int num_nodes,
+    std::span<const int> node_types,
+    std::span<const int> num_neigh,
+    std::span<const int> neigh_indices,
+    std::span<const int> neigh_types,
+    std::span<const double> xyz,
+    std::span<const double> r,
+    std::span<const double> node_feats_in,
+    const RRNLBLayerCache& cache,
+    std::span<const double> layer_output_adj,
+    std::span<const double> layer_skip_adj,
+    std::span<double> node_feats_in_adj,
+    int num_sender_nodes = -1,
+    std::span<const int> target_node_indices = {});
+void compute_rrnlb_M0(
+    const int num_nodes,
+    std::span<const int> node_types,
+    std::span<const double> node_feats,
+    const std::vector<RRNLBIrrepPart>& parts);
+void reverse_rrnlb_M0(
+    const int num_nodes,
+    std::span<const int> node_types,
+    const std::vector<RRNLBIrrepPart>& parts,
+    std::span<double> node_feats_adj);
+void compute_rrnlb_M1(
+    const int num_nodes,
+    std::span<const int> node_types,
+    std::span<const double> node_feats,
+    const std::vector<RRNLBIrrepPart>& parts);
+void reverse_rrnlb_M1(
+    const int num_nodes,
+    std::span<const int> node_types,
+    const std::vector<RRNLBIrrepPart>& parts,
+    std::span<double> node_feats_adj);
 
 // ZBL
 bool has_zbl;

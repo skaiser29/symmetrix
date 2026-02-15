@@ -3,3 +3,21 @@ build
 *.json
 *.whl
 ._*
+
+PORTING_REALAGNOSTIC_RESIDUAL_NONLINEAR.md
+
+# Generated local planning/status markdowns from iterative optimization work
+CLAUDE.md
+OPTIMIZATION_PLAN_FP32_PORTABLE.md
+PAIR_SYMMETRIX_*.md
+RRNLB_PHASE*_STATUS_*.md
+RRNLB_PHASE[0-9]_STATUS_*.md
+PORTING_RRNLB_TO_KOKKOS_SYMMETRIX.md
+
+# Local build artifacts
+build-phase*/
+build-*/
+libsymmetrix/build-*/
+symmetrix/build-*/
+symmetrix/a.out
+symmetrix/source/symmetrix/*.so

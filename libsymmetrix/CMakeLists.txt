@@ -12,6 +12,7 @@ set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 find_package(BLAS REQUIRED)
 add_subdirectory(external/sphericart)
 option(SYMMETRIX_KOKKOS "Enable Kokkos mode in Symmetrix." ON)
+option(SYMMETRIX_BUILD_SHARED "Build symmetrix as a shared library." ${BUILD_SHARED_LIBS})
 if(SYMMETRIX_KOKKOS)
     if(TARGET Kokkos::kokkos)
         message(STATUS "Symmetrix: Found existing Kokkos target.")
@@ -45,7 +46,11 @@ if(SYMMETRIX_KOKKOS)
         source/zbl_kokkos.cpp)
 endif()
 
-add_library(symmetrix ${SYMMETRIX_SOURCE_FILES})
+if(SYMMETRIX_BUILD_SHARED)
+    add_library(symmetrix SHARED ${SYMMETRIX_SOURCE_FILES})
+else()
+    add_library(symmetrix STATIC ${SYMMETRIX_SOURCE_FILES})
+endif()
 
 # TODO: generalize
 target_compile_options(symmetrix
@@ -66,6 +71,12 @@ if(SYMMETRIX_KOKKOS)
                 Kokkos::kokkoskernels)
 endif()
 
+if(SYMMETRIX_KOKKOS AND Kokkos_ENABLE_CUDA)
+    find_package(CUDAToolkit REQUIRED)
+    target_link_libraries(symmetrix PRIVATE CUDA::cublas CUDA::cublasLt)
+    target_compile_definitions(symmetrix PRIVATE SYMMETRIX_HAVE_CUBLAS)
+endif()
+
 
 # ----- options -----
 
@@ -74,4 +85,3 @@ if (SYMMETRIX_SPHERICART_CUDA)
     message(STATUS "Symmetrix: Will use CUDA version of sphericart.")
     target_compile_definitions(symmetrix PRIVATE SYMMETRIX_SPHERICART_CUDA)
 endif()
-

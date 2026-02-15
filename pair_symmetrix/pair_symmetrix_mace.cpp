@@ -120,6 +120,12 @@ void PairSymmetrixMACE::coeff(int narg, char **arg)
   mace = std::make_unique<MACE>(arg[2]);
   utils::logmesg(lmp, "success\n");
 
+  if (mace->interaction_mode_rrnlb and mode == "mpi_message_passing" and comm->me == 0) {
+    utils::logmesg(
+        lmp,
+        "symmetrix/mace: using staged RRNLB mpi_message_passing payload.\n");
+  }
+
   // extract atomic numbers from pair_coeff
   mace_types = std::vector<int>();
   for (int i=3; i<narg; ++i) {
@@ -140,8 +146,13 @@ void PairSymmetrixMACE::coeff(int narg, char **arg)
 
   // set message size
   if (mode == "mpi_message_passing") {
-    comm_forward = mace->num_LM*mace->num_channels;
-    comm_reverse = mace->num_LM*mace->num_channels;
+    if (mace->interaction_mode_rrnlb) {
+      comm_forward = mace->product_linear_0.dim_out;
+      comm_reverse = mace->product_linear_0.dim_out;
+    } else {
+      comm_forward = mace->num_LM*mace->num_channels;
+      comm_reverse = mace->num_LM*mace->num_channels;
+    }
   } else {
     comm_forward = 0;
     comm_reverse = 0;
@@ -193,22 +204,45 @@ void PairSymmetrixMACE::init_style()
 
 int PairSymmetrixMACE::pack_forward_comm(int n, int *list, double *buf, int /*pbc_flag*/, int * /*pbc*/)
 {
+  if (mace->interaction_mode_rrnlb && mode == "mpi_message_passing") {
+    const int width = mace->product_linear_0.dim_out;
+    for (int ii=0; ii<n; ++ii) {
+      const int i = list[ii];
+      for (int k=0; k<width; ++k) {
+        buf[ii*width+k] = rrnlb_feat0[i*width+k];
+      }
+    }
+    return n*width;
+  }
+
+  const int width = mace->num_LM*mace->num_channels;
   for (int ii=0; ii<n; ++ii) {
     const int i = list[ii];
-    for (int k=0; k<mace->num_LM*mace->num_channels; ++k) {
-      buf[ii*mace->num_LM*mace->num_channels+k] = H1[i*mace->num_LM*mace->num_channels+k];
+    for (int k=0; k<width; ++k) {
+      buf[ii*width+k] = H1[i*width+k];
     }
   }
-  return n*mace->num_LM*mace->num_channels;
+  return n*width;
 }
 
 /* ---------------------------------------------------------------------- */
 
 void PairSymmetrixMACE::unpack_forward_comm(int n, int first, double *buf)
 {
+  if (mace->interaction_mode_rrnlb && mode == "mpi_message_passing") {
+    const int width = mace->product_linear_0.dim_out;
+    for (int i=0; i<n; ++i) {
+      for (int k=0; k<width; ++k) {
+        rrnlb_feat0[(first+i)*width+k] = buf[i*width+k];
+      }
+    }
+    return;
+  }
+
+  const int width = mace->num_LM*mace->num_channels;
   for (int i=0; i<n; ++i) {
-    for (int k=0; k<mace->num_LM*mace->num_channels; ++k) {
-      H1[(first+i)*mace->num_LM*mace->num_channels+k] = buf[i*mace->num_LM*mace->num_channels+k];
+    for (int k=0; k<width; ++k) {
+      H1[(first+i)*width+k] = buf[i*width+k];
     }
   }
 }
@@ -217,22 +251,45 @@ void PairSymmetrixMACE::unpack_forward_comm(int n, int first, double *buf)
 
 int PairSymmetrixMACE::pack_reverse_comm(int n, int first, double *buf)
 {
+  if (mace->interaction_mode_rrnlb && mode == "mpi_message_passing") {
+    const int width = mace->product_linear_0.dim_out;
+    for (int i=0; i<n; ++i) {
+      for (int k=0; k<width; ++k) {
+        buf[i*width+k] = rrnlb_feat0_adj[(first+i)*width+k];
+      }
+    }
+    return n*width;
+  }
+
+  const int width = mace->num_LM*mace->num_channels;
   for (int i=0; i<n; ++i) {
-    for (int k=0; k<mace->num_LM*mace->num_channels; ++k) {
-      buf[i*mace->num_LM*mace->num_channels+k] = H1_adj[(first+i)*mace->num_LM*mace->num_channels+k];
+    for (int k=0; k<width; ++k) {
+      buf[i*width+k] = H1_adj[(first+i)*width+k];
     }
   }
-  return n*mace->num_LM*mace->num_channels;
+  return n*width;
 }
 
 /* ---------------------------------------------------------------------- */
 
 void PairSymmetrixMACE::unpack_reverse_comm(int n, int *list, double *buf)
 {
+  if (mace->interaction_mode_rrnlb && mode == "mpi_message_passing") {
+    const int width = mace->product_linear_0.dim_out;
+    for (int ii=0; ii<n; ++ii) {
+      const int i = list[ii];
+      for (int k=0; k<width; ++k) {
+        rrnlb_feat0_adj[i*width+k] += buf[ii*width+k];
+      }
+    }
+    return;
+  }
+
+  const int width = mace->num_LM*mace->num_channels;
   for (int ii=0; ii<n; ++ii) {
     const int i = list[ii];
-    for (int k=0; k<mace->num_LM*mace->num_channels; ++k) {
-      H1_adj[i*mace->num_LM*mace->num_channels+k] += buf[ii*mace->num_LM*mace->num_channels+k];
+    for (int k=0; k<width; ++k) {
+      H1_adj[i*width+k] += buf[ii*width+k];
     }
   }
 }
@@ -429,6 +486,7 @@ void PairSymmetrixMACE::compute_mpi_message_passing(int eflag, int vflag)
       if (r_squared < r_cut_squared) {
         num_neigh[ii] += 1;
         neigh_j[ij] = j;
+        neigh_indices[ij] = j;
         neigh_types[ij] = mace_types[atom->type[j]-1];
         xyz[3*ij] = dx;
         xyz[3*ij+1] = dy;
@@ -453,46 +511,245 @@ void PairSymmetrixMACE::compute_mpi_message_passing(int eflag, int vflag)
 
   mace->compute_Y(xyz);
 
-  mace->compute_R0(num_nodes, node_types, num_neigh, neigh_types, r);
-  mace->compute_A0(num_nodes, node_types, num_neigh, neigh_types);
-  mace->compute_A0_scaled(num_nodes, node_types, num_neigh, neigh_types, r);
-  mace->compute_M0(num_nodes, node_types);
-  mace->compute_H1(num_nodes);
-
-  // sort local H1 contributions by i (rather than ii)
-  H1.resize((atom->nlocal+atom->nghost)*mace->num_LM*mace->num_channels);
-  for (int ii=0; ii<list->inum; ++ii) {
-    const int i = list->ilist[ii];
-    for (int k=0; k<mace->num_LM*mace->num_channels; ++k) {
-      H1[i*mace->num_LM*mace->num_channels+k] = mace->H1[ii*mace->num_LM*mace->num_channels+k];
+  if (mace->interaction_mode_rrnlb) {
+    if (mace->rrnlb_layers.size() != 2) {
+      error->all(FLERR, "RRNLB mpi_message_passing currently expects exactly two interaction layers.");
     }
+
+    const int sender_nodes = atom->nlocal + atom->nghost;
+    const int feat0_dim = mace->product_linear_0.dim_out;
+    const int feat1_dim = mace->product_linear_1.dim_out;
+    const int product0_dim_in = mace->product_linear_0.dim_in;
+    const int product1_dim_in = mace->product_linear_1.dim_in;
+    const int num_channels = mace->num_channels;
+
+    std::vector<double> sender_embed(static_cast<size_t>(sender_nodes) * num_channels, 0.0);
+    for (int i = 0; i < sender_nodes; ++i) {
+      const int t = mace_types[atom->type[i]-1];
+      const auto* src = mace->node_embedding_species_values.data() + t * num_channels;
+      std::copy(src, src + num_channels, sender_embed.data() + static_cast<size_t>(i) * num_channels);
+    }
+
+    MACE::RRNLBLayerCache layer0_cache;
+    MACE::RRNLBLayerCache layer1_cache;
+    std::vector<double> interaction0_out, skip0;
+    mace->compute_rrnlb_interaction_layer_forward(
+      0,
+      num_nodes,
+      node_types,
+      num_neigh,
+      neigh_indices,
+      neigh_types,
+      r,
+      sender_embed,
+      interaction0_out,
+      skip0,
+      &layer0_cache,
+      sender_nodes,
+      node_i);
+
+    mace->compute_rrnlb_M0(
+      num_nodes,
+      node_types,
+      interaction0_out,
+      mace->rrnlb_layers[0].linear_2.parts_out);
+
+    rrnlb_feat0.assign(static_cast<size_t>(sender_nodes) * feat0_dim, 0.0);
+    for (int ii = 0; ii < num_nodes; ++ii) {
+      const int i = node_i[ii];
+      auto m0_i = std::span<const double>(
+        mace->M0.data() + static_cast<size_t>(ii) * product0_dim_in,
+        product0_dim_in);
+      auto feat0_i = std::span<double>(
+        rrnlb_feat0.data() + static_cast<size_t>(i) * feat0_dim,
+        feat0_dim);
+      mace->apply_rrnlb_linear(mace->product_linear_0, m0_i, feat0_i);
+      const auto* skip0_i = skip0.data() + static_cast<size_t>(ii) * feat0_dim;
+      for (int p = 0; p < feat0_dim; ++p)
+        feat0_i[p] += skip0_i[p];
+    }
+    comm->forward_comm(this);
+
+    std::vector<double> interaction1_out, skip1;
+    mace->compute_rrnlb_interaction_layer_forward(
+      1,
+      num_nodes,
+      node_types,
+      num_neigh,
+      neigh_indices,
+      neigh_types,
+      r,
+      rrnlb_feat0,
+      interaction1_out,
+      skip1,
+      &layer1_cache,
+      sender_nodes,
+      node_i);
+
+    mace->compute_rrnlb_M1(
+      num_nodes,
+      node_types,
+      interaction1_out,
+      mace->rrnlb_layers[1].linear_2.parts_out);
+
+    std::vector<double> feat1(static_cast<size_t>(num_nodes) * feat1_dim, 0.0);
+    std::vector<double> feat0_adj_local(static_cast<size_t>(num_nodes) * feat0_dim, 0.0);
+    std::vector<double> feat1_adj(static_cast<size_t>(num_nodes) * feat1_dim, 0.0);
+    for (int ii = 0; ii < num_nodes; ++ii) {
+      const int i = node_i[ii];
+      auto m1_i = std::span<const double>(
+        mace->M1.data() + static_cast<size_t>(ii) * product1_dim_in,
+        product1_dim_in);
+      auto feat1_i = std::span<double>(
+        feat1.data() + static_cast<size_t>(ii) * feat1_dim,
+        feat1_dim);
+      mace->apply_rrnlb_linear(mace->product_linear_1, m1_i, feat1_i);
+      const auto* skip1_i = skip1.data() + static_cast<size_t>(ii) * feat1_dim;
+      for (int p = 0; p < feat1_dim; ++p)
+        feat1_i[p] += skip1_i[p];
+
+      const int type_i = node_types[ii];
+      mace->node_energies[ii] += mace->atomic_energies[type_i];
+      const auto* feat0_i = rrnlb_feat0.data() + static_cast<size_t>(i) * feat0_dim;
+      for (int k = 0; k < num_channels; ++k) {
+        mace->node_energies[ii] += mace->readout_1_weights[k] * feat0_i[k];
+        feat0_adj_local[static_cast<size_t>(ii) * feat0_dim + k] += mace->readout_1_weights[k];
+      }
+      auto x = std::vector<double>(feat1_i.begin(), feat1_i.end());
+      auto [f, g] = mace->readout_2->evaluate_gradient(x);
+      mace->node_energies[ii] += f[0];
+      for (int k = 0; k < feat1_dim; ++k)
+        feat1_adj[static_cast<size_t>(ii) * feat1_dim + k] += g[k];
+    }
+
+    std::vector<double> skip1_adj = feat1_adj;
+    mace->M1_adj.assign(static_cast<size_t>(num_nodes) * product1_dim_in, 0.0);
+    for (int ii = 0; ii < num_nodes; ++ii) {
+      auto feat1_adj_i = std::span<const double>(
+        feat1_adj.data() + static_cast<size_t>(ii) * feat1_dim,
+        feat1_dim);
+      auto m1_adj_i = std::span<double>(
+        mace->M1_adj.data() + static_cast<size_t>(ii) * product1_dim_in,
+        product1_dim_in);
+      mace->apply_rrnlb_linear_transpose(mace->product_linear_1, feat1_adj_i, m1_adj_i);
+    }
+
+    std::vector<double> interaction1_adj(
+      static_cast<size_t>(num_nodes) * mace->rrnlb_layers[1].linear_2.dim_out, 0.0);
+    mace->reverse_rrnlb_M1(
+      num_nodes,
+      node_types,
+      mace->rrnlb_layers[1].linear_2.parts_out,
+      interaction1_adj);
+
+    rrnlb_feat0_adj.assign(static_cast<size_t>(sender_nodes) * feat0_dim, 0.0);
+    mace->reverse_rrnlb_interaction_layer(
+      1,
+      num_nodes,
+      node_types,
+      num_neigh,
+      neigh_indices,
+      neigh_types,
+      xyz,
+      r,
+      rrnlb_feat0,
+      layer1_cache,
+      interaction1_adj,
+      skip1_adj,
+      rrnlb_feat0_adj,
+      sender_nodes,
+      node_i);
+
+    for (int ii = 0; ii < num_nodes; ++ii) {
+      const int i = node_i[ii];
+      auto* dst = rrnlb_feat0_adj.data() + static_cast<size_t>(i) * feat0_dim;
+      const auto* src = feat0_adj_local.data() + static_cast<size_t>(ii) * feat0_dim;
+      for (int p = 0; p < feat0_dim; ++p)
+        dst[p] += src[p];
+    }
+    comm->reverse_comm(this);
+
+    mace->M0_adj.assign(static_cast<size_t>(num_nodes) * product0_dim_in, 0.0);
+    std::vector<double> skip0_adj(static_cast<size_t>(num_nodes) * feat0_dim, 0.0);
+    for (int ii = 0; ii < num_nodes; ++ii) {
+      const int i = node_i[ii];
+      auto feat0_adj_i = std::span<const double>(
+        rrnlb_feat0_adj.data() + static_cast<size_t>(i) * feat0_dim,
+        feat0_dim);
+      auto m0_adj_i = std::span<double>(
+        mace->M0_adj.data() + static_cast<size_t>(ii) * product0_dim_in,
+        product0_dim_in);
+      mace->apply_rrnlb_linear_transpose(mace->product_linear_0, feat0_adj_i, m0_adj_i);
+      std::copy(feat0_adj_i.begin(), feat0_adj_i.end(), skip0_adj.data() + static_cast<size_t>(ii) * feat0_dim);
+    }
+
+    std::vector<double> interaction0_adj(
+      static_cast<size_t>(num_nodes) * mace->rrnlb_layers[0].linear_2.dim_out, 0.0);
+    mace->reverse_rrnlb_M0(
+      num_nodes,
+      node_types,
+      mace->rrnlb_layers[0].linear_2.parts_out,
+      interaction0_adj);
+
+    std::vector<double> sender_embed_adj(static_cast<size_t>(sender_nodes) * num_channels, 0.0);
+    mace->reverse_rrnlb_interaction_layer(
+      0,
+      num_nodes,
+      node_types,
+      num_neigh,
+      neigh_indices,
+      neigh_types,
+      xyz,
+      r,
+      sender_embed,
+      layer0_cache,
+      interaction0_adj,
+      skip0_adj,
+      sender_embed_adj,
+      sender_nodes,
+      node_i);
+  } else {
+    mace->compute_R0(num_nodes, node_types, num_neigh, neigh_types, r);
+    mace->compute_A0(num_nodes, node_types, num_neigh, neigh_types);
+    mace->compute_A0_scaled(num_nodes, node_types, num_neigh, neigh_types, r);
+    mace->compute_M0(num_nodes, node_types);
+    mace->compute_H1(num_nodes);
+
+    // sort local H1 contributions by i (rather than ii)
+    H1.resize((atom->nlocal+atom->nghost)*mace->num_LM*mace->num_channels);
+    for (int ii=0; ii<list->inum; ++ii) {
+      const int i = list->ilist[ii];
+      for (int k=0; k<mace->num_LM*mace->num_channels; ++k) {
+        H1[i*mace->num_LM*mace->num_channels+k] = mace->H1[ii*mace->num_LM*mace->num_channels+k];
+      }
+    }
+    comm->forward_comm(this);
+    mace->H1 = H1;
+
+    mace->compute_R1(num_nodes, node_types, num_neigh, neigh_types, r);
+    mace->compute_Phi1(num_nodes, num_neigh, neigh_j);
+    mace->compute_A1(num_nodes);
+    mace->compute_A1_scaled(num_nodes, node_types, num_neigh, neigh_types, r);
+    mace->compute_M1(num_nodes, node_types);
+    mace->compute_H2(num_nodes, node_types);
+
+    mace->compute_readouts(num_nodes, node_types);
+
+    mace->reverse_H2(num_nodes, node_types, false);
+    mace->reverse_M1(num_nodes, node_types);
+    mace->reverse_A1_scaled(num_nodes, node_types, num_neigh, neigh_types, xyz, r, false);
+    mace->reverse_A1(num_nodes);
+    mace->reverse_Phi1(num_nodes, num_neigh, neigh_j, xyz, r, false, false);
+
+    H1_adj = mace->H1_adj;
+    comm->reverse_comm(this);
+    mace->H1_adj = H1_adj;
+
+    mace->reverse_H1(num_nodes);
+    mace->reverse_M0(num_nodes, node_types);
+    mace->reverse_A0_scaled(num_nodes, node_types, num_neigh, neigh_types, xyz, r);
+    mace->reverse_A0(num_nodes, node_types, num_neigh, neigh_types, xyz, r);
   }
-  comm->forward_comm(this);
-  mace->H1 = H1;
-
-  mace->compute_R1(num_nodes, node_types, num_neigh, neigh_types, r);
-  mace->compute_Phi1(num_nodes, num_neigh, neigh_j);
-  mace->compute_A1(num_nodes);
-  mace->compute_A1_scaled(num_nodes, node_types, num_neigh, neigh_types, r);
-  mace->compute_M1(num_nodes, node_types);
-  mace->compute_H2(num_nodes, node_types);
-
-  mace->compute_readouts(num_nodes, node_types);
-
-  mace->reverse_H2(num_nodes, node_types, false);
-  mace->reverse_M1(num_nodes, node_types);
-  mace->reverse_A1_scaled(num_nodes, node_types, num_neigh, neigh_types, xyz, r, false);
-  mace->reverse_A1(num_nodes);
-  mace->reverse_Phi1(num_nodes, num_neigh, neigh_j, xyz, r, false, false);
-
-  H1_adj = mace->H1_adj;
-  comm->reverse_comm(this);
-  mace->H1_adj = H1_adj;
-
-  mace->reverse_H1(num_nodes);
-  mace->reverse_M0(num_nodes, node_types);
-  mace->reverse_A0_scaled(num_nodes, node_types, num_neigh, neigh_types, xyz, r);
-  mace->reverse_A0(num_nodes, node_types, num_neigh, neigh_types, xyz, r);
 
   // ----- end mace evaluation -----
 
@@ -553,6 +810,7 @@ void PairSymmetrixMACE::compute_no_mpi_message_passing(int eflag, int vflag)
   ev_init(eflag, vflag);
 
   const double r_cut_squared = mace->r_cut*mace->r_cut;
+  const bool interaction_mode_rrnlb = mace->interaction_mode_rrnlb;
 
   // locate ghosts within r_cut of locals
   is_local.resize(atom->nlocal+atom->nghost);
@@ -577,6 +835,30 @@ void PairSymmetrixMACE::compute_no_mpi_message_passing(int eflag, int vflag)
       const double r_squared = dx*dx + dy*dy + dz*dz;
       if (r_squared<r_cut_squared and not is_local[j])
         is_ghost[j] = true;
+    }
+  }
+
+  // RRNLB requires a 2-hop node set for 2 interaction layers.
+  if (interaction_mode_rrnlb) {
+    std::vector<int> first_shell_ghosts;
+    first_shell_ghosts.reserve(atom->nghost);
+    for (int ii=0; ii<atom->nlocal+atom->nghost; ++ii) {
+      if (is_ghost[ii]) first_shell_ghosts.push_back(ii);
+    }
+    for (const int i : first_shell_ghosts) {
+      const double x_i = atom->x[i][0];
+      const double y_i = atom->x[i][1];
+      const double z_i = atom->x[i][2];
+      int* jlist = list->firstneigh[i];
+      for (int jj=0; jj<list->numneigh[i]; jj++) {
+        const int j = (jlist[jj] & NEIGHMASK);
+        const double dx = atom->x[j][0] - x_i;
+        const double dy = atom->x[j][1] - y_i;
+        const double dz = atom->x[j][2] - z_i;
+        const double r_squared = dx*dx + dy*dy + dz*dz;
+        if (r_squared < r_cut_squared and not is_local[j])
+          is_ghost[j] = true;
+      }
     }
   }
 
@@ -612,8 +894,11 @@ void PairSymmetrixMACE::compute_no_mpi_message_passing(int eflag, int vflag)
       const double dy = atom->x[j][1] - y_i;
       const double dz = atom->x[j][2] - z_i;
       const double r_squared = dx*dx + dy*dy + dz*dz;
-      if (r_squared < r_cut_squared)
+      if (r_squared < r_cut_squared) {
+        if (interaction_mode_rrnlb and not (is_local[j] or is_ghost[j]))
+          continue;
         num_neigh[ii] += 1;
+      }
     }
   }
 
@@ -645,8 +930,14 @@ void PairSymmetrixMACE::compute_no_mpi_message_passing(int eflag, int vflag)
       const double dz = atom->x[j][2] - z_i;
       const double r_squared = dx*dx + dy*dy + dz*dz;
       if (r_squared < r_cut_squared) {
+        if (interaction_mode_rrnlb and not (is_local[j] or is_ghost[j]))
+          continue;
         neigh_j[ij] = j;
-        neigh_indices[ij] = ii_from_i[j];
+        if (auto iter = ii_from_i.find(j); iter != ii_from_i.end()) {
+          neigh_indices[ij] = iter->second;
+        } else {
+          neigh_indices[ij] = 0;
+        }
         neigh_types[ij] = mace_types[atom->type[j]-1];
         xyz[3*ij] = dx;
         xyz[3*ij+1] = dy;
@@ -659,43 +950,54 @@ void PairSymmetrixMACE::compute_no_mpi_message_passing(int eflag, int vflag)
 
   // ----- begin mace evaluation -----
 
-  mace->node_energies.resize(num_local_nodes);
-  std::fill(mace->node_energies.begin(), mace->node_energies.end(), 0.0);
-  mace->node_forces.resize(xyz.size());
-  std::fill(mace->node_forces.begin(), mace->node_forces.end(), 0.0);
+  if (mace->interaction_mode_rrnlb) {
+    mace->compute_node_energies_forces(
+        num_local_nodes + num_ghost_nodes,
+        node_types,
+        num_neigh,
+        neigh_indices,
+        neigh_types,
+        xyz,
+        r);
+  } else {
+    mace->node_energies.resize(num_local_nodes);
+    std::fill(mace->node_energies.begin(), mace->node_energies.end(), 0.0);
+    mace->node_forces.resize(xyz.size());
+    std::fill(mace->node_forces.begin(), mace->node_forces.end(), 0.0);
 
-  if (mace->has_zbl)
-    mace->zbl.compute_ZBL(
-     num_local_nodes, node_types, num_neigh, neigh_types,
-     mace->atomic_numbers, r, xyz, mace->node_energies, mace->node_forces);
+    if (mace->has_zbl)
+      mace->zbl.compute_ZBL(
+       num_local_nodes, node_types, num_neigh, neigh_types,
+       mace->atomic_numbers, r, xyz, mace->node_energies, mace->node_forces);
 
-  mace->compute_Y(xyz);
+    mace->compute_Y(xyz);
 
-  mace->compute_R0(num_local_nodes+num_ghost_nodes, node_types, num_neigh, neigh_types, r);
-  mace->compute_A0(num_local_nodes+num_ghost_nodes, node_types, num_neigh, neigh_types);
-  mace->compute_A0_scaled(num_local_nodes+num_ghost_nodes, node_types, num_neigh, neigh_types, r);
-  mace->compute_M0(num_local_nodes+num_ghost_nodes, node_types);
-  mace->compute_H1(num_local_nodes+num_ghost_nodes);
+    mace->compute_R0(num_local_nodes+num_ghost_nodes, node_types, num_neigh, neigh_types, r);
+    mace->compute_A0(num_local_nodes+num_ghost_nodes, node_types, num_neigh, neigh_types);
+    mace->compute_A0_scaled(num_local_nodes+num_ghost_nodes, node_types, num_neigh, neigh_types, r);
+    mace->compute_M0(num_local_nodes+num_ghost_nodes, node_types);
+    mace->compute_H1(num_local_nodes+num_ghost_nodes);
 
-  mace->compute_R1(num_local_nodes, node_types, num_neigh, neigh_types, r);
-  mace->compute_Phi1(num_local_nodes, num_neigh, neigh_indices);
-  mace->compute_A1(num_local_nodes);
-  mace->compute_A1_scaled(num_local_nodes, node_types, num_neigh, neigh_types, r);
-  mace->compute_M1(num_local_nodes, node_types);
-  mace->compute_H2(num_local_nodes, node_types);
+    mace->compute_R1(num_local_nodes, node_types, num_neigh, neigh_types, r);
+    mace->compute_Phi1(num_local_nodes, num_neigh, neigh_indices);
+    mace->compute_A1(num_local_nodes);
+    mace->compute_A1_scaled(num_local_nodes, node_types, num_neigh, neigh_types, r);
+    mace->compute_M1(num_local_nodes, node_types);
+    mace->compute_H2(num_local_nodes, node_types);
 
-  mace->compute_readouts(num_local_nodes, node_types);
-  
-  mace->reverse_H2(num_local_nodes, node_types, false);
-  mace->reverse_M1(num_local_nodes, node_types);
-  mace->reverse_A1_scaled(num_local_nodes, node_types, num_neigh, neigh_types, xyz, r, false);
-  mace->reverse_A1(num_local_nodes);
-  mace->reverse_Phi1(num_local_nodes, num_neigh, neigh_indices, xyz, r, false, false);
+    mace->compute_readouts(num_local_nodes, node_types);
+    
+    mace->reverse_H2(num_local_nodes, node_types, false);
+    mace->reverse_M1(num_local_nodes, node_types);
+    mace->reverse_A1_scaled(num_local_nodes, node_types, num_neigh, neigh_types, xyz, r, false);
+    mace->reverse_A1(num_local_nodes);
+    mace->reverse_Phi1(num_local_nodes, num_neigh, neigh_indices, xyz, r, false, false);
 
-  mace->reverse_H1(num_local_nodes+num_ghost_nodes);
-  mace->reverse_M0(num_local_nodes+num_ghost_nodes, node_types);
-  mace->reverse_A0_scaled(num_local_nodes+num_ghost_nodes, node_types, num_neigh, neigh_types, xyz, r);
-  mace->reverse_A0(num_local_nodes+num_ghost_nodes, node_types, num_neigh, neigh_types, xyz, r);
+    mace->reverse_H1(num_local_nodes+num_ghost_nodes);
+    mace->reverse_M0(num_local_nodes+num_ghost_nodes, node_types);
+    mace->reverse_A0_scaled(num_local_nodes+num_ghost_nodes, node_types, num_neigh, neigh_types, xyz, r);
+    mace->reverse_A0(num_local_nodes+num_ghost_nodes, node_types, num_neigh, neigh_types, xyz, r);
+  }
 
   // ----- end mace evaluation -----
 

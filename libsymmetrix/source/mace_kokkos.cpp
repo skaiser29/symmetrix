@@ -3000,6 +3000,9 @@ void MACEKokkos<Precision, AccumPrecision>::reverse_rrnlb_interaction_layer(
     auto skip_input_adj_targets = cache.skip_input_adj_targets;
     auto density_adj = cache.density_adj;
 
+    // h_up_adj is an accumulation buffer across multiple reverse stages inside this
+    // call, but must start at zero for each invocation.
+    Kokkos::deep_copy(h_up_adj, static_cast<AccumPrecision>(0.0));
     Kokkos::deep_copy(lin1_raw_adj, static_cast<AccumPrecision>(0.0));
     Kokkos::deep_copy(h_res_adj, static_cast<AccumPrecision>(0.0));
     Kokkos::deep_copy(density_adj, static_cast<AccumPrecision>(0.0));

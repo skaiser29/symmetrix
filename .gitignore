@@ -13,6 +13,10 @@ PAIR_SYMMETRIX_*.md
 RRNLB_PHASE*_STATUS_*.md
 RRNLB_PHASE[0-9]_STATUS_*.md
 PORTING_RRNLB_TO_KOKKOS_SYMMETRIX.md
+RRNLB_PORT_AND_PERF_SUMMARY_2026-02-15.md
+
+# External/submodule local noise
+libsymmetrix/external/kokkos-kernels/
 
 # Local build artifacts
 build-phase*/

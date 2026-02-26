@@ -1588,12 +1588,29 @@ void MACE::compute_rrnlb_interaction_layer_forward(
         return target_node_indices[i];
     };
 
-    std::vector<double> h_up(sender_nodes * layer.linear_up.dim_out);
-    std::vector<double> h_res(num_nodes * layer.linear_res.dim_out);
+    std::vector<double> h_up_local;
+    std::vector<double> h_res_local;
+    std::vector<double> conv_accum_local;
+    std::vector<double> density_local;
+    std::vector<double> lin1_raw_local;
+    std::vector<double> pre_gate_local;
+    std::vector<double> gated_local;
+    std::vector<double> tp_values_local;
+    auto& h_up = (cache != nullptr) ? cache->h_up : h_up_local;
+    auto& h_res = (cache != nullptr) ? cache->h_res : h_res_local;
+    auto& conv_accum = (cache != nullptr) ? cache->conv_accum : conv_accum_local;
+    auto& density = (cache != nullptr) ? cache->density : density_local;
+    auto& lin1_raw = (cache != nullptr) ? cache->lin1_raw : lin1_raw_local;
+    auto& pre_gate = (cache != nullptr) ? cache->pre_gate : pre_gate_local;
+    auto& gated = (cache != nullptr) ? cache->gated : gated_local;
+    auto& tp_values = (cache != nullptr) ? cache->tp_values : tp_values_local;
+
+    h_up.resize(static_cast<size_t>(sender_nodes) * layer.linear_up.dim_out);
+    h_res.resize(static_cast<size_t>(num_nodes) * layer.linear_res.dim_out);
     layer_skip.resize(num_nodes * layer.skip_tp.dim_out);
     for (int s = 0; s < sender_nodes; ++s) {
         auto x_s = std::span<const double>(node_feats_in.data() + s * in_dim, in_dim);
-        auto up_s = std::span<double>(h_up.data() + s * layer.linear_up.dim_out, layer.linear_up.dim_out);
+        auto up_s = std::span<double>(h_up.data() + static_cast<size_t>(s) * layer.linear_up.dim_out, layer.linear_up.dim_out);
         apply_rrnlb_linear(layer.linear_up, x_s, up_s);
     }
     for (int i = 0; i < num_nodes; ++i) {
@@ -1602,16 +1619,19 @@ void MACE::compute_rrnlb_interaction_layer_forward(
             throw std::runtime_error("RRNLB layer target index is out of bounds.");
         }
         auto x_i = std::span<const double>(node_feats_in.data() + sender_i * in_dim, in_dim);
-        auto up_i = std::span<const double>(h_up.data() + sender_i * layer.linear_up.dim_out, layer.linear_up.dim_out);
-        auto res_i = std::span<double>(h_res.data() + i * layer.linear_res.dim_out, layer.linear_res.dim_out);
+        auto up_i = std::span<const double>(h_up.data() + static_cast<size_t>(sender_i) * layer.linear_up.dim_out, layer.linear_up.dim_out);
+        auto res_i = std::span<double>(h_res.data() + static_cast<size_t>(i) * layer.linear_res.dim_out, layer.linear_res.dim_out);
         auto skip_i = std::span<double>(layer_skip.data() + i * layer.skip_tp.dim_out, layer.skip_tp.dim_out);
         apply_rrnlb_linear(layer.linear_res, up_i, res_i);
         apply_rrnlb_linear(layer.skip_tp, x_i, skip_i);
     }
 
-    std::vector<double> conv_accum(num_nodes * layer.linear_1.dim_in, 0.0);
-    std::vector<double> density(num_nodes, 0.0);
-    std::vector<double> tp_values(layer.tp_weight_numel, 0.0);
+    conv_accum.resize(static_cast<size_t>(num_nodes) * layer.linear_1.dim_in);
+    density.resize(num_nodes);
+    tp_values.resize(layer.tp_weight_numel);
+    std::fill(conv_accum.begin(), conv_accum.end(), 0.0);
+    std::fill(density.begin(), density.end(), 0.0);
+    std::fill(tp_values.begin(), tp_values.end(), 0.0);
 
     int ij = 0;
     for (int i = 0; i < num_nodes; ++i) {
@@ -1630,8 +1650,8 @@ void MACE::compute_rrnlb_interaction_layer_forward(
             density[i] += layer.density_splines[pair_index].evaluate(r[ij]);
             const auto Y_ij = Y.data() + ij * num_lm;
 
-            auto conv_i = conv_accum.data() + i * layer.linear_1.dim_in;
-            auto up_sender = h_up.data() + sender * layer.linear_up.dim_out;
+            auto conv_i = conv_accum.data() + static_cast<size_t>(i) * layer.linear_1.dim_in;
+            auto up_sender = h_up.data() + static_cast<size_t>(sender) * layer.linear_up.dim_out;
             for (const auto& ins : layer.conv_instructions) {
                 const auto& in_part = layer.edge_parts[ins.i_in1];
                 const auto& out_part = layer.linear_1.parts_in[ins.i_out];
@@ -1652,23 +1672,23 @@ void MACE::compute_rrnlb_interaction_layer_forward(
         }
     }
 
-    std::vector<double> lin1_raw(num_nodes * layer.linear_1.dim_out);
-    std::vector<double> pre_gate(num_nodes * layer.linear_1.dim_out);
-    std::vector<double> gated(num_nodes * layer.linear_2.dim_in);
+    lin1_raw.resize(static_cast<size_t>(num_nodes) * layer.linear_1.dim_out);
+    pre_gate.resize(static_cast<size_t>(num_nodes) * layer.linear_1.dim_out);
+    gated.resize(static_cast<size_t>(num_nodes) * layer.linear_2.dim_in);
     layer_output.resize(num_nodes * layer.linear_2.dim_out);
     for (int i = 0; i < num_nodes; ++i) {
         auto conv_i = std::span<const double>(
-            conv_accum.data() + i * layer.linear_1.dim_in, layer.linear_1.dim_in);
+            conv_accum.data() + static_cast<size_t>(i) * layer.linear_1.dim_in, layer.linear_1.dim_in);
         auto lin1_raw_i = std::span<double>(
-            lin1_raw.data() + i * layer.linear_1.dim_out, layer.linear_1.dim_out);
+            lin1_raw.data() + static_cast<size_t>(i) * layer.linear_1.dim_out, layer.linear_1.dim_out);
         auto pre_gate_i = std::span<double>(
-            pre_gate.data() + i * layer.linear_1.dim_out, layer.linear_1.dim_out);
+            pre_gate.data() + static_cast<size_t>(i) * layer.linear_1.dim_out, layer.linear_1.dim_out);
         auto res_i = std::span<const double>(
-            h_res.data() + i * layer.linear_res.dim_out, layer.linear_res.dim_out);
+            h_res.data() + static_cast<size_t>(i) * layer.linear_res.dim_out, layer.linear_res.dim_out);
         auto gated_i = std::span<double>(
-            gated.data() + i * layer.linear_2.dim_in, layer.linear_2.dim_in);
+            gated.data() + static_cast<size_t>(i) * layer.linear_2.dim_in, layer.linear_2.dim_in);
         auto out_i = std::span<double>(
-            layer_output.data() + i * layer.linear_2.dim_out, layer.linear_2.dim_out);
+            layer_output.data() + static_cast<size_t>(i) * layer.linear_2.dim_out, layer.linear_2.dim_out);
 
         apply_rrnlb_linear(layer.linear_1, conv_i, lin1_raw_i);
         const double denom = density[i] * layer.beta + layer.alpha;
@@ -1679,12 +1699,8 @@ void MACE::compute_rrnlb_interaction_layer_forward(
         apply_rrnlb_linear(layer.linear_2, gated_i, out_i);
     }
 
-    if (cache != nullptr) {
-        cache->h_up = std::move(h_up);
-        cache->density = std::move(density);
-        cache->lin1_raw = std::move(lin1_raw);
-        cache->pre_gate = std::move(pre_gate);
-    }
+    // When cache is provided, forward intermediates remain in cache-owned
+    // vectors and are reused across timesteps.
 }
 
 void MACE::reverse_rrnlb_interaction_layer(
@@ -1697,7 +1713,7 @@ void MACE::reverse_rrnlb_interaction_layer(
     std::span<const double> xyz,
     std::span<const double> r,
     std::span<const double> node_feats_in,
-    const RRNLBLayerCache& cache,
+    RRNLBLayerCache& cache,
     std::span<const double> layer_output_adj,
     std::span<const double> layer_skip_adj,
     std::span<double> node_feats_in_adj,
@@ -1736,13 +1752,20 @@ void MACE::reverse_rrnlb_interaction_layer(
 
     std::fill(node_feats_in_adj.begin(), node_feats_in_adj.end(), 0.0);
 
-    std::vector<double> gated_adj(num_nodes * layer.linear_2.dim_in, 0.0);
-    std::vector<double> pre_gate_adj(num_nodes * layer.linear_1.dim_out, 0.0);
-    std::vector<double> lin1_raw_adj(num_nodes * layer.linear_1.dim_out, 0.0);
-    std::vector<double> h_res_adj(num_nodes * layer.linear_res.dim_out, 0.0);
-    std::vector<double> conv_adj(num_nodes * layer.linear_1.dim_in, 0.0);
-    std::vector<double> h_up_adj(sender_nodes * layer.linear_up.dim_out, 0.0);
-    std::vector<double> density_adj(num_nodes, 0.0);
+    auto& gated_adj = cache.gated_adj;
+    auto& pre_gate_adj = cache.pre_gate_adj;
+    auto& lin1_raw_adj = cache.lin1_raw_adj;
+    auto& h_res_adj = cache.h_res_adj;
+    auto& conv_adj = cache.conv_adj;
+    auto& h_up_adj = cache.h_up_adj;
+    auto& density_adj = cache.density_adj;
+    gated_adj.assign(static_cast<size_t>(num_nodes) * layer.linear_2.dim_in, 0.0);
+    pre_gate_adj.assign(static_cast<size_t>(num_nodes) * layer.linear_1.dim_out, 0.0);
+    lin1_raw_adj.assign(static_cast<size_t>(num_nodes) * layer.linear_1.dim_out, 0.0);
+    h_res_adj.assign(static_cast<size_t>(num_nodes) * layer.linear_res.dim_out, 0.0);
+    conv_adj.assign(static_cast<size_t>(num_nodes) * layer.linear_1.dim_in, 0.0);
+    h_up_adj.assign(static_cast<size_t>(sender_nodes) * layer.linear_up.dim_out, 0.0);
+    density_adj.assign(num_nodes, 0.0);
 
     for (int i = 0; i < num_nodes; ++i) {
         auto out_adj_i = std::span<const double>(
@@ -1792,9 +1815,12 @@ void MACE::reverse_rrnlb_interaction_layer(
         apply_rrnlb_linear_transpose(layer.linear_1, lin1_raw_adj_i, conv_adj_i);
     }
 
-    std::vector<double> tp_values(layer.tp_weight_numel, 0.0);
-    std::vector<double> tp_derivs(layer.tp_weight_numel, 0.0);
-    std::vector<double> y_adj(num_lm, 0.0);
+    auto& tp_values = cache.tp_values;
+    auto& tp_derivs = cache.tp_derivs;
+    auto& y_adj = cache.y_adj;
+    tp_values.assign(layer.tp_weight_numel, 0.0);
+    tp_derivs.assign(layer.tp_weight_numel, 0.0);
+    y_adj.assign(num_lm, 0.0);
     int ij = 0;
     for (int i = 0; i < num_nodes; ++i) {
         for (int j = 0; j < num_neigh[i]; ++j) {
@@ -1876,7 +1902,8 @@ void MACE::reverse_rrnlb_interaction_layer(
         apply_rrnlb_linear_transpose(layer.skip_tp, skip_adj_i, x_adj_i);
     }
 
-    std::vector<double> x_up_adj_tmp(in_dim, 0.0);
+    auto& x_up_adj_tmp = cache.x_up_adj_tmp;
+    x_up_adj_tmp.resize(in_dim);
     for (int i = 0; i < sender_nodes; ++i) {
         auto h_up_adj_i = std::span<const double>(
             h_up_adj.data() + i * layer.linear_up.dim_out, layer.linear_up.dim_out);
@@ -1924,17 +1951,19 @@ void MACE::compute_rrnlb_forward(
         return;
     }
 
-    std::vector<double> node_embed(num_nodes * num_channels);
+    rrnlb_node_embed_ws.resize(static_cast<size_t>(num_nodes) * num_channels);
+    auto& node_embed = rrnlb_node_embed_ws;
     for (int i = 0; i < num_nodes; ++i) {
         const int t = node_types[i];
         const auto* src = node_embedding_species_values.data() + t * num_channels;
-        std::copy(src, src + num_channels, node_embed.begin() + i * num_channels);
+        std::copy(src, src + num_channels, node_embed.begin() + static_cast<size_t>(i) * num_channels);
     }
 
-    RRNLBLayerCache layer0_cache;
-    RRNLBLayerCache layer1_cache;
+    auto& layer0_cache = rrnlb_forward_layer0_cache_ws;
+    auto& layer1_cache = rrnlb_forward_layer1_cache_ws;
 
-    std::vector<double> interaction0_out, skip0;
+    auto& interaction0_out = rrnlb_interaction0_out_ws;
+    auto& skip0 = rrnlb_skip0_ws;
     compute_rrnlb_interaction_layer_forward(
         0,
         num_nodes,
@@ -1968,7 +1997,8 @@ void MACE::compute_rrnlb_forward(
         }
     }
 
-    std::vector<double> interaction1_out, skip1;
+    auto& interaction1_out = rrnlb_interaction1_out_ws;
+    auto& skip1 = rrnlb_skip1_ws;
     compute_rrnlb_interaction_layer_forward(
         1,
         num_nodes,
@@ -2002,39 +2032,47 @@ void MACE::compute_rrnlb_forward(
         }
     }
 
-    std::vector<double> feat0_adj(num_nodes * product_linear_0.dim_out, 0.0);
-    std::vector<double> feat1_adj(num_nodes * product_linear_1.dim_out, 0.0);
+    rrnlb_feat0_adj_ws.assign(static_cast<size_t>(num_nodes) * product_linear_0.dim_out, 0.0);
+    rrnlb_feat1_adj_ws.assign(static_cast<size_t>(num_nodes) * product_linear_1.dim_out, 0.0);
+    auto& feat0_adj = rrnlb_feat0_adj_ws;
+    auto& feat1_adj = rrnlb_feat1_adj_ws;
+    rrnlb_mlp_input_ws.resize(product_linear_1.dim_out);
+    auto& mlp_x = rrnlb_mlp_input_ws;
     for (int i = 0; i < num_nodes; ++i) {
         node_energies[i] += atomic_energies[node_types[i]];
-        auto feat0_i = rrnlb_node_feats_0.data() + i * product_linear_0.dim_out;
+        auto feat0_i = rrnlb_node_feats_0.data() + static_cast<size_t>(i) * product_linear_0.dim_out;
         for (int k = 0; k < num_channels; ++k) {
             node_energies[i] += readout_1_weights[k] * feat0_i[k];
-            feat0_adj[i * product_linear_0.dim_out + k] += readout_1_weights[k];
+            feat0_adj[static_cast<size_t>(i) * product_linear_0.dim_out + k] += readout_1_weights[k];
         }
-        auto feat1_i = rrnlb_node_feats_1.data() + i * product_linear_1.dim_out;
-        auto x = std::vector<double>(feat1_i, feat1_i + product_linear_1.dim_out);
-        auto [f, g] = readout_2->evaluate_gradient(x);
+        auto feat1_i = rrnlb_node_feats_1.data() + static_cast<size_t>(i) * product_linear_1.dim_out;
+        std::copy(feat1_i, feat1_i + product_linear_1.dim_out, mlp_x.begin());
+        auto [f, g] = readout_2->evaluate_gradient(mlp_x);
         node_energies[i] += f[0];
         for (int k = 0; k < product_linear_1.dim_out; ++k) {
-            feat1_adj[i * product_linear_1.dim_out + k] += g[k];
+            feat1_adj[static_cast<size_t>(i) * product_linear_1.dim_out + k] += g[k];
         }
     }
 
-    std::vector<double> skip1_adj = feat1_adj;
+    rrnlb_skip1_adj_ws = feat1_adj;
+    auto& skip1_adj = rrnlb_skip1_adj_ws;
     M1_adj.assign(num_nodes * product_linear_1.dim_in, 0.0);
     for (int i = 0; i < num_nodes; ++i) {
         auto feat1_adj_i = std::span<const double>(
-            feat1_adj.data() + i * product_linear_1.dim_out, product_linear_1.dim_out);
-        auto m1_adj_i = std::span<double>(M1_adj.data() + i * product_linear_1.dim_in, product_linear_1.dim_in);
+            feat1_adj.data() + static_cast<size_t>(i) * product_linear_1.dim_out, product_linear_1.dim_out);
+        auto m1_adj_i = std::span<double>(M1_adj.data() + static_cast<size_t>(i) * product_linear_1.dim_in, product_linear_1.dim_in);
         apply_rrnlb_linear_transpose(product_linear_1, feat1_adj_i, m1_adj_i);
     }
-    std::vector<double> interaction1_adj(num_nodes * rrnlb_layers[1].linear_2.dim_out, 0.0);
+    rrnlb_interaction1_adj_ws.assign(
+        static_cast<size_t>(num_nodes) * rrnlb_layers[1].linear_2.dim_out, 0.0);
+    auto& interaction1_adj = rrnlb_interaction1_adj_ws;
     reverse_rrnlb_M1(
         num_nodes,
         node_types,
         rrnlb_layers[1].linear_2.parts_out,
         interaction1_adj);
-    std::vector<double> feat0_from_layer1_adj(rrnlb_node_feats_0.size(), 0.0);
+    rrnlb_feat0_from_layer1_adj_ws.assign(rrnlb_node_feats_0.size(), 0.0);
+    auto& feat0_from_layer1_adj = rrnlb_feat0_from_layer1_adj_ws;
     reverse_rrnlb_interaction_layer(
         1,
         num_nodes,
@@ -2053,21 +2091,25 @@ void MACE::compute_rrnlb_forward(
         feat0_adj[i] += feat0_from_layer1_adj[i];
     }
 
-    std::vector<double> skip0_adj = feat0_adj;
+    rrnlb_skip0_adj_ws = feat0_adj;
+    auto& skip0_adj = rrnlb_skip0_adj_ws;
     M0_adj.assign(num_nodes * product_linear_0.dim_in, 0.0);
     for (int i = 0; i < num_nodes; ++i) {
         auto feat0_adj_i = std::span<const double>(
-            feat0_adj.data() + i * product_linear_0.dim_out, product_linear_0.dim_out);
-        auto m0_adj_i = std::span<double>(M0_adj.data() + i * product_linear_0.dim_in, product_linear_0.dim_in);
+            feat0_adj.data() + static_cast<size_t>(i) * product_linear_0.dim_out, product_linear_0.dim_out);
+        auto m0_adj_i = std::span<double>(M0_adj.data() + static_cast<size_t>(i) * product_linear_0.dim_in, product_linear_0.dim_in);
         apply_rrnlb_linear_transpose(product_linear_0, feat0_adj_i, m0_adj_i);
     }
-    std::vector<double> interaction0_adj(num_nodes * rrnlb_layers[0].linear_2.dim_out, 0.0);
+    rrnlb_interaction0_adj_ws.assign(
+        static_cast<size_t>(num_nodes) * rrnlb_layers[0].linear_2.dim_out, 0.0);
+    auto& interaction0_adj = rrnlb_interaction0_adj_ws;
     reverse_rrnlb_M0(
         num_nodes,
         node_types,
         rrnlb_layers[0].linear_2.parts_out,
         interaction0_adj);
-    std::vector<double> node_embed_adj(node_embed.size(), 0.0);
+    rrnlb_node_embed_adj_ws.assign(node_embed.size(), 0.0);
+    auto& node_embed_adj = rrnlb_node_embed_adj_ws;
     reverse_rrnlb_interaction_layer(
         0,
         num_nodes,

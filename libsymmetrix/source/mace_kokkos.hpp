@@ -15,6 +15,12 @@
 
 class MACE;
 
+enum class RRNLBForwardAdaptiveMode {
+    Auto,
+    ForceFused,
+    ForceSplit
+};
+
 template <typename Precision, typename AccumPrecision = Precision>
 class MACEKokkos {
 
@@ -114,6 +120,12 @@ struct RRNLBLinearKokkos {
     Kokkos::View<Precision*> rev_group_pack_weights;
     Kokkos::View<int*> bias_indices;
     Kokkos::View<Precision*> bias_values;
+    int num_ins = 0;  // Host-side instruction count for fused kernel loops.
+};
+
+enum class RRNLBFusionStorageMode {
+    GlobalStaged,
+    ScratchTiled
 };
 
 struct RRNLBLayerKokkos {
@@ -125,6 +137,11 @@ struct RRNLBLayerKokkos {
     int conv_active_in_count = 0;
     int conv_active_out_count = 0;
     double gate_scalar_cst = 1.0;
+    int num_gate_parts = 0;  // Number of irrep parts in the gate (target_parts.size()).
+    RRNLBFusionStorageMode fusion_storage_mode_fwd = RRNLBFusionStorageMode::GlobalStaged;
+    RRNLBFusionStorageMode fusion_storage_mode_rev = RRNLBFusionStorageMode::GlobalStaged;
+    int fusion_tile_width_fwd = 0;
+    int fusion_tile_width_rev = 0;
 
     RRNLBLinearKokkos linear_up;
     RRNLBLinearKokkos linear_res;
@@ -241,6 +258,17 @@ struct RRNLBPhaseCounters {
     long long comm_pack_calls = 0;
     long long comm_unpack_calls = 0;
     long long workspace_reset_calls = 0;
+    long long fused_forward_global_staged_calls = 0;
+    long long fused_reverse_global_staged_calls = 0;
+    long long fused_forward_scratch_tiled_calls = 0;
+    long long fused_reverse_scratch_tiled_calls = 0;
+    long long forward_adaptive_mode_auto_calls = 0;
+    long long forward_adaptive_mode_force_fused_calls = 0;
+    long long forward_adaptive_mode_force_split_calls = 0;
+    long long forward_full_fused_calls = 0;
+    long long forward_split_calls = 0;
+    long long forward_split_conv_stage_calls = 0;
+    long long forward_split_norm_gate_stage_calls = 0;
 };
 
 struct RrnlbCacheStamp {
@@ -497,7 +525,8 @@ void ensure_rrnlb_epoch_topology_cache(
     Kokkos::View<const int*> first_neigh_input,
     Kokkos::View<const int*> edge_to_receiver_input,
     bool need_sender_maps,
-    int sender_nodes = -1);
+    int sender_nodes = -1,
+    bool force_refresh = false);
 void ensure_rrnlb_scratch_capacity(
     int num_nodes,
     int total_edges,
@@ -599,8 +628,8 @@ void reverse_M0(const int num_nodes, Kokkos::View<const int*> node_types);
 void reverse_M0_mixed_rrnlb(
     const int num_nodes,
     Kokkos::View<const int*> node_types,
-    Kokkos::View<const AccumPrecision***,Kokkos::LayoutRight> M0_adj_in,
-    Kokkos::View<AccumPrecision***,Kokkos::LayoutRight> A0_adj_out);
+    const Kokkos::View<const AccumPrecision***,Kokkos::LayoutRight>& M0_adj_in,
+    Kokkos::View<AccumPrecision***,Kokkos::LayoutRight>& A0_adj_out);
 
 // H1
 Kokkos::View<Precision***,Kokkos::LayoutRight> H1, H1_adj;
@@ -664,8 +693,8 @@ void reverse_M1(int num_nodes, Kokkos::View<const int*> node_types);
 void reverse_M1_mixed_rrnlb(
     const int num_nodes,
     Kokkos::View<const int*> node_types,
-    Kokkos::View<const AccumPrecision**,Kokkos::LayoutRight> M1_adj_in,
-    Kokkos::View<AccumPrecision***,Kokkos::LayoutRight> A1_adj_out);
+    const Kokkos::View<const AccumPrecision**,Kokkos::LayoutRight>& M1_adj_in,
+    Kokkos::View<AccumPrecision***,Kokkos::LayoutRight>& A1_adj_out);
 
 // H2
 Kokkos::View<double**,Kokkos::LayoutRight> H2, H2_adj;

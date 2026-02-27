@@ -102,6 +102,17 @@ enum class RRNLBNonlinearAblationMode {
     GateIdentity
 };
 
+enum class RRNLBEdgeTopologyRefreshMode {
+    Always,
+    LegacyEpoch
+};
+
+enum class RRNLBMpiApNativeM0Impl {
+    NodeReduce,
+    AtomicLegacy,
+    NodeReduceV2
+};
+
 auto rrnlb_nonlinear_ablation_mode() -> RRNLBNonlinearAblationMode
 {
     static RRNLBNonlinearAblationMode mode = []() -> RRNLBNonlinearAblationMode {
@@ -151,6 +162,115 @@ auto rrnlb_forward_vector_length() -> int
         return parsed;
     }();
     return value;
+}
+
+auto rrnlb_forward_adaptive_mode() -> RRNLBForwardAdaptiveMode
+{
+    static RRNLBForwardAdaptiveMode mode = []() -> RRNLBForwardAdaptiveMode {
+        const char* mode_env = std::getenv("SYMMETRIX_RRNLB_FORWARD_ADAPTIVE_MODE");
+        if (mode_env == nullptr || mode_env[0] == '\0') {
+            return RRNLBForwardAdaptiveMode::Auto;
+        }
+        std::string mode(mode_env);
+        std::transform(
+            mode.begin(),
+            mode.end(),
+            mode.begin(),
+            [] (unsigned char c) { return static_cast<char>(std::tolower(c)); });
+        if (mode == "auto") return RRNLBForwardAdaptiveMode::Auto;
+        if (mode == "force_fused") return RRNLBForwardAdaptiveMode::ForceFused;
+        if (mode == "force_split") return RRNLBForwardAdaptiveMode::ForceSplit;
+        std::ostringstream oss;
+        oss << "Unsupported SYMMETRIX_RRNLB_FORWARD_ADAPTIVE_MODE value '" << mode
+            << "'. Supported values: auto, force_fused, force_split.";
+        throw std::runtime_error(oss.str());
+    }();
+    return mode;
+}
+
+auto rrnlb_forward_split_min_nodes() -> int
+{
+    static int value = []() -> int {
+        const char* env = std::getenv("SYMMETRIX_RRNLB_FORWARD_SPLIT_MIN_NODES");
+        if (env == nullptr || env[0] == '\0') return 384;
+        int parsed = std::atoi(env);
+        if (parsed < 1) parsed = 1;
+        return parsed;
+    }();
+    return value;
+}
+
+auto rrnlb_forward_should_use_split(
+    const RRNLBForwardAdaptiveMode mode,
+    const int num_nodes,
+    const bool receiver_parallel_enabled,
+    const bool use_edge_parallel) -> bool
+{
+    if (!receiver_parallel_enabled || !use_edge_parallel) return false;
+    switch (mode) {
+        case RRNLBForwardAdaptiveMode::ForceFused:
+            return false;
+        case RRNLBForwardAdaptiveMode::ForceSplit:
+            return true;
+        case RRNLBForwardAdaptiveMode::Auto:
+        default:
+            return num_nodes < rrnlb_forward_split_min_nodes();
+    }
+}
+
+auto rrnlb_edge_topology_refresh_mode() -> RRNLBEdgeTopologyRefreshMode
+{
+    static RRNLBEdgeTopologyRefreshMode mode = []() -> RRNLBEdgeTopologyRefreshMode {
+        const char* mode_env = std::getenv("SYMMETRIX_RRNLB_EDGE_TOPOLOGY_REFRESH");
+        if (mode_env == nullptr || mode_env[0] == '\0') {
+            return RRNLBEdgeTopologyRefreshMode::Always;
+        }
+        std::string mode(mode_env);
+        std::transform(
+            mode.begin(),
+            mode.end(),
+            mode.begin(),
+            [] (unsigned char c) { return static_cast<char>(std::tolower(c)); });
+        if (mode == "always") return RRNLBEdgeTopologyRefreshMode::Always;
+        if (mode == "legacy_epoch" || mode == "legacy") {
+            return RRNLBEdgeTopologyRefreshMode::LegacyEpoch;
+        }
+        std::ostringstream oss;
+        oss << "Unsupported SYMMETRIX_RRNLB_EDGE_TOPOLOGY_REFRESH value '" << mode
+            << "'. Supported values: always, legacy_epoch.";
+        throw std::runtime_error(oss.str());
+    }();
+    return mode;
+}
+
+auto rrnlb_mpi_ap_native_m0_impl() -> RRNLBMpiApNativeM0Impl
+{
+    static RRNLBMpiApNativeM0Impl mode = []() -> RRNLBMpiApNativeM0Impl {
+        const char* mode_env = std::getenv("SYMMETRIX_RRNLB_MPI_AP_NATIVE_M0_IMPL");
+        if (mode_env == nullptr || mode_env[0] == '\0') {
+            return RRNLBMpiApNativeM0Impl::NodeReduce;
+        }
+        std::string mode(mode_env);
+        std::transform(
+            mode.begin(),
+            mode.end(),
+            mode.begin(),
+            [] (unsigned char c) { return static_cast<char>(std::tolower(c)); });
+        if (mode == "node_reduce" || mode == "node") {
+            return RRNLBMpiApNativeM0Impl::NodeReduce;
+        }
+        if (mode == "atomic_legacy" || mode == "legacy" || mode == "atomic") {
+            return RRNLBMpiApNativeM0Impl::AtomicLegacy;
+        }
+        if (mode == "node_reduce_v2" || mode == "node_v2" || mode == "v2") {
+            return RRNLBMpiApNativeM0Impl::NodeReduceV2;
+        }
+        std::ostringstream oss;
+        oss << "Unsupported SYMMETRIX_RRNLB_MPI_AP_NATIVE_M0_IMPL value '" << mode
+            << "'. Supported values: node_reduce, atomic_legacy, node_reduce_v2.";
+        throw std::runtime_error(oss.str());
+    }();
+    return mode;
 }
 
 auto rrnlb_group_packed_gemm_mode() -> RRNLBGroupPackedGemmMode
@@ -1003,6 +1123,7 @@ auto make_rrnlb_linear_kokkos(
     std::vector<unsigned char> active_in_mask(dst.dim_in, static_cast<unsigned char>(0));
 
     const int num_ins = static_cast<int>(src.instructions.size());
+    dst.num_ins = num_ins;
     dst.h_ins_in_offset.resize(num_ins);
     dst.h_ins_out_offset.resize(num_ins);
     dst.h_ins_mul_in.resize(num_ins);
@@ -1548,10 +1669,14 @@ void MACEKokkos<Precision, AccumPrecision>::ensure_rrnlb_epoch_topology_cache(
     Kokkos::View<const int*> first_neigh_input,
     Kokkos::View<const int*> edge_to_receiver_input,
     bool need_sender_maps,
-    int sender_nodes)
+    int sender_nodes,
+    bool force_refresh)
 {
     if (!interaction_mode_rrnlb) return;
     if (sender_nodes < 0) sender_nodes = num_nodes;
+    const bool force_refresh_enabled =
+        force_refresh
+        && rrnlb_edge_topology_refresh_mode() == RRNLBEdgeTopologyRefreshMode::Always;
     const int sender_segment_edges = std::max(1, rrnlb_sender_segment_size());
     const bool need_sender_segments = need_sender_maps && total_edges > 0;
     const long long epoch_key =
@@ -1603,6 +1728,8 @@ void MACEKokkos<Precision, AccumPrecision>::ensure_rrnlb_epoch_topology_cache(
     }
 
     const bool cache_hit =
+        !force_refresh_enabled
+        &&
         rrnlb_epoch_topology_cache.initialized
         && rrnlb_epoch_topology_cache.epoch == epoch_key
         && rrnlb_epoch_topology_cache.num_nodes == num_nodes
@@ -3280,8 +3407,39 @@ void MACEKokkos<Precision, AccumPrecision>::compute_rrnlb_interaction_layer_forw
         conv_accum, Kokkos::make_pair(0, num_nodes), Kokkos::ALL);
     auto density_active = Kokkos::subview(
         cache.density, Kokkos::make_pair(0, num_nodes));
-    Kokkos::deep_copy(conv_accum_active, static_cast<Precision>(0.0));
-    Kokkos::deep_copy(density_active, static_cast<Precision>(0.0));
+    const int recv_tiled_fwd_override = rrnlb_receiver_tiled_forward_override();
+    const bool receiver_parallel_fwd_enabled =
+        recv_tiled_fwd_override >= 0 ? recv_tiled_fwd_override != 0 : true;
+    const auto forward_adaptive_mode = rrnlb_forward_adaptive_mode();
+    switch (forward_adaptive_mode) {
+        case RRNLBForwardAdaptiveMode::ForceFused:
+            rrnlb_phase_counters.forward_adaptive_mode_force_fused_calls++;
+            break;
+        case RRNLBForwardAdaptiveMode::ForceSplit:
+            rrnlb_phase_counters.forward_adaptive_mode_force_split_calls++;
+            break;
+        case RRNLBForwardAdaptiveMode::Auto:
+        default:
+            rrnlb_phase_counters.forward_adaptive_mode_auto_calls++;
+            break;
+    }
+    const bool receiver_forward_will_run = use_edge_parallel && receiver_parallel_fwd_enabled;
+    const bool use_split_receiver_forward = rrnlb_forward_should_use_split(
+        forward_adaptive_mode, num_nodes, receiver_parallel_fwd_enabled, use_edge_parallel);
+    const bool fused_forward_uses_scratch =
+        receiver_forward_will_run
+        && !use_split_receiver_forward
+        && layer.fusion_storage_mode_fwd == RRNLBFusionStorageMode::ScratchTiled;
+    // Forward scratch-tiled fusion stages conv_row in shared memory, so conv_accum
+    // is unused and can skip the clear; staged/global and fallback paths still need it.
+    if (!fused_forward_uses_scratch) {
+        Kokkos::deep_copy(conv_accum_active, static_cast<Precision>(0.0));
+    }
+    // Density is written directly by receiver-parallel forward paths (full-fused or split);
+    // only non-receiver paths need the atomic-accumulation zero init.
+    if (!receiver_forward_will_run) {
+        Kokkos::deep_copy(density_active, static_cast<Precision>(0.0));
+    }
 
     const auto conv_in_offset = layer.conv_in_offset;
     const auto conv_out_offset = layer.conv_out_offset;
@@ -3327,6 +3485,8 @@ void MACEKokkos<Precision, AccumPrecision>::compute_rrnlb_interaction_layer_forw
     const auto work_out_slot = layer.conv_work_out_slot;
     const int num_work_items = layer.conv_work_table_size;
 
+    bool did_fused_forward = false;
+    bool did_split_forward = false;
     if (use_edge_parallel) {
         // Precompute per-edge radial descriptors (shared by forward + reverse).
         precompute_rrnlb_edge_radial_descriptors(
@@ -3335,9 +3495,7 @@ void MACEKokkos<Precision, AccumPrecision>::compute_rrnlb_interaction_layer_forw
         const auto edge_den_val = rrnlb_edge_density_value[layer_index];
 
         // Gate: prefer receiver-parallel (zero global atomics) when enabled.
-        const int recv_tiled_fwd_override = rrnlb_receiver_tiled_forward_override();
-        const bool use_receiver_parallel_fwd =
-            recv_tiled_fwd_override >= 0 ? recv_tiled_fwd_override != 0 : true;
+        const bool use_receiver_parallel_fwd = receiver_parallel_fwd_enabled;
 
         auto density_view = cache.density;
         const int compact_out_count =
@@ -3349,109 +3507,419 @@ void MACEKokkos<Precision, AccumPrecision>::compute_rrnlb_interaction_layer_forw
                 ? true
                 : (compact_mode == RRNLBInteractionCompactMode::Auto && compact_auto);
 
-        if (use_receiver_parallel_fwd) {
-            // Receiver-parallel forward: one team per receiver node.
-            // Eliminates all global atomics on conv_accum and density.
-            if (use_compact_out) {
-                Kokkos::parallel_for(
-                    "RRNLB conv forward (recv-parallel compact-out)",
-                    Kokkos::TeamPolicy<>(num_nodes, Kokkos::AUTO, rrnlb_forward_vector_length())
-                        .set_scratch_size(
-                            0,
-                            Kokkos::PerTeam(compact_out_count * sizeof(Precision))),
-                    KOKKOS_LAMBDA (Kokkos::TeamPolicy<>::member_type team_member) {
-                        const int i = team_member.league_rank();
-                        auto conv_local = Kokkos::View<Precision*,Kokkos::MemoryUnmanaged>(
-                            team_member.team_scratch(0), compact_out_count);
-                        auto conv_i = Kokkos::subview(conv_accum, i, Kokkos::ALL);
+        if (use_receiver_parallel_fwd && !use_split_receiver_forward) {
+            // Fused forward mega-kernel: conv + linear_1 + normalize + gate + linear_2.
+            // Uses scratch for conv/gate rows when available, with global-staged
+            // fallback for oversized layers.
+            did_fused_forward = true;
+            rrnlb_phase_counters.forward_full_fused_calls++;
 
+            const int lin1_dim = layer.linear_1.dim_out;
+            const int gate_dim = layer.linear_2.dim_in;
+            const int lin2_out_dim = layer.linear_2.dim_out;
+
+            // Linear_1 metadata (device views).
+            const auto l1_ins_in_off = layer.linear_1.ins_in_offset;
+            const auto l1_ins_out_off = layer.linear_1.ins_out_offset;
+            const auto l1_ins_mul_in = layer.linear_1.ins_mul_in;
+            const auto l1_ins_mul_out = layer.linear_1.ins_mul_out;
+            const auto l1_ins_ir_dim = layer.linear_1.ins_ir_dim;
+            const auto l1_ins_w_off = layer.linear_1.ins_weight_offset;
+            const auto l1_ins_pw = layer.linear_1.ins_path_weight;
+            const auto l1_weights = layer.linear_1.ins_weights;
+            const auto l1_bias_idx = layer.linear_1.bias_indices;
+            const auto l1_bias_val = layer.linear_1.bias_values;
+            const int l1_num_ins = layer.linear_1.num_ins;
+            const int l1_num_bias = l1_bias_idx.extent_int(0);
+
+            // Linear_2 metadata (device views).
+            const auto l2_ins_in_off = layer.linear_2.ins_in_offset;
+            const auto l2_ins_out_off = layer.linear_2.ins_out_offset;
+            const auto l2_ins_mul_in = layer.linear_2.ins_mul_in;
+            const auto l2_ins_mul_out = layer.linear_2.ins_mul_out;
+            const auto l2_ins_ir_dim = layer.linear_2.ins_ir_dim;
+            const auto l2_ins_w_off = layer.linear_2.ins_weight_offset;
+            const auto l2_ins_pw = layer.linear_2.ins_path_weight;
+            const auto l2_weights = layer.linear_2.ins_weights;
+            const auto l2_bias_idx = layer.linear_2.bias_indices;
+            const auto l2_bias_val = layer.linear_2.bias_values;
+            const int l2_num_ins = layer.linear_2.num_ins;
+            const int l2_num_bias = l2_bias_idx.extent_int(0);
+
+            // Gate metadata.
+            const auto g_target_off = layer.target_offset;
+            const auto g_target_mul = layer.target_mul;
+            const auto g_target_l = layer.target_l;
+            const auto g_nonlin_off = layer.nonlin_offset;
+            const auto g_gate_cst = layer.gate_gate_cst;
+            const Precision g_scalar_cst = static_cast<Precision>(layer.gate_scalar_cst);
+            const int g_num_parts = layer.num_gate_parts;
+            const bool gate_identity_mode =
+                rrnlb_nonlinear_ablation_mode() == RRNLBNonlinearAblationMode::GateIdentity;
+
+            // Normalize.
+            const double fused_alpha = layer.alpha;
+            const double fused_beta = layer.beta;
+
+            // Cache views for intermediate storage (needed by reverse pass, and for
+            // global-staged fused fallback when scratch is too large).
+            const auto conv_accum_cache = conv_accum;
+            const auto lin1_raw_cache = cache.lin1_raw;
+            const auto pre_gate_cache = cache.pre_gate;
+            const auto gated_cache = cache.gated;
+
+            const bool use_scratch_fwd =
+                layer.fusion_storage_mode_fwd == RRNLBFusionStorageMode::ScratchTiled;
+            const int fwd_scratch_bytes = use_scratch_fwd
+                ? (conv_out_dim + gate_dim) * sizeof(Precision)
+                : 0;
+            if (use_scratch_fwd) {
+                rrnlb_phase_counters.fused_forward_scratch_tiled_calls++;
+            } else {
+                rrnlb_phase_counters.fused_forward_global_staged_calls++;
+            }
+
+            Kokkos::parallel_for(
+                "RRNLB fused forward",
+                Kokkos::TeamPolicy<>(num_nodes, Kokkos::AUTO, rrnlb_forward_vector_length())
+                    .set_scratch_size(0, Kokkos::PerTeam(fwd_scratch_bytes)),
+                KOKKOS_LAMBDA (Kokkos::TeamPolicy<>::member_type team_member) {
+                    const int i = team_member.league_rank();
+
+                    Precision* conv_row_ptr = nullptr;
+                    Precision* gate_row_ptr = nullptr;
+                    if (use_scratch_fwd) {
+                        // Kokkos ScratchMemorySpace is a sequential allocator: each
+                        // View constructor advances the internal pointer, so conv_row
+                        // and gate_row are allocated contiguously.
+                        using ScratchSpace =
+                            Kokkos::TeamPolicy<>::member_type::scratch_memory_space;
+                        auto scratch = team_member.team_scratch(0);
+                        Kokkos::View<Precision*, ScratchSpace, Kokkos::MemoryUnmanaged>
+                            conv_row_scratch(scratch, conv_out_dim);
+                        Kokkos::View<Precision*, ScratchSpace, Kokkos::MemoryUnmanaged>
+                            gate_row_scratch(scratch, gate_dim);
+                        conv_row_ptr = conv_row_scratch.data();
+                        gate_row_ptr = gate_row_scratch.data();
+                    } else {
+                        auto conv_row_global = Kokkos::subview(conv_accum_cache, i, Kokkos::ALL);
+                        auto gate_row_global = Kokkos::subview(gated_cache, i, Kokkos::ALL);
+                        conv_row_ptr = conv_row_global.data();
+                        gate_row_ptr = gate_row_global.data();
+                    }
+
+                    // lin1_row and pre_gate_row stay in global (needed by reverse cache).
+                    auto lin1_row = Kokkos::subview(lin1_raw_cache, i, Kokkos::ALL);
+                    auto pre_gate_row = Kokkos::subview(pre_gate_cache, i, Kokkos::ALL);
+                    auto out_row = Kokkos::subview(layer_output, i, Kokkos::ALL);
+
+                    // === PHASE 1: Convolution ===
+                    Kokkos::parallel_for(
+                        Kokkos::TeamThreadRange(team_member, conv_out_dim),
+                        [&] (const int p) { conv_row_ptr[p] = static_cast<Precision>(0.0); });
+                    team_member.team_barrier();
+
+                    const int edge_begin = first_neigh(i);
+                    const int edge_end = (i + 1 < num_nodes) ? first_neigh(i + 1) : total_edges;
+
+                    Precision density_i = static_cast<Precision>(0.0);
+                    Kokkos::parallel_reduce(
+                        Kokkos::TeamThreadRange(team_member, edge_end - edge_begin),
+                        [&] (const int j, Precision& den) {
+                            den += edge_den_val(edge_begin + j);
+                        },
+                        density_i);
+
+                    for (int ij = edge_begin; ij < edge_end; ++ij) {
+                        const int sender = neigh_indices(ij);
+                        const auto up_sender = Kokkos::subview(h_up_all, sender, Kokkos::ALL);
                         Kokkos::parallel_for(
-                            Kokkos::TeamThreadRange(team_member, compact_out_count),
-                            [&] (const int p) { conv_local(p) = static_cast<Precision>(0.0); });
+                            Kokkos::TeamThreadRange(team_member, num_work_items),
+                            [&] (const int w) {
+                                const Precision val =
+                                    work_coeff(w)
+                                    * Y(ij * num_lm + work_y_lm(w))
+                                    * edge_tp_vals(ij, work_w_idx(w))
+                                    * up_sender(work_in_idx(w));
+                                Kokkos::atomic_add(&conv_row_ptr[work_out_idx(w)], val);
+                            });
+                    }
+                    team_member.team_barrier();
+
+                    // Write density to global cache (needed for reverse).
+                    Kokkos::single(Kokkos::PerTeam(team_member), [&] () {
+                        density_view(i) = density_i;
+                    });
+
+                    // === PHASE 2: Linear_1 GEMV ===
+                    Kokkos::parallel_for(
+                        Kokkos::TeamThreadRange(team_member, lin1_dim),
+                        [&] (const int p) { lin1_row(p) = static_cast<Precision>(0.0); });
+                    team_member.team_barrier();
+
+                    for (int q = 0; q < l1_num_ins; ++q) {
+                        const int in_off = l1_ins_in_off(q);
+                        const int out_off = l1_ins_out_off(q);
+                        const int mul_in = l1_ins_mul_in(q);
+                        const int mul_out = l1_ins_mul_out(q);
+                        const int ir_d = l1_ins_ir_dim(q);
+                        const Precision pw = l1_ins_pw(q);
+                        const int w_base = l1_ins_w_off(q);
+                        Kokkos::parallel_for(
+                            Kokkos::TeamThreadRange(team_member, mul_out * ir_d),
+                            [&] (const int p) {
+                                const int k = p / ir_d;
+                                const int m = p % ir_d;
+                                Precision sum = static_cast<Precision>(0.0);
+                                for (int j = 0; j < mul_in; ++j) {
+                                    sum += l1_weights(w_base + k + j * mul_out)
+                                         * conv_row_ptr[in_off + j * ir_d + m];
+                                }
+                                lin1_row(out_off + k * ir_d + m) += pw * sum;
+                            });
                         team_member.team_barrier();
+                    }
 
-                        const int edge_begin = first_neigh(i);
-                        const int edge_end = (i + 1 < num_nodes) ? first_neigh(i + 1) : total_edges;
+                    if (l1_num_bias > 0) {
+                        Kokkos::parallel_for(
+                            Kokkos::TeamThreadRange(team_member, l1_num_bias),
+                            [&] (const int b) {
+                                lin1_row(l1_bias_idx(b)) += l1_bias_val(b);
+                            });
+                        team_member.team_barrier();
+                    }
 
-                        Precision density_i = static_cast<Precision>(0.0);
-                        Kokkos::parallel_reduce(
-                            Kokkos::TeamThreadRange(team_member, edge_end - edge_begin),
-                            [&] (const int j, Precision& den) {
-                                den += edge_den_val(edge_begin + j);
-                            },
-                            density_i);
+                    // === PHASE 3: Normalize + Residual ===
+                    const Precision denom = static_cast<Precision>(fused_alpha)
+                        + static_cast<Precision>(fused_beta) * density_i;
+                    Kokkos::parallel_for(
+                        Kokkos::TeamThreadRange(team_member, lin1_dim),
+                        [&] (const int p) {
+                            pre_gate_row(p) = lin1_row(p) / denom + h_res(i, p);
+                        });
+                    team_member.team_barrier();
 
-                        for (int ij = edge_begin; ij < edge_end; ++ij) {
-                            const int sender = neigh_indices(ij);
-                            const auto up_sender = Kokkos::subview(h_up_all, sender, Kokkos::ALL);
+                    // === PHASE 4: Gate ===
+                    Kokkos::parallel_for(
+                        Kokkos::TeamThreadRange(team_member, gate_dim),
+                        [&] (const int p) { gate_row_ptr[p] = static_cast<Precision>(0.0); });
+                    team_member.team_barrier();
+
+                    // Scalar channel (p=0): SiLU.
+                    {
+                        const int scalar_mul = g_target_mul(0);
+                        const int scalar_nonlin_off = g_nonlin_off(0);
+                        const int scalar_target_off = g_target_off(0);
+                        Kokkos::parallel_for(
+                            Kokkos::TeamThreadRange(team_member, scalar_mul),
+                            [&] (const int k) {
+                                const Precision v = pre_gate_row(scalar_nonlin_off + k);
+                                gate_row_ptr[scalar_target_off + k] = gate_identity_mode
+                                    ? g_scalar_cst * v
+                                    : g_scalar_cst * rrnlb_silu(v);
+                            });
+                        team_member.team_barrier();
+                    }
+
+                    // Higher-l channels: sigmoid gate.
+                    {
+                        int gate_off = g_nonlin_off(0) + g_target_mul(0);
+                        for (int gp = 1; gp < g_num_parts; ++gp) {
+                            const int out_off = g_target_off(gp);
+                            const int in_off = g_nonlin_off(gp);
+                            const int mul = g_target_mul(gp);
+                            const int ir_d = 2 * g_target_l(gp) + 1;
+                            const Precision cst =
+                                gp - 1 < g_gate_cst.extent_int(0)
+                                    ? g_gate_cst(gp - 1)
+                                    : static_cast<Precision>(1.0);
                             Kokkos::parallel_for(
-                                Kokkos::TeamThreadRange(team_member, num_work_items),
-                                [&] (const int w) {
-                                    const int out_s = work_out_slot(w);
-                                    if (out_s >= 0) {
-                                        const Precision val =
-                                            work_coeff(w)
-                                            * Y(ij * num_lm + work_y_lm(w))
-                                            * edge_tp_vals(ij, work_w_idx(w))
-                                            * up_sender(work_in_idx(w));
-                                        Kokkos::atomic_add(&conv_local(out_s), val);
+                                Kokkos::TeamThreadRange(team_member, mul),
+                                [&] (const int k) {
+                                    const Precision g = gate_identity_mode
+                                        ? cst
+                                        : cst * rrnlb_sigmoid(pre_gate_row(gate_off + k));
+                                    for (int m = 0; m < ir_d; ++m) {
+                                        gate_row_ptr[out_off + k * ir_d + m] =
+                                            g * pre_gate_row(in_off + k * ir_d + m);
                                     }
                                 });
+                            team_member.team_barrier();
+                            gate_off += mul;
                         }
+                    }
 
-                        team_member.team_barrier();
+                    // === PHASE 5: Linear_2 GEMV → layer_output ===
+                    Kokkos::parallel_for(
+                        Kokkos::TeamThreadRange(team_member, lin2_out_dim),
+                        [&] (const int p) {
+                            out_row(p) = static_cast<Precision>(0.0);
+                        });
+                    team_member.team_barrier();
+
+                    for (int q = 0; q < l2_num_ins; ++q) {
+                        const int in_off = l2_ins_in_off(q);
+                        const int out_off = l2_ins_out_off(q);
+                        const int mul_in = l2_ins_mul_in(q);
+                        const int mul_out = l2_ins_mul_out(q);
+                        const int ir_d = l2_ins_ir_dim(q);
+                        const Precision pw = l2_ins_pw(q);
+                        const int w_base = l2_ins_w_off(q);
                         Kokkos::parallel_for(
-                            Kokkos::TeamThreadRange(team_member, compact_out_count),
-                            [&] (const int p_local) {
-                                const Precision val = conv_local(p_local);
-                                if (val != static_cast<Precision>(0.0)) {
-                                    conv_i(conv_active_out_indices(p_local)) += val;
+                            Kokkos::TeamThreadRange(team_member, mul_out * ir_d),
+                            [&] (const int p) {
+                                const int k = p / ir_d;
+                                const int m = p % ir_d;
+                                Precision sum = static_cast<Precision>(0.0);
+                                for (int j = 0; j < mul_in; ++j) {
+                                    sum += l2_weights(w_base + k + j * mul_out)
+                                         * gate_row_ptr[in_off + j * ir_d + m];
+                                }
+                                out_row(out_off + k * ir_d + m) += pw * sum;
+                            });
+                        team_member.team_barrier();
+                    }
+
+                    if (l2_num_bias > 0) {
+                        Kokkos::parallel_for(
+                            Kokkos::TeamThreadRange(team_member, l2_num_bias),
+                            [&] (const int b) {
+                                out_row(l2_bias_idx(b)) += l2_bias_val(b);
+                            });
+                    }
+                });
+        } else if (use_receiver_parallel_fwd) {
+            did_split_forward = true;
+            rrnlb_phase_counters.forward_split_calls++;
+            rrnlb_phase_counters.forward_split_conv_stage_calls++;
+
+            Kokkos::parallel_for(
+                "RRNLB receiver conv forward (split)",
+                Kokkos::TeamPolicy<>(num_nodes, Kokkos::AUTO, rrnlb_forward_vector_length()),
+                KOKKOS_LAMBDA (Kokkos::TeamPolicy<>::member_type team_member) {
+                    const int i = team_member.league_rank();
+                    auto conv_i = Kokkos::subview(conv_accum, i, Kokkos::ALL);
+
+                    Kokkos::parallel_for(
+                        Kokkos::TeamThreadRange(team_member, conv_out_dim),
+                        [&] (const int p) { conv_i(p) = static_cast<Precision>(0.0); });
+                    team_member.team_barrier();
+
+                    const int edge_begin = first_neigh(i);
+                    const int edge_end = (i + 1 < num_nodes) ? first_neigh(i + 1) : total_edges;
+
+                    Precision density_i = static_cast<Precision>(0.0);
+                    Kokkos::parallel_reduce(
+                        Kokkos::TeamThreadRange(team_member, edge_end - edge_begin),
+                        [&] (const int j, Precision& den) {
+                            den += edge_den_val(edge_begin + j);
+                        },
+                        density_i);
+
+                    for (int ij = edge_begin; ij < edge_end; ++ij) {
+                        const int sender = neigh_indices(ij);
+                        const auto up_sender = Kokkos::subview(h_up_all, sender, Kokkos::ALL);
+                        Kokkos::parallel_for(
+                            Kokkos::TeamThreadRange(team_member, num_work_items),
+                            [&] (const int w) {
+                                const Precision val =
+                                    work_coeff(w)
+                                    * Y(ij * num_lm + work_y_lm(w))
+                                    * edge_tp_vals(ij, work_w_idx(w))
+                                    * up_sender(work_in_idx(w));
+                                Kokkos::atomic_add(&conv_i(work_out_idx(w)), val);
+                            });
+                    }
+                    team_member.team_barrier();
+
+                    Kokkos::single(Kokkos::PerTeam(team_member), [&] () {
+                        density_view(i) = density_i;
+                    });
+                });
+
+            rrnlb_apply_linear_forward(layer.linear_1, num_nodes, conv_accum, cache.lin1_raw);
+
+            rrnlb_phase_counters.forward_split_norm_gate_stage_calls++;
+            const int lin1_dim = layer.linear_1.dim_out;
+            const int gate_dim = layer.linear_2.dim_in;
+            const auto g_target_off = layer.target_offset;
+            const auto g_target_mul = layer.target_mul;
+            const auto g_target_l = layer.target_l;
+            const auto g_nonlin_off = layer.nonlin_offset;
+            const auto g_gate_cst = layer.gate_gate_cst;
+            const Precision g_scalar_cst = static_cast<Precision>(layer.gate_scalar_cst);
+            const int g_num_parts = layer.num_gate_parts;
+            const bool gate_identity_mode =
+                rrnlb_nonlinear_ablation_mode() == RRNLBNonlinearAblationMode::GateIdentity;
+            const double split_alpha = layer.alpha;
+            const double split_beta = layer.beta;
+            const auto lin1_raw_cache = cache.lin1_raw;
+            const auto pre_gate_cache = cache.pre_gate;
+            const auto gated_cache = cache.gated;
+
+            Kokkos::parallel_for(
+                "RRNLB fused normalize+gate forward (split)",
+                Kokkos::TeamPolicy<>(num_nodes, Kokkos::AUTO, rrnlb_forward_vector_length()),
+                KOKKOS_LAMBDA (Kokkos::TeamPolicy<>::member_type team_member) {
+                    const int i = team_member.league_rank();
+                    auto lin1_row = Kokkos::subview(lin1_raw_cache, i, Kokkos::ALL);
+                    auto pre_gate_row = Kokkos::subview(pre_gate_cache, i, Kokkos::ALL);
+                    auto gate_row = Kokkos::subview(gated_cache, i, Kokkos::ALL);
+                    const Precision denom = static_cast<Precision>(split_alpha)
+                        + static_cast<Precision>(split_beta) * density_view(i);
+
+                    Kokkos::parallel_for(
+                        Kokkos::TeamThreadRange(team_member, lin1_dim),
+                        [&] (const int p) {
+                            pre_gate_row(p) = lin1_row(p) / denom + h_res(i, p);
+                        });
+                    team_member.team_barrier();
+
+                    Kokkos::parallel_for(
+                        Kokkos::TeamThreadRange(team_member, gate_dim),
+                        [&] (const int p) { gate_row(p) = static_cast<Precision>(0.0); });
+                    team_member.team_barrier();
+
+                    const int scalar_mul = g_target_mul(0);
+                    const int scalar_nonlin_off = g_nonlin_off(0);
+                    const int scalar_target_off = g_target_off(0);
+                    Kokkos::parallel_for(
+                        Kokkos::TeamThreadRange(team_member, scalar_mul),
+                        [&] (const int k) {
+                            const Precision v = pre_gate_row(scalar_nonlin_off + k);
+                            gate_row(scalar_target_off + k) = gate_identity_mode
+                                ? g_scalar_cst * v
+                                : g_scalar_cst * rrnlb_silu(v);
+                        });
+                    team_member.team_barrier();
+
+                    int gate_off = g_nonlin_off(0) + g_target_mul(0);
+                    for (int gp = 1; gp < g_num_parts; ++gp) {
+                        const int out_off = g_target_off(gp);
+                        const int in_off = g_nonlin_off(gp);
+                        const int mul = g_target_mul(gp);
+                        const int ir_d = 2 * g_target_l(gp) + 1;
+                        const Precision cst =
+                            gp - 1 < g_gate_cst.extent_int(0)
+                                ? g_gate_cst(gp - 1)
+                                : static_cast<Precision>(1.0);
+                        Kokkos::parallel_for(
+                            Kokkos::TeamThreadRange(team_member, mul),
+                            [&] (const int k) {
+                                const Precision g = gate_identity_mode
+                                    ? cst
+                                    : cst * rrnlb_sigmoid(pre_gate_row(gate_off + k));
+                                for (int m = 0; m < ir_d; ++m) {
+                                    gate_row(out_off + k * ir_d + m) =
+                                        g * pre_gate_row(in_off + k * ir_d + m);
                                 }
                             });
+                        team_member.team_barrier();
+                        gate_off += mul;
+                    }
+                });
 
-                        Kokkos::single(Kokkos::PerTeam(team_member), [&] () {
-                            density_view(i) = density_i;
-                        });
-                    });
-            } else {
-                Kokkos::parallel_for(
-                    "RRNLB conv forward (recv-parallel)",
-                    Kokkos::TeamPolicy<>(num_nodes, Kokkos::AUTO, rrnlb_forward_vector_length()),
-                    KOKKOS_LAMBDA (Kokkos::TeamPolicy<>::member_type team_member) {
-                        const int i = team_member.league_rank();
-                        auto conv_i = Kokkos::subview(conv_accum, i, Kokkos::ALL);
-
-                        const int edge_begin = first_neigh(i);
-                        const int edge_end = (i + 1 < num_nodes) ? first_neigh(i + 1) : total_edges;
-
-                        Precision density_i = static_cast<Precision>(0.0);
-                        Kokkos::parallel_reduce(
-                            Kokkos::TeamThreadRange(team_member, edge_end - edge_begin),
-                            [&] (const int j, Precision& den) {
-                                den += edge_den_val(edge_begin + j);
-                            },
-                            density_i);
-
-                        for (int ij = edge_begin; ij < edge_end; ++ij) {
-                            const int sender = neigh_indices(ij);
-                            const auto up_sender = Kokkos::subview(h_up_all, sender, Kokkos::ALL);
-                            Kokkos::parallel_for(
-                                Kokkos::TeamThreadRange(team_member, num_work_items),
-                                [&] (const int w) {
-                                    const Precision val =
-                                        work_coeff(w)
-                                        * Y(ij * num_lm + work_y_lm(w))
-                                        * edge_tp_vals(ij, work_w_idx(w))
-                                        * up_sender(work_in_idx(w));
-                                    Kokkos::atomic_add(&conv_i(work_out_idx(w)), val);
-                                });
-                        }
-
-                        Kokkos::single(Kokkos::PerTeam(team_member), [&] () {
-                            density_view(i) = density_i;
-                        });
-                    });
-            }
+            rrnlb_apply_linear_forward(layer.linear_2, num_nodes, cache.gated, layer_output);
         } else {
             // Edge-parallel forward: one team per edge for maximum GPU occupancy.
             const auto edge_recv = edge_to_receiver;
@@ -3670,23 +4138,25 @@ void MACEKokkos<Precision, AccumPrecision>::compute_rrnlb_interaction_layer_forw
                 });
         }
     }
-    rrnlb_apply_linear_forward(layer.linear_1, num_nodes, conv_accum, cache.lin1_raw);
-    const auto density = cache.density;
-    const auto lin1_raw = cache.lin1_raw;
-    const auto pre_gate = cache.pre_gate;
-    const double alpha = layer.alpha;
-    const double beta = layer.beta;
-    Kokkos::parallel_for(
-        "RRNLB normalize/residual",
-        num_nodes * layer.linear_1.dim_out,
-        KOKKOS_LAMBDA (const int ip) {
-            const int i = ip / layer.linear_1.dim_out;
-            const int p = ip % layer.linear_1.dim_out;
-            const Precision denom = static_cast<Precision>(alpha) + static_cast<Precision>(beta) * density(i);
-            pre_gate(i, p) = lin1_raw(i, p) / denom + h_res(i, p);
-        });
-    rrnlb_apply_gate_forward(layer, num_nodes, cache.pre_gate, gated);
-    rrnlb_apply_linear_forward(layer.linear_2, num_nodes, gated, layer_output);
+    if (!did_fused_forward && !did_split_forward) {
+        rrnlb_apply_linear_forward(layer.linear_1, num_nodes, conv_accum, cache.lin1_raw);
+        const auto density = cache.density;
+        const auto lin1_raw = cache.lin1_raw;
+        const auto pre_gate = cache.pre_gate;
+        const double alpha = layer.alpha;
+        const double beta = layer.beta;
+        Kokkos::parallel_for(
+            "RRNLB normalize/residual",
+            num_nodes * layer.linear_1.dim_out,
+            KOKKOS_LAMBDA (const int ip) {
+                const int i = ip / layer.linear_1.dim_out;
+                const int p = ip % layer.linear_1.dim_out;
+                const Precision denom = static_cast<Precision>(alpha) + static_cast<Precision>(beta) * density(i);
+                pre_gate(i, p) = lin1_raw(i, p) / denom + h_res(i, p);
+            });
+        rrnlb_apply_gate_forward(layer, num_nodes, cache.pre_gate, gated);
+        rrnlb_apply_linear_forward(layer.linear_2, num_nodes, gated, layer_output);
+    }
 }
 
 template <typename T>
@@ -3806,39 +4276,167 @@ void MACEKokkos<Precision, AccumPrecision>::reverse_rrnlb_interaction_layer(
     // lin1_raw_adj, h_res_adj, density_adj: write-before-read in the normalize
     // reverse kernel below -- no zeroing needed.
 
-    rrnlb_apply_linear_transpose(layer.linear_2, num_nodes, layer_output_adj, gated_adj);
-    rrnlb_apply_gate_reverse(layer, num_nodes, cache.pre_gate, gated_adj, pre_gate_adj);
+    // Partially-fused reverse: cuBLAS linear_2^T → fused gate+normalize reverse → cuBLAS linear_1^T.
+    // Restores cuBLAS batched GEMM for the two linear transposes (eliminating hand-written
+    // GEMV register pressure), and fuses only the lightweight gate_reverse + normalize_reverse
+    // into a single kernel with scratch-tiled pre_gate_adj and global fallback.
+    {
+        const int lin1_dim = layer.linear_1.dim_out;
 
-    const auto lin1_raw = cache.lin1_raw;
-    const auto density = cache.density;
-    const double alpha = layer.alpha;
-    const double beta = layer.beta;
-    Kokkos::parallel_for(
-        "RRNLB normalize reverse",
-        Kokkos::TeamPolicy<>(num_nodes, Kokkos::AUTO, 32),
-        KOKKOS_LAMBDA (Kokkos::TeamPolicy<>::member_type team_member) {
-            const int i = team_member.league_rank();
-            const AccumPrecision denom =
-                static_cast<AccumPrecision>(alpha)
-                + static_cast<AccumPrecision>(beta) * static_cast<AccumPrecision>(density(i));
-            const AccumPrecision inv = static_cast<AccumPrecision>(1.0) / denom;
-            const AccumPrecision inv2 = inv * inv;
-            AccumPrecision density_contrib = static_cast<AccumPrecision>(0.0);
-            Kokkos::parallel_reduce(
-                Kokkos::TeamThreadRange(team_member, layer.linear_1.dim_out),
-                [&] (const int p, AccumPrecision& lsum) {
-                    const AccumPrecision upstream = pre_gate_adj(i, p);
-                    lin1_raw_adj(i, p) = upstream * inv;
-                    h_res_adj(i, p) = upstream;
-                    lsum += upstream
-                        * (-static_cast<AccumPrecision>(beta)
-                           * static_cast<AccumPrecision>(lin1_raw(i, p)) * inv2);
-                },
-                density_contrib);
-            Kokkos::single(Kokkos::PerTeam(team_member), [&] () {
-                density_adj(i) = density_contrib;
-            });
-        });
+        // Stage 1: cuBLAS linear_2^T (layer_output_adj → gated_adj).
+        rrnlb_apply_linear_transpose(layer.linear_2, num_nodes, layer_output_adj, gated_adj);
+
+        // Stage 2: Fused gate_reverse + normalize_reverse kernel.
+        // ~15 captures vs 40+ in the full fusion → much better register pressure/occupancy.
+        // Reads gated_adj, pre_gate_cache, lin1_raw, density from global.
+        // Writes lin1_raw_adj, h_res_adj, density_adj to global.
+        // pre_gate_adj is scratch-tiled when possible, with global fallback.
+        {
+            const auto g_target_off = layer.target_offset;
+            const auto g_target_mul = layer.target_mul;
+            const auto g_target_l = layer.target_l;
+            const auto g_nonlin_off = layer.nonlin_offset;
+            const auto g_gate_cst = layer.gate_gate_cst;
+            const AccumPrecision g_scalar_cst = static_cast<AccumPrecision>(layer.gate_scalar_cst);
+            const int g_num_parts = layer.num_gate_parts;
+            const bool gate_identity_mode =
+                rrnlb_nonlinear_ablation_mode() == RRNLBNonlinearAblationMode::GateIdentity;
+
+            const double rev_alpha = layer.alpha;
+            const double rev_beta = layer.beta;
+
+            const auto pre_gate_cache_view = cache.pre_gate;
+            const auto lin1_raw = cache.lin1_raw;
+            const auto density = cache.density;
+
+            const bool use_scratch_rev =
+                layer.fusion_storage_mode_rev == RRNLBFusionStorageMode::ScratchTiled;
+            const int rev_scratch_bytes = use_scratch_rev
+                ? lin1_dim * sizeof(AccumPrecision)
+                : 0;
+            if (use_scratch_rev) {
+                rrnlb_phase_counters.fused_reverse_scratch_tiled_calls++;
+            } else {
+                rrnlb_phase_counters.fused_reverse_global_staged_calls++;
+            }
+
+            Kokkos::parallel_for(
+                "RRNLB fused gate+normalize reverse",
+                Kokkos::TeamPolicy<>(num_nodes, Kokkos::AUTO, rrnlb_reverse_vector_length())
+                    .set_scratch_size(0, Kokkos::PerTeam(rev_scratch_bytes)),
+                KOKKOS_LAMBDA (Kokkos::TeamPolicy<>::member_type team_member) {
+                    const int i = team_member.league_rank();
+                    auto gated_adj_row = Kokkos::subview(gated_adj, i, Kokkos::ALL);
+                    AccumPrecision* pregate_adj_ptr = nullptr;
+                    if (use_scratch_rev) {
+                        using ScratchSpace =
+                            Kokkos::TeamPolicy<>::member_type::scratch_memory_space;
+                        auto scratch = team_member.team_scratch(0);
+                        Kokkos::View<AccumPrecision*, ScratchSpace, Kokkos::MemoryUnmanaged>
+                            pregate_adj_row_scratch(scratch, lin1_dim);
+                        pregate_adj_ptr = pregate_adj_row_scratch.data();
+                    } else {
+                        auto pregate_adj_row_global = Kokkos::subview(pre_gate_adj, i, Kokkos::ALL);
+                        pregate_adj_ptr = pregate_adj_row_global.data();
+                    }
+
+                    auto lin1raw_adj_row = Kokkos::subview(lin1_raw_adj, i, Kokkos::ALL);
+
+                    // === Gate Reverse ===
+                    Kokkos::parallel_for(
+                        Kokkos::TeamThreadRange(team_member, lin1_dim),
+                        [&] (const int p) { pregate_adj_ptr[p] = static_cast<AccumPrecision>(0.0); });
+                    team_member.team_barrier();
+
+                    // Scalar channel: SiLU derivative.
+                    {
+                        const int scalar_mul = g_target_mul(0);
+                        const int scalar_nonlin_off = g_nonlin_off(0);
+                        const int scalar_target_off = g_target_off(0);
+                        Kokkos::parallel_for(
+                            Kokkos::TeamThreadRange(team_member, scalar_mul),
+                            [&] (const int k) {
+                                const int in_idx = scalar_nonlin_off + k;
+                                const int out_idx = scalar_target_off + k;
+                                pregate_adj_ptr[in_idx] += gated_adj_row(out_idx)
+                                    * g_scalar_cst
+                                    * (gate_identity_mode
+                                        ? static_cast<AccumPrecision>(1.0)
+                                        : static_cast<AccumPrecision>(
+                                              rrnlb_silu_deriv(pre_gate_cache_view(i, in_idx))));
+                            });
+                        team_member.team_barrier();
+                    }
+
+                    // Higher-l: sigmoid gate derivative.
+                    {
+                        int gate_off = g_nonlin_off(0) + g_target_mul(0);
+                        for (int gp = 1; gp < g_num_parts; ++gp) {
+                            const int out_off = g_target_off(gp);
+                            const int in_off = g_nonlin_off(gp);
+                            const int mul = g_target_mul(gp);
+                            const int ir_d = 2 * g_target_l(gp) + 1;
+                            const AccumPrecision cst =
+                                gp - 1 < g_gate_cst.extent_int(0)
+                                    ? static_cast<AccumPrecision>(g_gate_cst(gp - 1))
+                                    : static_cast<AccumPrecision>(1.0);
+                            Kokkos::parallel_for(
+                                Kokkos::TeamThreadRange(team_member, mul),
+                                [&] (const int k) {
+                                    const AccumPrecision sig = static_cast<AccumPrecision>(
+                                        rrnlb_sigmoid(pre_gate_cache_view(i, gate_off + k)));
+                                    const AccumPrecision g = gate_identity_mode
+                                        ? cst : cst * sig;
+                                    AccumPrecision dg = static_cast<AccumPrecision>(0.0);
+                                    for (int m = 0; m < ir_d; ++m) {
+                                        const int out_idx = out_off + k * ir_d + m;
+                                        const int in_idx = in_off + k * ir_d + m;
+                                        pregate_adj_ptr[in_idx] += gated_adj_row(out_idx) * g;
+                                        if (!gate_identity_mode) {
+                                            dg += gated_adj_row(out_idx)
+                                                * static_cast<AccumPrecision>(
+                                                      pre_gate_cache_view(i, in_idx));
+                                        }
+                                    }
+                                    if (!gate_identity_mode) {
+                                        pregate_adj_ptr[gate_off + k] += dg * cst * sig
+                                            * (static_cast<AccumPrecision>(1.0) - sig);
+                                    }
+                                });
+                            team_member.team_barrier();
+                            gate_off += mul;
+                        }
+                    }
+
+                    // === Normalize Reverse ===
+                    const AccumPrecision norm_denom =
+                        static_cast<AccumPrecision>(rev_alpha)
+                        + static_cast<AccumPrecision>(rev_beta)
+                          * static_cast<AccumPrecision>(density(i));
+                    const AccumPrecision norm_inv =
+                        static_cast<AccumPrecision>(1.0) / norm_denom;
+                    const AccumPrecision norm_inv2 = norm_inv * norm_inv;
+                    AccumPrecision density_contrib = static_cast<AccumPrecision>(0.0);
+                    Kokkos::parallel_reduce(
+                        Kokkos::TeamThreadRange(team_member, lin1_dim),
+                        [&] (const int p, AccumPrecision& lsum) {
+                            const AccumPrecision upstream = pregate_adj_ptr[p];
+                            lin1raw_adj_row(p) = upstream * norm_inv;
+                            h_res_adj(i, p) = upstream;
+                            lsum += upstream
+                                * (-static_cast<AccumPrecision>(rev_beta)
+                                   * static_cast<AccumPrecision>(lin1_raw(i, p)) * norm_inv2);
+                        },
+                        density_contrib);
+                    Kokkos::single(Kokkos::PerTeam(team_member), [&] () {
+                        density_adj(i) = density_contrib;
+                    });
+                });
+        }
+
+        // Stage 3: cuBLAS linear_1^T (lin1_raw_adj → conv_adj).
+        rrnlb_apply_linear_transpose(layer.linear_1, num_nodes, lin1_raw_adj, conv_adj);
+    }
     rrnlb_apply_linear_transpose(layer.linear_res, num_nodes, h_res_adj, h_up_adj_targets);
     const auto target_map = target_node_indices;
     if (!has_target_map) {
@@ -3862,7 +4460,7 @@ void MACEKokkos<Precision, AccumPrecision>::reverse_rrnlb_interaction_layer(
                 }
             });
     }
-    rrnlb_apply_linear_transpose(layer.linear_1, num_nodes, lin1_raw_adj, conv_adj);
+    // linear_1^T is Stage 3 of the partially-fused reverse pipeline above.
 
     const auto conv_in_offset = layer.conv_in_offset;
     const auto conv_out_offset = layer.conv_out_offset;
@@ -4420,6 +5018,9 @@ void MACEKokkos<Precision, AccumPrecision>::compute_rrnlb_node_energies_forces(
             },
             total_edges_local);
     }
+    const bool edge_parallel_topology_active =
+        total_edges_local > 0
+        && edge_to_receiver_input.extent_int(0) >= total_edges_local;
     ensure_rrnlb_epoch_topology_cache(
         num_nodes,
         total_edges_local,
@@ -4427,7 +5028,9 @@ void MACEKokkos<Precision, AccumPrecision>::compute_rrnlb_node_energies_forces(
         neigh_indices,
         first_neigh_input,
         edge_to_receiver_input,
-        false);
+        false,
+        -1,
+        edge_parallel_topology_active);
     ensure_rrnlb_scratch_capacity(num_nodes, total_edges_local, num_nodes);
     rrnlb_total_edges = total_edges_local;
     auto rrnlb_first_neigh_view = Kokkos::subview(
@@ -5704,15 +6307,197 @@ template <typename Precision, typename AccumPrecision>
 void MACEKokkos<Precision, AccumPrecision>::reverse_M0_mixed_rrnlb(
     const int num_nodes,
     Kokkos::View<const int*> node_types,
-    Kokkos::View<const AccumPrecision***,Kokkos::LayoutRight> M0_adj_in,
-    Kokkos::View<AccumPrecision***,Kokkos::LayoutRight> A0_adj_out)
+    const Kokkos::View<const AccumPrecision***,Kokkos::LayoutRight>& M0_adj_in,
+    Kokkos::View<AccumPrecision***,Kokkos::LayoutRight>& A0_adj_out)
 {
     if (A0_adj_out.extent_int(0) < num_nodes
-        || A0_adj_out.extent_int(1) != A0.extent_int(1)
-        || A0_adj_out.extent_int(2) != A0.extent_int(2)) {
-        Kokkos::realloc(A0_adj_out, A0.extent_int(0), A0.extent_int(1), A0.extent_int(2));
+        || A0_adj_out.extent_int(1) != num_lm
+        || A0_adj_out.extent_int(2) != num_channels) {
+        Kokkos::realloc(A0_adj_out, num_nodes, num_lm, num_channels);
     }
-    Kokkos::deep_copy(A0_adj_out, static_cast<AccumPrecision>(0.0));
+
+    const auto M0_poly_spec = this->M0_poly_spec;
+    const auto M0_poly_coeff = this->M0_poly_coeff;
+    const auto M0_poly_values = this->M0_poly_values;
+    const auto num_channels = this->num_channels;
+    const auto num_lm = this->num_lm;
+    const auto num_LM = this->num_LM;
+
+    const auto m0_impl = rrnlb_mpi_ap_native_m0_impl();
+    bool use_atomic_legacy = m0_impl == RRNLBMpiApNativeM0Impl::AtomicLegacy;
+    bool use_node_reduce_v2 = m0_impl == RRNLBMpiApNativeM0Impl::NodeReduceV2;
+    int max_need_p = 0;
+    std::size_t node_reduce_v2_scratch_bytes = 0;
+    if (use_node_reduce_v2) {
+        for (int LM = 0; LM < num_LM; ++LM) {
+            max_need_p = std::max(max_need_p, M0_poly_coeff(LM).extent_int(1));
+        }
+        node_reduce_v2_scratch_bytes =
+            static_cast<std::size_t>(max_need_p)
+            * static_cast<std::size_t>(num_channels)
+            * sizeof(AccumPrecision);
+        constexpr std::size_t kMaxNodeReduceV2ScratchBytes = 48 * 1024;
+        if (node_reduce_v2_scratch_bytes > kMaxNodeReduceV2ScratchBytes) {
+            use_node_reduce_v2 = false;
+            use_atomic_legacy = true;
+        }
+    }
+
+    if (use_atomic_legacy) {
+        auto A0_adj_active = Kokkos::subview(
+            A0_adj_out,
+            Kokkos::make_pair(0, num_nodes),
+            Kokkos::ALL(),
+            Kokkos::ALL());
+        Kokkos::deep_copy(A0_adj_active, static_cast<AccumPrecision>(0.0));
+
+        if (rrnlb_M0_poly_adjoints_ap.extent_int(0) != num_LM) {
+            rrnlb_M0_poly_adjoints_ap =
+                Kokkos::View<Kokkos::View<AccumPrecision***,Kokkos::LayoutRight>*,Kokkos::SharedSpace>(
+                    Kokkos::view_alloc("rrnlb_M0_poly_adjoints_ap", Kokkos::SequentialHostInit),
+                    num_LM);
+        }
+        for (int LM = 0; LM < num_LM; ++LM) {
+            const int need_p = M0_poly_coeff(LM).extent_int(1);
+            if (rrnlb_M0_poly_adjoints_ap(LM).extent_int(0) < num_nodes
+                || rrnlb_M0_poly_adjoints_ap(LM).extent_int(1) != need_p
+                || rrnlb_M0_poly_adjoints_ap(LM).extent_int(2) != num_channels) {
+                rrnlb_M0_poly_adjoints_ap(LM) = Kokkos::View<AccumPrecision***,Kokkos::LayoutRight>(
+                    Kokkos::view_alloc(
+                        std::string("rrnlb_M0_poly_adjoints_ap_") + std::to_string(LM),
+                        Kokkos::WithoutInitializing),
+                    num_nodes,
+                    need_p,
+                    num_channels);
+            }
+        }
+
+        const auto M0_poly_adjoints_ap = this->rrnlb_M0_poly_adjoints_ap;
+        Kokkos::parallel_for(
+            "Reverse M0 mixed rrnlb (atomic legacy)",
+            Kokkos::TeamPolicy<>(num_nodes * num_LM, Kokkos::AUTO, 32),
+            KOKKOS_LAMBDA (Kokkos::TeamPolicy<>::member_type team_member) {
+                const int i = team_member.league_rank() / num_LM;
+                const int LM = team_member.league_rank() % num_LM;
+                const int type_i = node_types(i);
+
+                Kokkos::parallel_for(
+                    Kokkos::TeamVectorMDRange<
+                        Kokkos::Rank<2, Kokkos::Iterate::Right>,
+                        Kokkos::TeamPolicy<>::member_type>(
+                        team_member, M0_poly_coeff(LM).extent_int(1), num_channels),
+                    [&] (const int p, const int k) {
+                        M0_poly_adjoints_ap(LM)(i, p, k) =
+                            static_cast<AccumPrecision>(M0_poly_coeff(LM)(type_i, p, k));
+                    });
+                team_member.team_barrier();
+
+                for (int p = M0_poly_spec(LM).extent_int(0) - 1; p >= 0; --p) {
+                    const int p0 = M0_poly_spec(LM)(p, 0);
+                    const int p1 = M0_poly_spec(LM)(p, 1);
+                    Kokkos::parallel_for(
+                        Kokkos::TeamVectorRange(team_member, num_channels),
+                        [&] (const int k) {
+                            const AccumPrecision upstream =
+                                M0_poly_adjoints_ap(LM)(i, num_lm + p, k);
+                            M0_poly_adjoints_ap(LM)(i, p0, k) +=
+                                upstream
+                                * static_cast<AccumPrecision>(M0_poly_values(LM)(i, p1, k));
+                            M0_poly_adjoints_ap(LM)(i, p1, k) +=
+                                upstream
+                                * static_cast<AccumPrecision>(M0_poly_values(LM)(i, p0, k));
+                        });
+                }
+                team_member.team_barrier();
+
+                Kokkos::parallel_for(
+                    Kokkos::TeamVectorMDRange<
+                        Kokkos::Rank<2, Kokkos::Iterate::Right>,
+                        Kokkos::TeamPolicy<>::member_type>(
+                        team_member, num_lm, num_channels),
+                    [&] (const int lm, const int k) {
+                        Kokkos::atomic_add(
+                            &A0_adj_out(i, lm, k),
+                            M0_poly_adjoints_ap(LM)(i, lm, k) * M0_adj_in(i, LM, k));
+                    });
+            });
+        return;
+    }
+
+    if (use_node_reduce_v2) {
+        const int max_need_p_capture = max_need_p;
+        const std::size_t scratch_bytes = node_reduce_v2_scratch_bytes;
+        Kokkos::parallel_for(
+            "Reverse M0 mixed rrnlb (node reduce v2)",
+            Kokkos::TeamPolicy<>(num_nodes, Kokkos::AUTO, 32)
+                .set_scratch_size(0, Kokkos::PerTeam(scratch_bytes)),
+            KOKKOS_LAMBDA (Kokkos::TeamPolicy<>::member_type team_member) {
+                const int i = team_member.league_rank();
+                const int type_i = node_types(i);
+                Kokkos::View<
+                    AccumPrecision**,
+                    Kokkos::LayoutRight,
+                    typename Kokkos::TeamPolicy<>::member_type::scratch_memory_space>
+                    m0_poly_adj_scratch(
+                        team_member.team_scratch(0),
+                        max_need_p_capture,
+                        num_channels);
+
+                Kokkos::parallel_for(
+                    Kokkos::TeamVectorMDRange<
+                        Kokkos::Rank<2, Kokkos::Iterate::Right>,
+                        Kokkos::TeamPolicy<>::member_type>(
+                        team_member, num_lm, num_channels),
+                    [&] (const int lm, const int k) {
+                        A0_adj_out(i, lm, k) = static_cast<AccumPrecision>(0.0);
+                    });
+                team_member.team_barrier();
+
+                for (int LM = 0; LM < num_LM; ++LM) {
+                    const int need_p = M0_poly_coeff(LM).extent_int(1);
+                    Kokkos::parallel_for(
+                        Kokkos::TeamVectorMDRange<
+                            Kokkos::Rank<2, Kokkos::Iterate::Right>,
+                            Kokkos::TeamPolicy<>::member_type>(
+                            team_member, need_p, num_channels),
+                        [&] (const int p, const int k) {
+                            m0_poly_adj_scratch(p, k) =
+                                static_cast<AccumPrecision>(M0_poly_coeff(LM)(type_i, p, k));
+                        });
+                    team_member.team_barrier();
+
+                    for (int p = M0_poly_spec(LM).extent_int(0) - 1; p >= 0; --p) {
+                        const int p0 = M0_poly_spec(LM)(p, 0);
+                        const int p1 = M0_poly_spec(LM)(p, 1);
+                        Kokkos::parallel_for(
+                            Kokkos::TeamVectorRange(team_member, num_channels),
+                            [&] (const int k) {
+                                const AccumPrecision upstream =
+                                    m0_poly_adj_scratch(num_lm + p, k);
+                                m0_poly_adj_scratch(p0, k) +=
+                                    upstream
+                                    * static_cast<AccumPrecision>(M0_poly_values(LM)(i, p1, k));
+                                m0_poly_adj_scratch(p1, k) +=
+                                    upstream
+                                    * static_cast<AccumPrecision>(M0_poly_values(LM)(i, p0, k));
+                            });
+                    }
+                    team_member.team_barrier();
+
+                    Kokkos::parallel_for(
+                        Kokkos::TeamVectorMDRange<
+                            Kokkos::Rank<2, Kokkos::Iterate::Right>,
+                            Kokkos::TeamPolicy<>::member_type>(
+                            team_member, num_lm, num_channels),
+                        [&] (const int lm, const int k) {
+                            A0_adj_out(i, lm, k) +=
+                                m0_poly_adj_scratch(lm, k) * M0_adj_in(i, LM, k);
+                        });
+                    team_member.team_barrier();
+                }
+            });
+        return;
+    }
 
     if (rrnlb_M0_poly_adjoints_ap.extent_int(0) != num_LM) {
         rrnlb_M0_poly_adjoints_ap =
@@ -5735,16 +6520,9 @@ void MACEKokkos<Precision, AccumPrecision>::reverse_M0_mixed_rrnlb(
         }
     }
 
-    const auto M0_poly_spec = this->M0_poly_spec;
-    const auto M0_poly_coeff = this->M0_poly_coeff;
-    const auto M0_poly_values = this->M0_poly_values;
     const auto M0_poly_adjoints_ap = this->rrnlb_M0_poly_adjoints_ap;
-    const auto num_channels = this->num_channels;
-    const auto num_lm = this->num_lm;
-    const auto num_LM = this->num_LM;
-
     Kokkos::parallel_for(
-        "Reverse M0 mixed rrnlb",
+        "Reverse M0 mixed rrnlb prep (node reduce)",
         Kokkos::TeamPolicy<>(num_nodes * num_LM, Kokkos::AUTO, 32),
         KOKKOS_LAMBDA (Kokkos::TeamPolicy<>::member_type team_member) {
             const int i = team_member.league_rank() / num_LM;
@@ -5778,17 +6556,22 @@ void MACEKokkos<Precision, AccumPrecision>::reverse_M0_mixed_rrnlb(
                             * static_cast<AccumPrecision>(M0_poly_values(LM)(i, p0, k));
                     });
             }
-            team_member.team_barrier();
+        });
 
+    Kokkos::parallel_for(
+        "Reverse M0 mixed rrnlb (node reduce)",
+        Kokkos::TeamPolicy<>(num_nodes * num_lm, Kokkos::AUTO, 32),
+        KOKKOS_LAMBDA (Kokkos::TeamPolicy<>::member_type team_member) {
+            const int i = team_member.league_rank() / num_lm;
+            const int lm = team_member.league_rank() % num_lm;
             Kokkos::parallel_for(
-                Kokkos::TeamVectorMDRange<
-                    Kokkos::Rank<2, Kokkos::Iterate::Right>,
-                    Kokkos::TeamPolicy<>::member_type>(
-                    team_member, num_lm, num_channels),
-                [&] (const int lm, const int k) {
-                    Kokkos::atomic_add(
-                        &A0_adj_out(i, lm, k),
-                        M0_poly_adjoints_ap(LM)(i, lm, k) * M0_adj_in(i, LM, k));
+                Kokkos::TeamVectorRange(team_member, num_channels),
+                [&] (const int k) {
+                    AccumPrecision accum = static_cast<AccumPrecision>(0.0);
+                    for (int LM = 0; LM < num_LM; ++LM) {
+                        accum += M0_poly_adjoints_ap(LM)(i, lm, k) * M0_adj_in(i, LM, k);
+                    }
+                    A0_adj_out(i, lm, k) = accum;
                 });
         });
 }
@@ -6526,15 +7309,14 @@ template <typename Precision, typename AccumPrecision>
 void MACEKokkos<Precision, AccumPrecision>::reverse_M1_mixed_rrnlb(
     const int num_nodes,
     Kokkos::View<const int*> node_types,
-    Kokkos::View<const AccumPrecision**,Kokkos::LayoutRight> M1_adj_in,
-    Kokkos::View<AccumPrecision***,Kokkos::LayoutRight> A1_adj_out)
+    const Kokkos::View<const AccumPrecision**,Kokkos::LayoutRight>& M1_adj_in,
+    Kokkos::View<AccumPrecision***,Kokkos::LayoutRight>& A1_adj_out)
 {
     if (A1_adj_out.extent_int(0) < num_nodes
-        || A1_adj_out.extent_int(1) != A1.extent_int(1)
-        || A1_adj_out.extent_int(2) != A1.extent_int(2)) {
-        Kokkos::realloc(A1_adj_out, A1.extent_int(0), A1.extent_int(1), A1.extent_int(2));
+        || A1_adj_out.extent_int(1) != num_lm
+        || A1_adj_out.extent_int(2) != num_channels) {
+        Kokkos::realloc(A1_adj_out, num_nodes, num_lm, num_channels);
     }
-    Kokkos::deep_copy(A1_adj_out, static_cast<AccumPrecision>(0.0));
 
     if (rrnlb_M1_poly_adjoints_ap.extent_int(0) < num_nodes
         || rrnlb_M1_poly_adjoints_ap.extent_int(1) != M1_poly_coeff.extent_int(1)
@@ -6801,6 +7583,7 @@ void MACEKokkos<Precision, AccumPrecision>::load_from_json(std::string filename)
                     src.skip_tp, "rrnlb_layer" + std::to_string(li) + "_skip_tp");
 
                 const int num_target = static_cast<int>(src.target_parts.size());
+                layer.num_gate_parts = num_target;
                 Kokkos::realloc(layer.target_offset, num_target);
                 Kokkos::realloc(layer.target_mul, num_target);
                 Kokkos::realloc(layer.target_l, num_target);
@@ -7105,6 +7888,20 @@ void MACEKokkos<Precision, AccumPrecision>::load_from_json(std::string filename)
                     }
                 }
                 Kokkos::deep_copy(layer.density_spline_coeff, h_density_coeff);
+
+                // Select scratch vs global staging for fused kernels based on
+                // per-layer scratch requirements vs 48 KB shared memory limit.
+                {
+                    const int fwd_scratch = (layer.linear_1.dim_in + layer.linear_2.dim_in) * sizeof(Precision);
+                    const int rev_scratch = layer.linear_1.dim_out * sizeof(AccumPrecision);
+                    const int limit = 48 * 1024;
+                    layer.fusion_storage_mode_fwd = (fwd_scratch <= limit)
+                        ? RRNLBFusionStorageMode::ScratchTiled : RRNLBFusionStorageMode::GlobalStaged;
+                    layer.fusion_storage_mode_rev = (rev_scratch <= limit)
+                        ? RRNLBFusionStorageMode::ScratchTiled : RRNLBFusionStorageMode::GlobalStaged;
+                    layer.fusion_tile_width_fwd = layer.linear_1.dim_in + layer.linear_2.dim_in;
+                    layer.fusion_tile_width_rev = layer.linear_1.dim_out;
+                }
 
                 rrnlb_layers_kokkos.push_back(std::move(layer));
             }

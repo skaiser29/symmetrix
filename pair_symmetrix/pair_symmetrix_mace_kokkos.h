@@ -103,6 +103,17 @@ class PairSymmetrixMACEKokkos : public Pair, public KokkosBase {
   Kokkos::View<AccumPrecision**,Kokkos::LayoutRight> rrnlb_product0_in_adj_ws;
   Kokkos::View<AccumPrecision**,Kokkos::LayoutRight> rrnlb_interaction0_adj_ws;
   Kokkos::View<AccumPrecision**,Kokkos::LayoutRight> rrnlb_sender_embed_adj_ws;
+  Kokkos::View<int*> rrnlb_ap_map_p1_src_col;
+  Kokkos::View<int*> rrnlb_ap_map_p1_dst_k;
+  Kokkos::View<int*> rrnlb_ap_map_l1_dst_col;
+  Kokkos::View<int*> rrnlb_ap_map_l1_src_lm;
+  Kokkos::View<int*> rrnlb_ap_map_l1_src_k;
+  Kokkos::View<int*> rrnlb_ap_map_p0_src_col;
+  Kokkos::View<int*> rrnlb_ap_map_p0_dst_lm;
+  Kokkos::View<int*> rrnlb_ap_map_p0_dst_k;
+  Kokkos::View<int*> rrnlb_ap_map_l0_dst_col;
+  Kokkos::View<int*> rrnlb_ap_map_l0_src_lm;
+  Kokkos::View<int*> rrnlb_ap_map_l0_src_k;
 
   // neighbor list variables
   Kokkos::View<int*> node_indices;

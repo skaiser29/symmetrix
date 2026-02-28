@@ -523,16 +523,18 @@ void PairSymmetrixMACE::compute_mpi_message_passing(int eflag, int vflag)
     const int product1_dim_in = mace->product_linear_1.dim_in;
     const int num_channels = mace->num_channels;
 
-    std::vector<double> sender_embed(static_cast<size_t>(sender_nodes) * num_channels, 0.0);
+    rrnlb_sender_embed_ws.assign(static_cast<size_t>(sender_nodes) * num_channels, 0.0);
+    auto &sender_embed = rrnlb_sender_embed_ws;
     for (int i = 0; i < sender_nodes; ++i) {
       const int t = mace_types[atom->type[i]-1];
       const auto* src = mace->node_embedding_species_values.data() + t * num_channels;
       std::copy(src, src + num_channels, sender_embed.data() + static_cast<size_t>(i) * num_channels);
     }
 
-    MACE::RRNLBLayerCache layer0_cache;
-    MACE::RRNLBLayerCache layer1_cache;
-    std::vector<double> interaction0_out, skip0;
+    auto& layer0_cache = rrnlb_layer0_cache_ws;
+    auto& layer1_cache = rrnlb_layer1_cache_ws;
+    auto &interaction0_out = rrnlb_interaction0_out_ws;
+    auto &skip0 = rrnlb_skip0_ws;
     mace->compute_rrnlb_interaction_layer_forward(
       0,
       num_nodes,
@@ -570,7 +572,8 @@ void PairSymmetrixMACE::compute_mpi_message_passing(int eflag, int vflag)
     }
     comm->forward_comm(this);
 
-    std::vector<double> interaction1_out, skip1;
+    auto &interaction1_out = rrnlb_interaction1_out_ws;
+    auto &skip1 = rrnlb_skip1_ws;
     mace->compute_rrnlb_interaction_layer_forward(
       1,
       num_nodes,
@@ -592,9 +595,12 @@ void PairSymmetrixMACE::compute_mpi_message_passing(int eflag, int vflag)
       interaction1_out,
       mace->rrnlb_layers[1].linear_2.parts_out);
 
-    std::vector<double> feat1(static_cast<size_t>(num_nodes) * feat1_dim, 0.0);
-    std::vector<double> feat0_adj_local(static_cast<size_t>(num_nodes) * feat0_dim, 0.0);
-    std::vector<double> feat1_adj(static_cast<size_t>(num_nodes) * feat1_dim, 0.0);
+    rrnlb_feat1_ws.assign(static_cast<size_t>(num_nodes) * feat1_dim, 0.0);
+    rrnlb_feat0_adj_local_ws.assign(static_cast<size_t>(num_nodes) * feat0_dim, 0.0);
+    rrnlb_feat1_adj_ws.assign(static_cast<size_t>(num_nodes) * feat1_dim, 0.0);
+    auto &feat1 = rrnlb_feat1_ws;
+    auto &feat0_adj_local = rrnlb_feat0_adj_local_ws;
+    auto &feat1_adj = rrnlb_feat1_adj_ws;
     for (int ii = 0; ii < num_nodes; ++ii) {
       const int i = node_i[ii];
       auto m1_i = std::span<const double>(
@@ -622,7 +628,8 @@ void PairSymmetrixMACE::compute_mpi_message_passing(int eflag, int vflag)
         feat1_adj[static_cast<size_t>(ii) * feat1_dim + k] += g[k];
     }
 
-    std::vector<double> skip1_adj = feat1_adj;
+    rrnlb_skip1_adj_ws = feat1_adj;
+    auto &skip1_adj = rrnlb_skip1_adj_ws;
     mace->M1_adj.assign(static_cast<size_t>(num_nodes) * product1_dim_in, 0.0);
     for (int ii = 0; ii < num_nodes; ++ii) {
       auto feat1_adj_i = std::span<const double>(
@@ -634,8 +641,9 @@ void PairSymmetrixMACE::compute_mpi_message_passing(int eflag, int vflag)
       mace->apply_rrnlb_linear_transpose(mace->product_linear_1, feat1_adj_i, m1_adj_i);
     }
 
-    std::vector<double> interaction1_adj(
+    rrnlb_interaction1_adj_ws.assign(
       static_cast<size_t>(num_nodes) * mace->rrnlb_layers[1].linear_2.dim_out, 0.0);
+    auto &interaction1_adj = rrnlb_interaction1_adj_ws;
     mace->reverse_rrnlb_M1(
       num_nodes,
       node_types,
@@ -670,7 +678,8 @@ void PairSymmetrixMACE::compute_mpi_message_passing(int eflag, int vflag)
     comm->reverse_comm(this);
 
     mace->M0_adj.assign(static_cast<size_t>(num_nodes) * product0_dim_in, 0.0);
-    std::vector<double> skip0_adj(static_cast<size_t>(num_nodes) * feat0_dim, 0.0);
+    rrnlb_skip0_adj_ws.assign(static_cast<size_t>(num_nodes) * feat0_dim, 0.0);
+    auto &skip0_adj = rrnlb_skip0_adj_ws;
     for (int ii = 0; ii < num_nodes; ++ii) {
       const int i = node_i[ii];
       auto feat0_adj_i = std::span<const double>(
@@ -683,15 +692,17 @@ void PairSymmetrixMACE::compute_mpi_message_passing(int eflag, int vflag)
       std::copy(feat0_adj_i.begin(), feat0_adj_i.end(), skip0_adj.data() + static_cast<size_t>(ii) * feat0_dim);
     }
 
-    std::vector<double> interaction0_adj(
+    rrnlb_interaction0_adj_ws.assign(
       static_cast<size_t>(num_nodes) * mace->rrnlb_layers[0].linear_2.dim_out, 0.0);
+    auto &interaction0_adj = rrnlb_interaction0_adj_ws;
     mace->reverse_rrnlb_M0(
       num_nodes,
       node_types,
       mace->rrnlb_layers[0].linear_2.parts_out,
       interaction0_adj);
 
-    std::vector<double> sender_embed_adj(static_cast<size_t>(sender_nodes) * num_channels, 0.0);
+    rrnlb_sender_embed_adj_ws.assign(static_cast<size_t>(sender_nodes) * num_channels, 0.0);
+    auto &sender_embed_adj = rrnlb_sender_embed_adj_ws;
     mace->reverse_rrnlb_interaction_layer(
       0,
       num_nodes,

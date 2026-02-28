@@ -53,6 +53,16 @@ class PairSymmetrixMACE : public Pair {
 
   std::vector<double> H1, H1_adj;
   std::vector<double> rrnlb_feat0, rrnlb_feat0_adj;
+  MACE::RRNLBLayerCache rrnlb_layer0_cache_ws;
+  MACE::RRNLBLayerCache rrnlb_layer1_cache_ws;
+  std::vector<double> rrnlb_sender_embed_ws;
+  std::vector<double> rrnlb_interaction0_out_ws, rrnlb_skip0_ws;
+  std::vector<double> rrnlb_interaction1_out_ws, rrnlb_skip1_ws;
+  std::vector<double> rrnlb_feat1_ws;
+  std::vector<double> rrnlb_feat0_adj_local_ws, rrnlb_feat1_adj_ws;
+  std::vector<double> rrnlb_skip1_adj_ws, rrnlb_skip0_adj_ws;
+  std::vector<double> rrnlb_interaction1_adj_ws, rrnlb_interaction0_adj_ws;
+  std::vector<double> rrnlb_sender_embed_adj_ws;
 
   // symmetrix evaluator and inputs
   std::unique_ptr<MACE> mace;

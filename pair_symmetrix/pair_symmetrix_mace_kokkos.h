@@ -103,18 +103,33 @@ class PairSymmetrixMACEKokkos : public Pair, public KokkosBase {
   Kokkos::View<AccumPrecision**,Kokkos::LayoutRight> rrnlb_product0_in_adj_ws;
   Kokkos::View<AccumPrecision**,Kokkos::LayoutRight> rrnlb_interaction0_adj_ws;
   Kokkos::View<AccumPrecision**,Kokkos::LayoutRight> rrnlb_sender_embed_adj_ws;
+  Kokkos::View<int*> rrnlb_ap_map_p1_src_col;
+  Kokkos::View<int*> rrnlb_ap_map_p1_dst_k;
+  Kokkos::View<int*> rrnlb_ap_map_l1_dst_col;
+  Kokkos::View<int*> rrnlb_ap_map_l1_src_lm;
+  Kokkos::View<int*> rrnlb_ap_map_l1_src_k;
+  Kokkos::View<int*> rrnlb_ap_map_p0_src_col;
+  Kokkos::View<int*> rrnlb_ap_map_p0_dst_lm;
+  Kokkos::View<int*> rrnlb_ap_map_p0_dst_k;
+  Kokkos::View<int*> rrnlb_ap_map_l0_dst_col;
+  Kokkos::View<int*> rrnlb_ap_map_l0_src_lm;
+  Kokkos::View<int*> rrnlb_ap_map_l0_src_k;
 
   // neighbor list variables
   Kokkos::View<int*> node_indices;
   Kokkos::View<int*> node_types;
   Kokkos::View<int*> num_neigh;
   Kokkos::View<int*> first_neigh;
-  Kokkos::View<int*> rrnlb_edge_to_receiver;
   Kokkos::View<int*> neigh_types;
   Kokkos::View<int*> neigh_indices;
   Kokkos::View<int*> neigh_ii_indices;
   Kokkos::View<double*> xyz;
   Kokkos::View<double*> r;
+  Kokkos::View<int*> rrnlb_edge_to_receiver;
+  long long rrnlb_neighbor_epoch_id = -1;
+  long long rrnlb_phase_step_counter = 0;
+  bool rrnlb_phase_csv_header_written = false;
+  std::string rrnlb_phase_csv_path;
 
   const std::array<std::string,118> periodic_table =
     { "H", "He",
@@ -128,6 +143,7 @@ class PairSymmetrixMACEKokkos : public Pair, public KokkosBase {
                        "Rf", "Db", "Sg", "Bh", "Hs", "Mt", "Ds", "Rg", "Cn", "Nh", "Fl", "Mc", "Lv", "Ts", "Og"};
 
   virtual void allocate();
+  void rrnlb_maybe_emit_phase_stats(const char *mode_tag);
 
  private:
   DAT::ttransform_kkacc_1d k_eatom;

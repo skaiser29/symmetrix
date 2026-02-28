@@ -82,9 +82,23 @@ struct RRNLBLayer {
 
 struct RRNLBLayerCache {
     std::vector<double> h_up;
+    std::vector<double> h_res;
+    std::vector<double> conv_accum;
     std::vector<double> density;
     std::vector<double> lin1_raw;
     std::vector<double> pre_gate;
+    std::vector<double> gated;
+    std::vector<double> tp_values;
+    std::vector<double> gated_adj;
+    std::vector<double> pre_gate_adj;
+    std::vector<double> lin1_raw_adj;
+    std::vector<double> h_res_adj;
+    std::vector<double> conv_adj;
+    std::vector<double> h_up_adj;
+    std::vector<double> density_adj;
+    std::vector<double> tp_derivs;
+    std::vector<double> y_adj;
+    std::vector<double> x_up_adj_tmp;
 };
 
 // Basic model information
@@ -102,6 +116,22 @@ RRNLBLinear product_linear_1;
 std::vector<RRNLBLayer> rrnlb_layers;
 std::vector<double> rrnlb_node_feats_0;
 std::vector<double> rrnlb_node_feats_1;
+RRNLBLayerCache rrnlb_forward_layer0_cache_ws;
+RRNLBLayerCache rrnlb_forward_layer1_cache_ws;
+std::vector<double> rrnlb_node_embed_ws;
+std::vector<double> rrnlb_interaction0_out_ws;
+std::vector<double> rrnlb_skip0_ws;
+std::vector<double> rrnlb_interaction1_out_ws;
+std::vector<double> rrnlb_skip1_ws;
+std::vector<double> rrnlb_feat0_adj_ws;
+std::vector<double> rrnlb_feat1_adj_ws;
+std::vector<double> rrnlb_skip1_adj_ws;
+std::vector<double> rrnlb_skip0_adj_ws;
+std::vector<double> rrnlb_interaction1_adj_ws;
+std::vector<double> rrnlb_interaction0_adj_ws;
+std::vector<double> rrnlb_feat0_from_layer1_adj_ws;
+std::vector<double> rrnlb_node_embed_adj_ws;
+std::vector<double> rrnlb_mlp_input_ws;
 
 // Node energies and forces
 std::vector<double> node_energies, node_forces;
@@ -161,7 +191,7 @@ void reverse_rrnlb_interaction_layer(
     std::span<const double> xyz,
     std::span<const double> r,
     std::span<const double> node_feats_in,
-    const RRNLBLayerCache& cache,
+    RRNLBLayerCache& cache,
     std::span<const double> layer_output_adj,
     std::span<const double> layer_skip_adj,
     std::span<double> node_feats_in_adj,

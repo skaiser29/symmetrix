@@ -71,88 +71,6 @@ auto rrnlb_env_flag(const char* name, const bool default_value) -> bool
   return true;
 }
 
-enum class RRNLBMpiMixedAdjointMode {
-  ApNative,
-  LegacyCast
-};
-
-enum class RRNLBMpiApNativePackMode {
-  FastIndexed,
-  LegacyLoop
-};
-
-enum class RRNLBEdgeTopologyRefreshMode {
-  Always,
-  LegacyEpoch
-};
-
-auto rrnlb_mpi_mixed_adjoint_mode() -> RRNLBMpiMixedAdjointMode
-{
-  static const RRNLBMpiMixedAdjointMode mode = []() -> RRNLBMpiMixedAdjointMode {
-    const char* env = std::getenv("SYMMETRIX_RRNLB_MPI_MIXED_ADJOINT_MODE");
-    if (env == nullptr || env[0] == '\0') return RRNLBMpiMixedAdjointMode::ApNative;
-    std::string value(env);
-    std::transform(
-      value.begin(),
-      value.end(),
-      value.begin(),
-      [] (unsigned char c) { return static_cast<char>(std::tolower(c)); });
-    if (value == "legacy_cast" || value == "legacy" || value == "cast") {
-      return RRNLBMpiMixedAdjointMode::LegacyCast;
-    }
-    return RRNLBMpiMixedAdjointMode::ApNative;
-  }();
-  return mode;
-}
-
-auto rrnlb_edge_topology_refresh_mode() -> RRNLBEdgeTopologyRefreshMode
-{
-  static const RRNLBEdgeTopologyRefreshMode mode = []() -> RRNLBEdgeTopologyRefreshMode {
-    const char* env = std::getenv("SYMMETRIX_RRNLB_EDGE_TOPOLOGY_REFRESH");
-    if (env == nullptr || env[0] == '\0') return RRNLBEdgeTopologyRefreshMode::Always;
-    std::string value(env);
-    std::transform(
-      value.begin(),
-      value.end(),
-      value.begin(),
-      [] (unsigned char c) { return static_cast<char>(std::tolower(c)); });
-    if (value == "always") return RRNLBEdgeTopologyRefreshMode::Always;
-    if (value == "legacy_epoch" || value == "legacy") {
-      return RRNLBEdgeTopologyRefreshMode::LegacyEpoch;
-    }
-    std::ostringstream oss;
-    oss << "Unsupported SYMMETRIX_RRNLB_EDGE_TOPOLOGY_REFRESH value '" << value
-        << "'. Supported values: always, legacy_epoch.";
-    throw std::runtime_error(oss.str());
-  }();
-  return mode;
-}
-
-auto rrnlb_mpi_ap_native_pack_mode() -> RRNLBMpiApNativePackMode
-{
-  static const RRNLBMpiApNativePackMode mode = []() -> RRNLBMpiApNativePackMode {
-    const char* env = std::getenv("SYMMETRIX_RRNLB_MPI_AP_NATIVE_PACK_MODE");
-    if (env == nullptr || env[0] == '\0') return RRNLBMpiApNativePackMode::FastIndexed;
-    std::string value(env);
-    std::transform(
-      value.begin(),
-      value.end(),
-      value.begin(),
-      [] (unsigned char c) { return static_cast<char>(std::tolower(c)); });
-    if (value == "legacy_loop" || value == "legacy" || value == "loop") {
-      return RRNLBMpiApNativePackMode::LegacyLoop;
-    }
-    if (value == "fast_indexed" || value == "fast" || value == "indexed") {
-      return RRNLBMpiApNativePackMode::FastIndexed;
-    }
-    std::ostringstream oss;
-    oss << "Unsupported SYMMETRIX_RRNLB_MPI_AP_NATIVE_PACK_MODE value '" << value
-        << "'. Supported values: legacy_loop, fast_indexed.";
-    throw std::runtime_error(oss.str());
-  }();
-  return mode;
-}
-
 auto rrnlb_debug_net_force_enabled() -> bool
 {
   static const bool enabled = rrnlb_env_flag("SYMMETRIX_RRNLB_DEBUG_NET_FORCE", false);
@@ -810,23 +728,20 @@ void PairSymmetrixMACEKokkos<DeviceType, Precision, AccumPrecision>::compute_no_
     KOKKOS_LAMBDA (Kokkos::TeamPolicy<>::member_type team_member) {
       const int ii = team_member.league_rank();
       const int i = node_indices(ii);
-      double f_x, f_y, f_z;
-      Kokkos::parallel_reduce(
+      Kokkos::parallel_for(
         Kokkos::TeamThreadRange(team_member, num_neigh(ii)),
-        [&] (const int jj, double& f_x, double& f_y, double& f_z) {
+        [&] (const int jj) {
           const int ij = first_neigh(ii) + jj;
           const int j = neigh_indices(ij);
-          f_x += mace_node_forces(3*ij);
-          f_y += mace_node_forces(3*ij+1);
-          f_z += mace_node_forces(3*ij+2);
-          Kokkos::atomic_add(&f(j,0), mace_node_forces(3*ij));
-          Kokkos::atomic_add(&f(j,1), mace_node_forces(3*ij+1));
-          Kokkos::atomic_add(&f(j,2), mace_node_forces(3*ij+2));
-        }, f_x, f_y, f_z);
-        Kokkos::single(Kokkos::PerTeam(team_member), [&]() {
-          Kokkos::atomic_add(&f(i,0), -f_x);
-          Kokkos::atomic_add(&f(i,1), -f_y);
-          Kokkos::atomic_add(&f(i,2), -f_z);
+          const double fx = mace_node_forces(3*ij);
+          const double fy = mace_node_forces(3*ij+1);
+          const double fz = mace_node_forces(3*ij+2);
+          Kokkos::atomic_add(&f(j,0), fx);
+          Kokkos::atomic_add(&f(j,1), fy);
+          Kokkos::atomic_add(&f(j,2), fz);
+          Kokkos::atomic_add(&f(i,0), -fx);
+          Kokkos::atomic_add(&f(i,1), -fy);
+          Kokkos::atomic_add(&f(i,2), -fz);
         });
     });
 
@@ -882,12 +797,9 @@ void PairSymmetrixMACEKokkos<DeviceType, Precision, AccumPrecision>::compute_no_
       Kokkos::TeamPolicy<>(num_nodes, Kokkos::AUTO),
       KOKKOS_LAMBDA (Kokkos::TeamPolicy<>::member_type team_member) {
         const int ii = team_member.league_rank();
-        const int i = node_indices(ii);
-        double v_0, v_1, v_2, v_3, v_4, v_5;
-        Kokkos::parallel_reduce(
+        Kokkos::parallel_for(
           Kokkos::TeamThreadRange(team_member, num_neigh(ii)),
-          [&] (const int jj, double& v_0, double& v_1, double& v_2,
-                             double& v_3, double& v_4, double& v_5) {
+          [&] (const int jj) {
             const int ij = first_neigh(ii) + jj;
             const double x = xyz(3*ij);
             const double y = xyz(3*ij+1);
@@ -895,21 +807,13 @@ void PairSymmetrixMACEKokkos<DeviceType, Precision, AccumPrecision>::compute_no_
             const double f_x = mace_node_forces(3*ij);
             const double f_y = mace_node_forces(3*ij+1);
             const double f_z = mace_node_forces(3*ij+2);
-            v_0 += x*f_x;
-            v_1 += y*f_y;
-            v_2 += z*f_z;
-            v_3 += 0.5*(x*f_y + y*f_x);
-            v_4 += 0.5*(x*f_z + z*f_x);
-            v_5 += 0.5*(y*f_z + z*f_y);
-          }, v_0, v_1, v_2, v_3, v_4, v_5);
-        Kokkos::single(Kokkos::PerTeam(team_member), [&]() {
-          Kokkos::atomic_add(&v(0), v_0);
-          Kokkos::atomic_add(&v(1), v_1);
-          Kokkos::atomic_add(&v(2), v_2);
-          Kokkos::atomic_add(&v(3), v_3);
-          Kokkos::atomic_add(&v(4), v_4);
-          Kokkos::atomic_add(&v(5), v_5);
-        });
+            Kokkos::atomic_add(&v(0), x*f_x);
+            Kokkos::atomic_add(&v(1), y*f_y);
+            Kokkos::atomic_add(&v(2), z*f_z);
+            Kokkos::atomic_add(&v(3), 0.5*(x*f_y + y*f_x));
+            Kokkos::atomic_add(&v(4), 0.5*(x*f_z + z*f_x));
+            Kokkos::atomic_add(&v(5), 0.5*(y*f_z + z*f_y));
+          });
       });
     auto h_v = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace(), v);
     virial[0] += h_v(0);
@@ -1009,9 +913,7 @@ void PairSymmetrixMACEKokkos<DeviceType, Precision, AccumPrecision>::compute_mpi
       "SYMMETRIX_RRNLB_PAIR_EDGE_PARALLEL_REV",
       rrnlb_pair_edge_parallel_default);
   const bool edge_parallel_active = rrnlb_pair_edge_parallel_fwd || rrnlb_pair_edge_parallel_rev;
-  const bool force_refresh_topology =
-    edge_parallel_active
-    && rrnlb_edge_topology_refresh_mode() == RRNLBEdgeTopologyRefreshMode::Always;
+  const bool force_refresh_topology = edge_parallel_active;
   const int rrnlb_total_edges_fwd = rrnlb_pair_edge_parallel_fwd ? num_edges : 0;
   const int rrnlb_total_edges_rev = rrnlb_pair_edge_parallel_rev ? num_edges : 0;
   const int rrnlb_sender_nodes = atom->nlocal + atom->nghost;
@@ -1120,13 +1022,6 @@ void PairSymmetrixMACEKokkos<DeviceType, Precision, AccumPrecision>::compute_mpi
   mace->compute_Y(xyz);
 
   if (mace->interaction_mode_rrnlb) {
-    const auto mpi_mixed_adjoint_mode = rrnlb_mpi_mixed_adjoint_mode();
-    const bool use_legacy_mixed_cast =
-      mpi_mixed_adjoint_mode == RRNLBMpiMixedAdjointMode::LegacyCast;
-    const auto ap_native_pack_mode = rrnlb_mpi_ap_native_pack_mode();
-    const bool use_fast_ap_native_pack =
-      ap_native_pack_mode == RRNLBMpiApNativePackMode::FastIndexed;
-
     if (mace->rrnlb_layers_kokkos.size() != 2) {
       error->all(FLERR, "RRNLB mpi_message_passing currently expects exactly two interaction layers.");
     }
@@ -1252,8 +1147,6 @@ void PairSymmetrixMACEKokkos<DeviceType, Precision, AccumPrecision>::compute_mpi
         || rrnlb_feat0.extent(1) != static_cast<std::size_t>(feat0_dim)) {
       Kokkos::realloc(rrnlb_feat0, sender_nodes, feat0_dim);
     }
-    // Local rows are overwritten by scatter; ghost rows are overwritten by
-    // forward communication, so avoid full sender-buffer clears here.
     const auto node_indices_view = node_indices;
     auto feat0_all = rrnlb_feat0;
     Kokkos::parallel_for(
@@ -1265,7 +1158,11 @@ void PairSymmetrixMACEKokkos<DeviceType, Precision, AccumPrecision>::compute_mpi
         const int i = node_indices_view(ii);
         feat0_all(i, p) = feat0_local(ii, p);
       });
+    // Explicitly order producer kernel before MPI comm pack path.
+    Kokkos::fence();
     comm->forward_comm(this);
+    // Ensure unpack completed before layer-1 consumes rrnlb_feat0.
+    Kokkos::fence();
 
     ensure_ws_2d(rrnlb_interaction1_out_ws, ws_nodes, layer1.linear_2.dim_out);
     ensure_ws_2d(rrnlb_skip1_ws, ws_nodes, layer1.skip_tp.dim_out);
@@ -1317,126 +1214,124 @@ void PairSymmetrixMACEKokkos<DeviceType, Precision, AccumPrecision>::compute_mpi
     int ap_map_p0_size = 0;
     int ap_map_l0_size = 0;
     if constexpr (!std::is_same_v<Precision, AccumPrecision>) {
-      if (use_fast_ap_native_pack && !use_legacy_mixed_cast) {
+      for (int p = 0; p < p1_num_parts; ++p) {
+        ap_map_p1_size += h_p1_in_mul[p];
+      }
+      bool rebuild_p1 =
+        ensure_exact_1d(rrnlb_ap_map_p1_src_col, ap_map_p1_size)
+        | ensure_exact_1d(rrnlb_ap_map_p1_dst_k, ap_map_p1_size);
+      if (rebuild_p1 && ap_map_p1_size > 0) {
+        auto h_src = Kokkos::create_mirror_view(rrnlb_ap_map_p1_src_col);
+        auto h_dst_k = Kokkos::create_mirror_view(rrnlb_ap_map_p1_dst_k);
+        int e = 0;
         for (int p = 0; p < p1_num_parts; ++p) {
-          ap_map_p1_size += h_p1_in_mul[p];
+          const int offset = h_p1_in_offset[p];
+          const int mul = h_p1_in_mul[p];
+          const int ir_dim = 2 * h_p1_in_l[p] + 1;
+          for (int k = 0; k < mul; ++k) {
+            h_src(e) = offset + k * ir_dim;
+            h_dst_k(e) = k;
+            ++e;
+          }
         }
-        bool rebuild_p1 =
-          ensure_exact_1d(rrnlb_ap_map_p1_src_col, ap_map_p1_size)
-          | ensure_exact_1d(rrnlb_ap_map_p1_dst_k, ap_map_p1_size);
-        if (rebuild_p1 && ap_map_p1_size > 0) {
-          auto h_src = Kokkos::create_mirror_view(rrnlb_ap_map_p1_src_col);
-          auto h_dst_k = Kokkos::create_mirror_view(rrnlb_ap_map_p1_dst_k);
-          int e = 0;
-          for (int p = 0; p < p1_num_parts; ++p) {
-            const int offset = h_p1_in_offset[p];
-            const int mul = h_p1_in_mul[p];
-            const int ir_dim = 2 * h_p1_in_l[p] + 1;
-            for (int k = 0; k < mul; ++k) {
-              h_src(e) = offset + k * ir_dim;
+        Kokkos::deep_copy(rrnlb_ap_map_p1_src_col, h_src);
+        Kokkos::deep_copy(rrnlb_ap_map_p1_dst_k, h_dst_k);
+      }
+
+      for (int p = 0; p < l1_num_parts; ++p) {
+        ap_map_l1_size += h_l1_out_mul[p] * (2 * h_l1_out_l[p] + 1);
+      }
+      bool rebuild_l1 =
+        ensure_exact_1d(rrnlb_ap_map_l1_dst_col, ap_map_l1_size)
+        | ensure_exact_1d(rrnlb_ap_map_l1_src_lm, ap_map_l1_size)
+        | ensure_exact_1d(rrnlb_ap_map_l1_src_k, ap_map_l1_size);
+      if (rebuild_l1 && ap_map_l1_size > 0) {
+        auto h_dst = Kokkos::create_mirror_view(rrnlb_ap_map_l1_dst_col);
+        auto h_src_lm = Kokkos::create_mirror_view(rrnlb_ap_map_l1_src_lm);
+        auto h_src_k = Kokkos::create_mirror_view(rrnlb_ap_map_l1_src_k);
+        int e = 0;
+        for (int p = 0; p < l1_num_parts; ++p) {
+          const int offset = h_l1_out_offset[p];
+          const int mul = h_l1_out_mul[p];
+          const int l = h_l1_out_l[p];
+          const int ir_dim = 2 * l + 1;
+          const int lm0 = l * l;
+          for (int k = 0; k < mul; ++k) {
+            for (int m = 0; m < ir_dim; ++m) {
+              h_dst(e) = offset + k * ir_dim + m;
+              h_src_lm(e) = lm0 + m;
+              h_src_k(e) = k;
+              ++e;
+            }
+          }
+        }
+        Kokkos::deep_copy(rrnlb_ap_map_l1_dst_col, h_dst);
+        Kokkos::deep_copy(rrnlb_ap_map_l1_src_lm, h_src_lm);
+        Kokkos::deep_copy(rrnlb_ap_map_l1_src_k, h_src_k);
+      }
+
+      for (int p = 0; p < p0_num_parts; ++p) {
+        ap_map_p0_size += h_p0_in_mul[p] * (2 * h_p0_in_l[p] + 1);
+      }
+      bool rebuild_p0 =
+        ensure_exact_1d(rrnlb_ap_map_p0_src_col, ap_map_p0_size)
+        | ensure_exact_1d(rrnlb_ap_map_p0_dst_lm, ap_map_p0_size)
+        | ensure_exact_1d(rrnlb_ap_map_p0_dst_k, ap_map_p0_size);
+      if (rebuild_p0 && ap_map_p0_size > 0) {
+        auto h_src = Kokkos::create_mirror_view(rrnlb_ap_map_p0_src_col);
+        auto h_dst_lm = Kokkos::create_mirror_view(rrnlb_ap_map_p0_dst_lm);
+        auto h_dst_k = Kokkos::create_mirror_view(rrnlb_ap_map_p0_dst_k);
+        int e = 0;
+        for (int p = 0; p < p0_num_parts; ++p) {
+          const int offset = h_p0_in_offset[p];
+          const int mul = h_p0_in_mul[p];
+          const int l = h_p0_in_l[p];
+          const int ir_dim = 2 * l + 1;
+          const int lm0 = l * l;
+          for (int k = 0; k < mul; ++k) {
+            for (int m = 0; m < ir_dim; ++m) {
+              h_src(e) = offset + k * ir_dim + m;
+              h_dst_lm(e) = lm0 + m;
               h_dst_k(e) = k;
               ++e;
             }
           }
-          Kokkos::deep_copy(rrnlb_ap_map_p1_src_col, h_src);
-          Kokkos::deep_copy(rrnlb_ap_map_p1_dst_k, h_dst_k);
         }
+        Kokkos::deep_copy(rrnlb_ap_map_p0_src_col, h_src);
+        Kokkos::deep_copy(rrnlb_ap_map_p0_dst_lm, h_dst_lm);
+        Kokkos::deep_copy(rrnlb_ap_map_p0_dst_k, h_dst_k);
+      }
 
-        for (int p = 0; p < l1_num_parts; ++p) {
-          ap_map_l1_size += h_l1_out_mul[p] * (2 * h_l1_out_l[p] + 1);
-        }
-        bool rebuild_l1 =
-          ensure_exact_1d(rrnlb_ap_map_l1_dst_col, ap_map_l1_size)
-          | ensure_exact_1d(rrnlb_ap_map_l1_src_lm, ap_map_l1_size)
-          | ensure_exact_1d(rrnlb_ap_map_l1_src_k, ap_map_l1_size);
-        if (rebuild_l1 && ap_map_l1_size > 0) {
-          auto h_dst = Kokkos::create_mirror_view(rrnlb_ap_map_l1_dst_col);
-          auto h_src_lm = Kokkos::create_mirror_view(rrnlb_ap_map_l1_src_lm);
-          auto h_src_k = Kokkos::create_mirror_view(rrnlb_ap_map_l1_src_k);
-          int e = 0;
-          for (int p = 0; p < l1_num_parts; ++p) {
-            const int offset = h_l1_out_offset[p];
-            const int mul = h_l1_out_mul[p];
-            const int l = h_l1_out_l[p];
-            const int ir_dim = 2 * l + 1;
-            const int lm0 = l * l;
-            for (int k = 0; k < mul; ++k) {
-              for (int m = 0; m < ir_dim; ++m) {
-                h_dst(e) = offset + k * ir_dim + m;
-                h_src_lm(e) = lm0 + m;
-                h_src_k(e) = k;
-                ++e;
-              }
-            }
-          }
-          Kokkos::deep_copy(rrnlb_ap_map_l1_dst_col, h_dst);
-          Kokkos::deep_copy(rrnlb_ap_map_l1_src_lm, h_src_lm);
-          Kokkos::deep_copy(rrnlb_ap_map_l1_src_k, h_src_k);
-        }
-
-        for (int p = 0; p < p0_num_parts; ++p) {
-          ap_map_p0_size += h_p0_in_mul[p] * (2 * h_p0_in_l[p] + 1);
-        }
-        bool rebuild_p0 =
-          ensure_exact_1d(rrnlb_ap_map_p0_src_col, ap_map_p0_size)
-          | ensure_exact_1d(rrnlb_ap_map_p0_dst_lm, ap_map_p0_size)
-          | ensure_exact_1d(rrnlb_ap_map_p0_dst_k, ap_map_p0_size);
-        if (rebuild_p0 && ap_map_p0_size > 0) {
-          auto h_src = Kokkos::create_mirror_view(rrnlb_ap_map_p0_src_col);
-          auto h_dst_lm = Kokkos::create_mirror_view(rrnlb_ap_map_p0_dst_lm);
-          auto h_dst_k = Kokkos::create_mirror_view(rrnlb_ap_map_p0_dst_k);
-          int e = 0;
-          for (int p = 0; p < p0_num_parts; ++p) {
-            const int offset = h_p0_in_offset[p];
-            const int mul = h_p0_in_mul[p];
-            const int l = h_p0_in_l[p];
-            const int ir_dim = 2 * l + 1;
-            const int lm0 = l * l;
-            for (int k = 0; k < mul; ++k) {
-              for (int m = 0; m < ir_dim; ++m) {
-                h_src(e) = offset + k * ir_dim + m;
-                h_dst_lm(e) = lm0 + m;
-                h_dst_k(e) = k;
-                ++e;
-              }
-            }
-          }
-          Kokkos::deep_copy(rrnlb_ap_map_p0_src_col, h_src);
-          Kokkos::deep_copy(rrnlb_ap_map_p0_dst_lm, h_dst_lm);
-          Kokkos::deep_copy(rrnlb_ap_map_p0_dst_k, h_dst_k);
-        }
-
+      for (int p = 0; p < l0_num_parts; ++p) {
+        ap_map_l0_size += h_l0_out_mul[p] * (2 * h_l0_out_l[p] + 1);
+      }
+      bool rebuild_l0 =
+        ensure_exact_1d(rrnlb_ap_map_l0_dst_col, ap_map_l0_size)
+        | ensure_exact_1d(rrnlb_ap_map_l0_src_lm, ap_map_l0_size)
+        | ensure_exact_1d(rrnlb_ap_map_l0_src_k, ap_map_l0_size);
+      if (rebuild_l0 && ap_map_l0_size > 0) {
+        auto h_dst = Kokkos::create_mirror_view(rrnlb_ap_map_l0_dst_col);
+        auto h_src_lm = Kokkos::create_mirror_view(rrnlb_ap_map_l0_src_lm);
+        auto h_src_k = Kokkos::create_mirror_view(rrnlb_ap_map_l0_src_k);
+        int e = 0;
         for (int p = 0; p < l0_num_parts; ++p) {
-          ap_map_l0_size += h_l0_out_mul[p] * (2 * h_l0_out_l[p] + 1);
-        }
-        bool rebuild_l0 =
-          ensure_exact_1d(rrnlb_ap_map_l0_dst_col, ap_map_l0_size)
-          | ensure_exact_1d(rrnlb_ap_map_l0_src_lm, ap_map_l0_size)
-          | ensure_exact_1d(rrnlb_ap_map_l0_src_k, ap_map_l0_size);
-        if (rebuild_l0 && ap_map_l0_size > 0) {
-          auto h_dst = Kokkos::create_mirror_view(rrnlb_ap_map_l0_dst_col);
-          auto h_src_lm = Kokkos::create_mirror_view(rrnlb_ap_map_l0_src_lm);
-          auto h_src_k = Kokkos::create_mirror_view(rrnlb_ap_map_l0_src_k);
-          int e = 0;
-          for (int p = 0; p < l0_num_parts; ++p) {
-            const int offset = h_l0_out_offset[p];
-            const int mul = h_l0_out_mul[p];
-            const int l = h_l0_out_l[p];
-            const int ir_dim = 2 * l + 1;
-            const int lm0 = l * l;
-            for (int k = 0; k < mul; ++k) {
-              for (int m = 0; m < ir_dim; ++m) {
-                h_dst(e) = offset + k * ir_dim + m;
-                h_src_lm(e) = lm0 + m;
-                h_src_k(e) = k;
-                ++e;
-              }
+          const int offset = h_l0_out_offset[p];
+          const int mul = h_l0_out_mul[p];
+          const int l = h_l0_out_l[p];
+          const int ir_dim = 2 * l + 1;
+          const int lm0 = l * l;
+          for (int k = 0; k < mul; ++k) {
+            for (int m = 0; m < ir_dim; ++m) {
+              h_dst(e) = offset + k * ir_dim + m;
+              h_src_lm(e) = lm0 + m;
+              h_src_k(e) = k;
+              ++e;
             }
           }
-          Kokkos::deep_copy(rrnlb_ap_map_l0_dst_col, h_dst);
-          Kokkos::deep_copy(rrnlb_ap_map_l0_src_lm, h_src_lm);
-          Kokkos::deep_copy(rrnlb_ap_map_l0_src_k, h_src_k);
         }
+        Kokkos::deep_copy(rrnlb_ap_map_l0_dst_col, h_dst);
+        Kokkos::deep_copy(rrnlb_ap_map_l0_src_lm, h_src_lm);
+        Kokkos::deep_copy(rrnlb_ap_map_l0_src_k, h_src_k);
       }
     }
     Kokkos::parallel_for(
@@ -1527,67 +1422,30 @@ void PairSymmetrixMACEKokkos<DeviceType, Precision, AccumPrecision>::compute_mpi
       mace->rrnlb_product_linear_1, num_nodes, feat1_adj, product1_in_adj);
 
     if constexpr (!std::is_same_v<Precision, AccumPrecision>) {
-      if (use_legacy_mixed_cast) {
-        const bool m1_adj_resized =
-          mace->M1_adj.extent(0) < num_nodes
-          || mace->M1_adj.extent(1) < num_channels;
-        if (m1_adj_resized) {
-          Kokkos::realloc(mace->M1_adj, num_nodes, num_channels);
-        }
-        auto M1_adj = mace->M1_adj;
-        Kokkos::parallel_for(
-          "rrnlb_product1_adj_to_M1_adj_mpi",
-          Kokkos::RangePolicy<DeviceType>(0, num_nodes * p1_num_parts),
-          KOKKOS_LAMBDA (const int ipart) {
-            const int i = ipart / p1_num_parts;
-            const int p = ipart % p1_num_parts;
-            const int offset = p1_in_offset(p);
-            const int mul = p1_in_mul(p);
-            const int l = p1_in_l(p);
-            const int ir_dim = 2 * l + 1;
-            for (int k = 0; k < mul; ++k) {
-              M1_adj(i, k) = static_cast<Precision>(product1_in_adj(i, offset + k * ir_dim));
-            }
-          });
-        mace->reverse_M1(num_nodes, node_types);
-      } else {
-        const bool m1_adj_ap_resized =
-          mace->rrnlb_M1_adj_ap.extent(0) < num_nodes
-          || mace->rrnlb_M1_adj_ap.extent(1) < num_channels;
-        if (m1_adj_ap_resized) {
-          Kokkos::realloc(mace->rrnlb_M1_adj_ap, num_nodes, num_channels);
-        }
-        auto M1_adj_ap = mace->rrnlb_M1_adj_ap;
-        if (use_fast_ap_native_pack && ap_map_p1_size > 0) {
-          const auto map_src_col = rrnlb_ap_map_p1_src_col;
-          const auto map_dst_k = rrnlb_ap_map_p1_dst_k;
-          Kokkos::parallel_for(
-            "rrnlb_product1_adj_to_M1_adj_ap_mpi_fast",
-            Kokkos::RangePolicy<DeviceType>(0, num_nodes * ap_map_p1_size),
-            KOKKOS_LAMBDA (const int idx) {
-              const int i = idx / ap_map_p1_size;
-              const int e = idx % ap_map_p1_size;
-              M1_adj_ap(i, map_dst_k(e)) = product1_in_adj(i, map_src_col(e));
-            });
-        } else {
-          Kokkos::parallel_for(
-            "rrnlb_product1_adj_to_M1_adj_ap_mpi",
-            Kokkos::RangePolicy<DeviceType>(0, num_nodes * p1_num_parts),
-            KOKKOS_LAMBDA (const int ipart) {
-              const int i = ipart / p1_num_parts;
-              const int p = ipart % p1_num_parts;
-              const int offset = p1_in_offset(p);
-              const int mul = p1_in_mul(p);
-              const int l = p1_in_l(p);
-              const int ir_dim = 2 * l + 1;
-              for (int k = 0; k < mul; ++k) {
-                M1_adj_ap(i, k) = product1_in_adj(i, offset + k * ir_dim);
-              }
-            });
-        }
-        mace->reverse_M1_mixed_rrnlb(
-          num_nodes, node_types, mace->rrnlb_M1_adj_ap, mace->rrnlb_A1_adj_ap);
+      const bool m1_adj_ap_resized =
+        mace->rrnlb_M1_adj_ap.extent(0) < num_nodes
+        || mace->rrnlb_M1_adj_ap.extent(1) < num_channels;
+      if (m1_adj_ap_resized) {
+        Kokkos::realloc(mace->rrnlb_M1_adj_ap, num_nodes, num_channels);
       }
+      auto M1_adj_ap = mace->rrnlb_M1_adj_ap;
+      Kokkos::deep_copy(
+        Kokkos::subview(M1_adj_ap, Kokkos::make_pair(0, num_nodes), Kokkos::ALL),
+        static_cast<AccumPrecision>(0.0));
+      const auto map_src_col = rrnlb_ap_map_p1_src_col;
+      const auto map_dst_k = rrnlb_ap_map_p1_dst_k;
+      Kokkos::parallel_for(
+        "rrnlb_product1_adj_to_M1_adj_ap_mpi_fast",
+        Kokkos::RangePolicy<DeviceType>(0, num_nodes * ap_map_p1_size),
+        KOKKOS_LAMBDA (const int idx) {
+          const int i = idx / ap_map_p1_size;
+          const int e = idx % ap_map_p1_size;
+          Kokkos::atomic_add(
+            &M1_adj_ap(i, map_dst_k(e)),
+            static_cast<AccumPrecision>(product1_in_adj(i, map_src_col(e))));
+        });
+      mace->reverse_M1_mixed_rrnlb(
+        num_nodes, node_types, mace->rrnlb_M1_adj_ap, mace->rrnlb_A1_adj_ap);
     } else {
       const bool m1_adj_resized =
         mace->M1_adj.extent(0) < num_nodes
@@ -1616,67 +1474,30 @@ void PairSymmetrixMACEKokkos<DeviceType, Precision, AccumPrecision>::compute_mpi
     const bool interaction1_adj_resized =
       ensure_ws_2d(rrnlb_interaction1_adj_ws, ws_nodes, layer1.linear_2.dim_out);
     auto interaction1_adj = rrnlb_interaction1_adj_ws;
-    if (interaction1_adj_resized) {
+    if constexpr (!std::is_same_v<Precision, AccumPrecision>) {
       Kokkos::deep_copy(
         Kokkos::subview(interaction1_adj, Kokkos::make_pair(0, num_nodes), Kokkos::ALL),
         static_cast<AccumPrecision>(0.0));
-    }
-    if constexpr (!std::is_same_v<Precision, AccumPrecision>) {
-      if (!use_legacy_mixed_cast) {
-        auto A1_adj_ap = mace->rrnlb_A1_adj_ap;
-        if (use_fast_ap_native_pack && ap_map_l1_size > 0) {
-          const auto map_dst_col = rrnlb_ap_map_l1_dst_col;
-          const auto map_src_lm = rrnlb_ap_map_l1_src_lm;
-          const auto map_src_k = rrnlb_ap_map_l1_src_k;
-          Kokkos::parallel_for(
-            "rrnlb_A1_adj_ap_to_layer1_mpi_fast",
-            Kokkos::RangePolicy<DeviceType>(0, num_nodes * ap_map_l1_size),
-            KOKKOS_LAMBDA (const int idx) {
-              const int i = idx / ap_map_l1_size;
-              const int e = idx % ap_map_l1_size;
-              interaction1_adj(i, map_dst_col(e)) = A1_adj_ap(i, map_src_lm(e), map_src_k(e));
-            });
-        } else {
-          Kokkos::parallel_for(
-            "rrnlb_A1_adj_ap_to_layer1_mpi",
-            Kokkos::RangePolicy<DeviceType>(0, num_nodes * l1_num_parts),
-            KOKKOS_LAMBDA (const int ipart) {
-              const int i = ipart / l1_num_parts;
-              const int p = ipart % l1_num_parts;
-              const int offset = l1_out_offset(p);
-              const int mul = l1_out_mul(p);
-              const int l = l1_out_l(p);
-              const int ir_dim = 2 * l + 1;
-              const int lm0 = l * l;
-              for (int k = 0; k < mul; ++k) {
-                for (int m = 0; m < ir_dim; ++m) {
-                  interaction1_adj(i, offset + k * ir_dim + m) = A1_adj_ap(i, lm0 + m, k);
-                }
-              }
-            });
-        }
-      } else {
-        auto A1_adj = mace->A1_adj;
-        Kokkos::parallel_for(
-          "rrnlb_A1_adj_to_layer1_mpi",
-          Kokkos::RangePolicy<DeviceType>(0, num_nodes * l1_num_parts),
-          KOKKOS_LAMBDA (const int ipart) {
-            const int i = ipart / l1_num_parts;
-            const int p = ipart % l1_num_parts;
-            const int offset = l1_out_offset(p);
-            const int mul = l1_out_mul(p);
-            const int l = l1_out_l(p);
-            const int ir_dim = 2 * l + 1;
-            const int lm0 = l * l;
-            for (int k = 0; k < mul; ++k) {
-              for (int m = 0; m < ir_dim; ++m) {
-                interaction1_adj(i, offset + k * ir_dim + m) =
-                  static_cast<AccumPrecision>(A1_adj(i, lm0 + m, k));
-              }
-            }
-          });
-      }
+      auto A1_adj_ap = mace->rrnlb_A1_adj_ap;
+      const auto map_dst_col = rrnlb_ap_map_l1_dst_col;
+      const auto map_src_lm = rrnlb_ap_map_l1_src_lm;
+      const auto map_src_k = rrnlb_ap_map_l1_src_k;
+      Kokkos::parallel_for(
+        "rrnlb_A1_adj_ap_to_layer1_mpi_fast",
+        Kokkos::RangePolicy<DeviceType>(0, num_nodes * ap_map_l1_size),
+        KOKKOS_LAMBDA (const int idx) {
+          const int i = idx / ap_map_l1_size;
+          const int e = idx % ap_map_l1_size;
+          Kokkos::atomic_add(
+            &interaction1_adj(i, map_dst_col(e)),
+            A1_adj_ap(i, map_src_lm(e), map_src_k(e)));
+        });
     } else {
+      if (interaction1_adj_resized) {
+        Kokkos::deep_copy(
+          Kokkos::subview(interaction1_adj, Kokkos::make_pair(0, num_nodes), Kokkos::ALL),
+          static_cast<AccumPrecision>(0.0));
+      }
       auto A1_adj = mace->A1_adj;
       Kokkos::parallel_for(
         "rrnlb_A1_adj_to_layer1_mpi",
@@ -1699,9 +1520,7 @@ void PairSymmetrixMACEKokkos<DeviceType, Precision, AccumPrecision>::compute_mpi
 
     ensure_ws_2d(rrnlb_feat0_from_layer1_adj_ws, ws_sender_nodes, feat0_dim);
     auto feat0_from_layer1_adj = rrnlb_feat0_from_layer1_adj_ws;
-    Kokkos::deep_copy(
-      Kokkos::subview(feat0_from_layer1_adj, Kokkos::make_pair(0, sender_nodes), Kokkos::ALL),
-      static_cast<AccumPrecision>(0.0));
+    Kokkos::deep_copy(feat0_from_layer1_adj, static_cast<AccumPrecision>(0.0));
     mace->reverse_rrnlb_interaction_layer(
       1, num_nodes, node_types, num_neigh, neigh_indices, neigh_types, xyz, r, first_neigh,
       rrnlb_feat0, cache1, interaction1_adj, skip1_adj, feat0_from_layer1_adj,
@@ -1719,9 +1538,13 @@ void PairSymmetrixMACEKokkos<DeviceType, Precision, AccumPrecision>::compute_mpi
         const int ii = ip / feat0_dim;
         const int p = ip % feat0_dim;
         const int i = node_indices_view(ii);
-        Kokkos::atomic_add(&feat0_adj_all(i, p), feat0_adj_local(ii, p));
+        feat0_adj_all(i, p) += feat0_adj_local(ii, p);
       });
+    // Explicitly order adjoint accumulation before MPI reverse comm pack.
+    Kokkos::fence();
     comm->reverse_comm(this);
+    // Ensure reverse comm unpack completed before node-index gather.
+    Kokkos::fence();
 
     ensure_ws_2d(rrnlb_feat0_adj_nodes_ws, ws_nodes, feat0_dim);
     auto feat0_adj_nodes = rrnlb_feat0_adj_nodes_ws;
@@ -1743,77 +1566,32 @@ void PairSymmetrixMACEKokkos<DeviceType, Precision, AccumPrecision>::compute_mpi
       mace->rrnlb_product_linear_0, num_nodes, feat0_adj_nodes, product0_in_adj);
 
     if constexpr (!std::is_same_v<Precision, AccumPrecision>) {
-      if (use_legacy_mixed_cast) {
-        const bool m0_adj_resized =
-          mace->M0_adj.extent(0) < num_nodes
-          || mace->M0_adj.extent(1) < num_LM
-          || mace->M0_adj.extent(2) < num_channels;
-        if (m0_adj_resized) {
-          Kokkos::realloc(mace->M0_adj, num_nodes, num_LM, num_channels);
-        }
-        auto M0_adj = mace->M0_adj;
-        Kokkos::parallel_for(
-          "rrnlb_product0_adj_to_M0_adj_mpi",
-          Kokkos::RangePolicy<DeviceType>(0, num_nodes * p0_num_parts),
-          KOKKOS_LAMBDA (const int ipart) {
-            const int i = ipart / p0_num_parts;
-            const int p = ipart % p0_num_parts;
-            const int offset = p0_in_offset(p);
-            const int mul = p0_in_mul(p);
-            const int l = p0_in_l(p);
-            const int ir_dim = 2 * l + 1;
-            const int lm0 = l * l;
-            for (int k = 0; k < mul; ++k) {
-              for (int m = 0; m < ir_dim; ++m) {
-                M0_adj(i, lm0 + m, k) =
-                  static_cast<Precision>(product0_in_adj(i, offset + k * ir_dim + m));
-              }
-            }
-          });
-        mace->reverse_M0(num_nodes, node_types);
-      } else {
-        const bool m0_adj_ap_resized =
-          mace->rrnlb_M0_adj_ap.extent(0) < num_nodes
-          || mace->rrnlb_M0_adj_ap.extent(1) < num_LM
-          || mace->rrnlb_M0_adj_ap.extent(2) < num_channels;
-        if (m0_adj_ap_resized) {
-          Kokkos::realloc(mace->rrnlb_M0_adj_ap, num_nodes, num_LM, num_channels);
-        }
-        auto M0_adj_ap = mace->rrnlb_M0_adj_ap;
-        if (use_fast_ap_native_pack && ap_map_p0_size > 0) {
-          const auto map_src_col = rrnlb_ap_map_p0_src_col;
-          const auto map_dst_lm = rrnlb_ap_map_p0_dst_lm;
-          const auto map_dst_k = rrnlb_ap_map_p0_dst_k;
-          Kokkos::parallel_for(
-            "rrnlb_product0_adj_to_M0_adj_ap_mpi_fast",
-            Kokkos::RangePolicy<DeviceType>(0, num_nodes * ap_map_p0_size),
-            KOKKOS_LAMBDA (const int idx) {
-              const int i = idx / ap_map_p0_size;
-              const int e = idx % ap_map_p0_size;
-              M0_adj_ap(i, map_dst_lm(e), map_dst_k(e)) = product0_in_adj(i, map_src_col(e));
-            });
-        } else {
-          Kokkos::parallel_for(
-            "rrnlb_product0_adj_to_M0_adj_ap_mpi",
-            Kokkos::RangePolicy<DeviceType>(0, num_nodes * p0_num_parts),
-            KOKKOS_LAMBDA (const int ipart) {
-              const int i = ipart / p0_num_parts;
-              const int p = ipart % p0_num_parts;
-              const int offset = p0_in_offset(p);
-              const int mul = p0_in_mul(p);
-              const int l = p0_in_l(p);
-              const int ir_dim = 2 * l + 1;
-              const int lm0 = l * l;
-              for (int k = 0; k < mul; ++k) {
-                for (int m = 0; m < ir_dim; ++m) {
-                  M0_adj_ap(i, lm0 + m, k) = product0_in_adj(i, offset + k * ir_dim + m);
-                }
-              }
-            });
-        }
-        mace->reverse_M0_mixed_rrnlb(
-          num_nodes, node_types, mace->rrnlb_M0_adj_ap, mace->rrnlb_A0_adj_ap);
+      const bool m0_adj_ap_resized =
+        mace->rrnlb_M0_adj_ap.extent(0) < num_nodes
+        || mace->rrnlb_M0_adj_ap.extent(1) < num_LM
+        || mace->rrnlb_M0_adj_ap.extent(2) < num_channels;
+      if (m0_adj_ap_resized) {
+        Kokkos::realloc(mace->rrnlb_M0_adj_ap, num_nodes, num_LM, num_channels);
       }
+      auto M0_adj_ap = mace->rrnlb_M0_adj_ap;
+      Kokkos::deep_copy(
+        Kokkos::subview(M0_adj_ap, Kokkos::make_pair(0, num_nodes), Kokkos::ALL, Kokkos::ALL),
+        static_cast<AccumPrecision>(0.0));
+      const auto map_src_col = rrnlb_ap_map_p0_src_col;
+      const auto map_dst_lm = rrnlb_ap_map_p0_dst_lm;
+      const auto map_dst_k = rrnlb_ap_map_p0_dst_k;
+      Kokkos::parallel_for(
+        "rrnlb_product0_adj_to_M0_adj_ap_mpi_fast",
+        Kokkos::RangePolicy<DeviceType>(0, num_nodes * ap_map_p0_size),
+        KOKKOS_LAMBDA (const int idx) {
+          const int i = idx / ap_map_p0_size;
+          const int e = idx % ap_map_p0_size;
+          Kokkos::atomic_add(
+            &M0_adj_ap(i, map_dst_lm(e), map_dst_k(e)),
+            static_cast<AccumPrecision>(product0_in_adj(i, map_src_col(e))));
+        });
+      mace->reverse_M0_mixed_rrnlb(
+        num_nodes, node_types, mace->rrnlb_M0_adj_ap, mace->rrnlb_A0_adj_ap);
     } else {
       const bool m0_adj_resized =
         mace->M0_adj.extent(0) < num_nodes
@@ -1846,67 +1624,30 @@ void PairSymmetrixMACEKokkos<DeviceType, Precision, AccumPrecision>::compute_mpi
     const bool interaction0_adj_resized =
       ensure_ws_2d(rrnlb_interaction0_adj_ws, ws_nodes, layer0.linear_2.dim_out);
     auto interaction0_adj = rrnlb_interaction0_adj_ws;
-    if (interaction0_adj_resized) {
+    if constexpr (!std::is_same_v<Precision, AccumPrecision>) {
       Kokkos::deep_copy(
         Kokkos::subview(interaction0_adj, Kokkos::make_pair(0, num_nodes), Kokkos::ALL),
         static_cast<AccumPrecision>(0.0));
-    }
-    if constexpr (!std::is_same_v<Precision, AccumPrecision>) {
-      if (!use_legacy_mixed_cast) {
-        auto A0_adj_ap = mace->rrnlb_A0_adj_ap;
-        if (use_fast_ap_native_pack && ap_map_l0_size > 0) {
-          const auto map_dst_col = rrnlb_ap_map_l0_dst_col;
-          const auto map_src_lm = rrnlb_ap_map_l0_src_lm;
-          const auto map_src_k = rrnlb_ap_map_l0_src_k;
-          Kokkos::parallel_for(
-            "rrnlb_A0_adj_ap_to_layer0_mpi_fast",
-            Kokkos::RangePolicy<DeviceType>(0, num_nodes * ap_map_l0_size),
-            KOKKOS_LAMBDA (const int idx) {
-              const int i = idx / ap_map_l0_size;
-              const int e = idx % ap_map_l0_size;
-              interaction0_adj(i, map_dst_col(e)) = A0_adj_ap(i, map_src_lm(e), map_src_k(e));
-            });
-        } else {
-          Kokkos::parallel_for(
-            "rrnlb_A0_adj_ap_to_layer0_mpi",
-            Kokkos::RangePolicy<DeviceType>(0, num_nodes * l0_num_parts),
-            KOKKOS_LAMBDA (const int ipart) {
-              const int i = ipart / l0_num_parts;
-              const int p = ipart % l0_num_parts;
-              const int offset = l0_out_offset(p);
-              const int mul = l0_out_mul(p);
-              const int l = l0_out_l(p);
-              const int ir_dim = 2 * l + 1;
-              const int lm0 = l * l;
-              for (int k = 0; k < mul; ++k) {
-                for (int m = 0; m < ir_dim; ++m) {
-                  interaction0_adj(i, offset + k * ir_dim + m) = A0_adj_ap(i, lm0 + m, k);
-                }
-              }
-            });
-        }
-      } else {
-        auto A0_adj = mace->A0_adj;
-        Kokkos::parallel_for(
-          "rrnlb_A0_adj_to_layer0_mpi",
-          Kokkos::RangePolicy<DeviceType>(0, num_nodes * l0_num_parts),
-          KOKKOS_LAMBDA (const int ipart) {
-            const int i = ipart / l0_num_parts;
-            const int p = ipart % l0_num_parts;
-            const int offset = l0_out_offset(p);
-            const int mul = l0_out_mul(p);
-            const int l = l0_out_l(p);
-            const int ir_dim = 2 * l + 1;
-            const int lm0 = l * l;
-            for (int k = 0; k < mul; ++k) {
-              for (int m = 0; m < ir_dim; ++m) {
-                interaction0_adj(i, offset + k * ir_dim + m) =
-                  static_cast<AccumPrecision>(A0_adj(i, lm0 + m, k));
-              }
-            }
-          });
-      }
+      auto A0_adj_ap = mace->rrnlb_A0_adj_ap;
+      const auto map_dst_col = rrnlb_ap_map_l0_dst_col;
+      const auto map_src_lm = rrnlb_ap_map_l0_src_lm;
+      const auto map_src_k = rrnlb_ap_map_l0_src_k;
+      Kokkos::parallel_for(
+        "rrnlb_A0_adj_ap_to_layer0_mpi_fast",
+        Kokkos::RangePolicy<DeviceType>(0, num_nodes * ap_map_l0_size),
+        KOKKOS_LAMBDA (const int idx) {
+          const int i = idx / ap_map_l0_size;
+          const int e = idx % ap_map_l0_size;
+          Kokkos::atomic_add(
+            &interaction0_adj(i, map_dst_col(e)),
+            A0_adj_ap(i, map_src_lm(e), map_src_k(e)));
+        });
     } else {
+      if (interaction0_adj_resized) {
+        Kokkos::deep_copy(
+          Kokkos::subview(interaction0_adj, Kokkos::make_pair(0, num_nodes), Kokkos::ALL),
+          static_cast<AccumPrecision>(0.0));
+      }
       auto A0_adj = mace->A0_adj;
       Kokkos::parallel_for(
         "rrnlb_A0_adj_to_layer0_mpi",
@@ -1929,9 +1670,7 @@ void PairSymmetrixMACEKokkos<DeviceType, Precision, AccumPrecision>::compute_mpi
 
     ensure_ws_2d(rrnlb_sender_embed_adj_ws, ws_sender_nodes, num_channels);
     auto sender_embed_adj = rrnlb_sender_embed_adj_ws;
-    Kokkos::deep_copy(
-      Kokkos::subview(sender_embed_adj, Kokkos::make_pair(0, sender_nodes), Kokkos::ALL),
-      static_cast<AccumPrecision>(0.0));
+    Kokkos::deep_copy(sender_embed_adj, static_cast<AccumPrecision>(0.0));
     mace->reverse_rrnlb_interaction_layer(
       0, num_nodes, node_types, num_neigh, neigh_indices, neigh_types, xyz, r, first_neigh,
       sender_embed, cache0, interaction0_adj, skip0_adj, sender_embed_adj,
@@ -2016,23 +1755,20 @@ void PairSymmetrixMACEKokkos<DeviceType, Precision, AccumPrecision>::compute_mpi
     KOKKOS_LAMBDA (Kokkos::TeamPolicy<>::member_type team_member) {
       const int ii = team_member.league_rank();
       const int i = node_indices(ii);
-      double f_x, f_y, f_z;
-      Kokkos::parallel_reduce(
+      Kokkos::parallel_for(
         Kokkos::TeamThreadRange(team_member, num_neigh(ii)),
-        [&] (const int jj, double& f_x, double& f_y, double& f_z) {
+        [&] (const int jj) {
           const int ij = first_neigh(ii) + jj;
           const int j = neigh_indices(ij);
-          f_x += mace_node_forces(3*ij);
-          f_y += mace_node_forces(3*ij+1);
-          f_z += mace_node_forces(3*ij+2);
-          Kokkos::atomic_add(&f(j,0), mace_node_forces(3*ij));
-          Kokkos::atomic_add(&f(j,1), mace_node_forces(3*ij+1));
-          Kokkos::atomic_add(&f(j,2), mace_node_forces(3*ij+2));
-        }, f_x, f_y, f_z);
-        Kokkos::single(Kokkos::PerTeam(team_member), [&]() {
-          Kokkos::atomic_add(&f(i,0), -f_x);
-          Kokkos::atomic_add(&f(i,1), -f_y);
-          Kokkos::atomic_add(&f(i,2), -f_z);
+          const double fx = mace_node_forces(3*ij);
+          const double fy = mace_node_forces(3*ij+1);
+          const double fz = mace_node_forces(3*ij+2);
+          Kokkos::atomic_add(&f(j,0), fx);
+          Kokkos::atomic_add(&f(j,1), fy);
+          Kokkos::atomic_add(&f(j,2), fz);
+          Kokkos::atomic_add(&f(i,0), -fx);
+          Kokkos::atomic_add(&f(i,1), -fy);
+          Kokkos::atomic_add(&f(i,2), -fz);
         });
     });
 
@@ -2088,12 +1824,9 @@ void PairSymmetrixMACEKokkos<DeviceType, Precision, AccumPrecision>::compute_mpi
       Kokkos::TeamPolicy<>(num_nodes, Kokkos::AUTO),
       KOKKOS_LAMBDA (Kokkos::TeamPolicy<>::member_type team_member) {
         const int ii = team_member.league_rank();
-        const int i = node_indices(ii);
-        double v_0, v_1, v_2, v_3, v_4, v_5;
-        Kokkos::parallel_reduce(
+        Kokkos::parallel_for(
           Kokkos::TeamThreadRange(team_member, num_neigh(ii)),
-          [&] (const int jj, double& v_0, double& v_1, double& v_2,
-                             double& v_3, double& v_4, double& v_5) {
+          [&] (const int jj) {
             const int ij = first_neigh(ii) + jj;
             const double x = xyz(3*ij);
             const double y = xyz(3*ij+1);
@@ -2101,21 +1834,13 @@ void PairSymmetrixMACEKokkos<DeviceType, Precision, AccumPrecision>::compute_mpi
             const double f_x = mace_node_forces(3*ij);
             const double f_y = mace_node_forces(3*ij+1);
             const double f_z = mace_node_forces(3*ij+2);
-            v_0 += x*f_x;
-            v_1 += y*f_y;
-            v_2 += z*f_z;
-            v_3 += 0.5*(x*f_y + y*f_x);
-            v_4 += 0.5*(x*f_z + z*f_x);
-            v_5 += 0.5*(y*f_z + z*f_y);
-          }, v_0, v_1, v_2, v_3, v_4, v_5);
-        Kokkos::single(Kokkos::PerTeam(team_member), [&]() {
-          Kokkos::atomic_add(&v(0), v_0);
-          Kokkos::atomic_add(&v(1), v_1);
-          Kokkos::atomic_add(&v(2), v_2);
-          Kokkos::atomic_add(&v(3), v_3);
-          Kokkos::atomic_add(&v(4), v_4);
-          Kokkos::atomic_add(&v(5), v_5);
-        });
+            Kokkos::atomic_add(&v(0), x*f_x);
+            Kokkos::atomic_add(&v(1), y*f_y);
+            Kokkos::atomic_add(&v(2), z*f_z);
+            Kokkos::atomic_add(&v(3), 0.5*(x*f_y + y*f_x));
+            Kokkos::atomic_add(&v(4), 0.5*(x*f_z + z*f_x));
+            Kokkos::atomic_add(&v(5), 0.5*(y*f_z + z*f_y));
+          });
       });
     auto h_v = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace(), v);
     virial[0] += h_v(0);
@@ -2449,23 +2174,20 @@ void PairSymmetrixMACEKokkos<DeviceType, Precision, AccumPrecision>::compute_no_
     KOKKOS_LAMBDA (Kokkos::TeamPolicy<>::member_type team_member) {
       const int ii = team_member.league_rank();
       const int i = node_indices(ii);
-      double f_x, f_y, f_z;
-      Kokkos::parallel_reduce(
+      Kokkos::parallel_for(
         Kokkos::TeamThreadRange(team_member, num_neigh(ii)),
-        [&] (const int jj, double& f_x, double& f_y, double& f_z) {
+        [&] (const int jj) {
           const int ij = first_neigh(ii) + jj;
           const int j = neigh_indices(ij);
-          f_x += mace_node_forces(3*ij);
-          f_y += mace_node_forces(3*ij+1);
-          f_z += mace_node_forces(3*ij+2);
-          Kokkos::atomic_add(&f(j,0), mace_node_forces(3*ij));
-          Kokkos::atomic_add(&f(j,1), mace_node_forces(3*ij+1));
-          Kokkos::atomic_add(&f(j,2), mace_node_forces(3*ij+2));
-        }, f_x, f_y, f_z);
-        Kokkos::single(Kokkos::PerTeam(team_member), [&]() {
-          Kokkos::atomic_add(&f(i,0), -f_x);
-          Kokkos::atomic_add(&f(i,1), -f_y);
-          Kokkos::atomic_add(&f(i,2), -f_z);
+          const double fx = mace_node_forces(3*ij);
+          const double fy = mace_node_forces(3*ij+1);
+          const double fz = mace_node_forces(3*ij+2);
+          Kokkos::atomic_add(&f(j,0), fx);
+          Kokkos::atomic_add(&f(j,1), fy);
+          Kokkos::atomic_add(&f(j,2), fz);
+          Kokkos::atomic_add(&f(i,0), -fx);
+          Kokkos::atomic_add(&f(i,1), -fy);
+          Kokkos::atomic_add(&f(i,2), -fz);
         });
     });
 
@@ -2521,12 +2243,9 @@ void PairSymmetrixMACEKokkos<DeviceType, Precision, AccumPrecision>::compute_no_
       Kokkos::TeamPolicy<>(num_local_nodes+num_ghost_nodes, Kokkos::AUTO),
       KOKKOS_LAMBDA (Kokkos::TeamPolicy<>::member_type team_member) {
         const int ii = team_member.league_rank();
-        const int i = node_indices(ii);
-        double v_0, v_1, v_2, v_3, v_4, v_5;
-        Kokkos::parallel_reduce(
+        Kokkos::parallel_for(
           Kokkos::TeamThreadRange(team_member, num_neigh(ii)),
-          [&] (const int jj, double& v_0, double& v_1, double& v_2,
-                             double& v_3, double& v_4, double& v_5) {
+          [&] (const int jj) {
             const int ij = first_neigh(ii) + jj;
             const double x = xyz(3*ij);
             const double y = xyz(3*ij+1);
@@ -2534,21 +2253,13 @@ void PairSymmetrixMACEKokkos<DeviceType, Precision, AccumPrecision>::compute_no_
             const double f_x = mace_node_forces(3*ij);
             const double f_y = mace_node_forces(3*ij+1);
             const double f_z = mace_node_forces(3*ij+2);
-            v_0 += x*f_x;
-            v_1 += y*f_y;
-            v_2 += z*f_z;
-            v_3 += 0.5*(x*f_y + y*f_x);
-            v_4 += 0.5*(x*f_z + z*f_x);
-            v_5 += 0.5*(y*f_z + z*f_y);
-          }, v_0, v_1, v_2, v_3, v_4, v_5);
-        Kokkos::single(Kokkos::PerTeam(team_member), [&]() {
-          Kokkos::atomic_add(&v(0), v_0);
-          Kokkos::atomic_add(&v(1), v_1);
-          Kokkos::atomic_add(&v(2), v_2);
-          Kokkos::atomic_add(&v(3), v_3);
-          Kokkos::atomic_add(&v(4), v_4);
-          Kokkos::atomic_add(&v(5), v_5);
-        });
+            Kokkos::atomic_add(&v(0), x*f_x);
+            Kokkos::atomic_add(&v(1), y*f_y);
+            Kokkos::atomic_add(&v(2), z*f_z);
+            Kokkos::atomic_add(&v(3), 0.5*(x*f_y + y*f_x));
+            Kokkos::atomic_add(&v(4), 0.5*(x*f_z + z*f_x));
+            Kokkos::atomic_add(&v(5), 0.5*(y*f_z + z*f_y));
+          });
       });
     auto h_v = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace(), v);
     virial[0] += h_v(0);

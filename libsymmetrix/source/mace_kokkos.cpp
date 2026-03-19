@@ -11,6 +11,7 @@
 #include <algorithm>
 #include <cctype>
 #include <utility>
+#include <cstdio>
 
 // TODO: remove some of these headers?
 #include "KokkosBatched_Util.hpp"
@@ -399,6 +400,99 @@ auto rrnlb_cublaslt_strict_enabled() -> bool
         return env[0] != '\0' && env[0] != '0';
     }();
     return enabled;
+}
+
+auto rrnlb_cublas_debug_fence_mode() -> int
+{
+    static int mode = []() -> int {
+        const char* env = std::getenv("SYMMETRIX_RRNLB_CUBLAS_DEBUG_FENCE");
+        if (env == nullptr || env[0] == '\0') return 0;
+        int parsed = std::atoi(env);
+        if (parsed < 0) parsed = 0;
+        if (parsed > 2) parsed = 2;
+        return parsed;
+    }();
+    return mode;
+}
+
+auto rrnlb_cublas_stream_diag_enabled() -> bool
+{
+    static bool enabled = []() -> bool {
+        const char* env = std::getenv("SYMMETRIX_RRNLB_CUBLAS_STREAM_DIAG");
+        if (env == nullptr) return false;
+        return env[0] != '\0' && env[0] != '0';
+    }();
+    return enabled;
+}
+
+auto rrnlb_cublas_stream_assert_enabled() -> bool
+{
+    static bool enabled = []() -> bool {
+        const char* env = std::getenv("SYMMETRIX_RRNLB_CUBLAS_STREAM_ASSERT");
+        if (env == nullptr) return false;
+        return env[0] != '\0' && env[0] != '0';
+    }();
+    return enabled;
+}
+
+auto rrnlb_cublas_maybe_fence(const int mode, const int threshold, const char* label) -> void
+{
+    if (mode >= threshold) {
+        Kokkos::fence(label);
+    }
+}
+
+auto rrnlb_cublas_check_stream(
+    cublasHandle_t handle,
+    cudaStream_t expected_stream,
+    const char* where) -> void
+{
+    const bool diag_enabled = rrnlb_cublas_stream_diag_enabled();
+    const bool assert_enabled = rrnlb_cublas_stream_assert_enabled();
+    if (!diag_enabled && !assert_enabled) return;
+
+    cudaStream_t handle_stream = nullptr;
+    const cublasStatus_t stream_status = cublasGetStream(handle, &handle_stream);
+    if (stream_status != CUBLAS_STATUS_SUCCESS) {
+        if (assert_enabled) {
+            std::ostringstream oss;
+            oss << where << " cublasGetStream failed with cuBLAS status "
+                << static_cast<int>(stream_status);
+            throw std::runtime_error(oss.str());
+        }
+        if (diag_enabled) {
+            std::fprintf(
+                stderr,
+                "[RRNLB-CUBLAS-DIAG] %s cublasGetStream status=%d\n",
+                where,
+                static_cast<int>(stream_status));
+            std::fflush(stderr);
+        }
+        return;
+    }
+
+    if (diag_enabled) {
+        int device = -1;
+        const cudaError_t dev_status = cudaGetDevice(&device);
+        std::fprintf(
+            stderr,
+            "[RRNLB-CUBLAS-DIAG] %s dev=%d expected_stream=%p handle_stream=%p handle=%p cudaGetDevice=%d\n",
+            where,
+            device,
+            reinterpret_cast<void*>(expected_stream),
+            reinterpret_cast<void*>(handle_stream),
+            reinterpret_cast<void*>(handle),
+            static_cast<int>(dev_status));
+        std::fflush(stderr);
+    }
+
+    if (assert_enabled && handle_stream != expected_stream) {
+        std::ostringstream oss;
+        oss << where
+            << " stream mismatch: expected=" << reinterpret_cast<void*>(expected_stream)
+            << " handle=" << reinterpret_cast<void*>(handle_stream);
+        throw std::runtime_error(oss.str());
+    }
 }
 
 auto rrnlb_get_cublas_handle() -> cublasHandle_t
@@ -2187,6 +2281,7 @@ void MACEKokkos<Precision, AccumPrecision>::rrnlb_apply_linear_forward(
         Kokkos::SpaceAccessibility<Kokkos::CudaSpace, typename decltype(x)::memory_space>::accessible
                && Kokkos::SpaceAccessibility<Kokkos::CudaSpace, typename decltype(y)::memory_space>::accessible) {
         if (num_nodes > 0) {
+            const int cublas_debug_fence_mode = rrnlb_cublas_debug_fence_mode();
             auto exec = Kokkos::DefaultExecutionSpace();
             auto handle = rrnlb_get_cublas_handle();
             cublasLtHandle_t lt_handle = nullptr;
@@ -2198,9 +2293,17 @@ void MACEKokkos<Precision, AccumPrecision>::rrnlb_apply_linear_forward(
             rrnlb_throw_cublas_error(
                 cublasSetPointerMode(handle, CUBLAS_POINTER_MODE_HOST),
                 "rrnlb_apply_linear_forward(cublasSetPointerMode)");
+            rrnlb_cublas_maybe_fence(
+                cublas_debug_fence_mode,
+                1,
+                "rrnlb_apply_linear_forward(pre-cublas)");
             rrnlb_throw_cublas_error(
                 cublasSetStream(handle, exec.cuda_stream()),
                 "rrnlb_apply_linear_forward(cublasSetStream)");
+            rrnlb_cublas_check_stream(
+                handle,
+                exec.cuda_stream(),
+                "rrnlb_apply_linear_forward(set-stream)");
 
             const int x_row_stride = x.extent_int(1);
             const int y_row_stride = y.extent_int(1);
@@ -2216,6 +2319,14 @@ void MACEKokkos<Precision, AccumPrecision>::rrnlb_apply_linear_forward(
             const Precision beta = static_cast<Precision>(1.0);
 
             for (int q = 0; q < num_ins; ++q) {
+                rrnlb_cublas_check_stream(
+                    handle,
+                    exec.cuda_stream(),
+                    "rrnlb_apply_linear_forward(loop)");
+                rrnlb_cublas_maybe_fence(
+                    cublas_debug_fence_mode,
+                    2,
+                    "rrnlb_apply_linear_forward(before-gemm)");
                 const int mul_in = h_ins_mul_in[q];
                 const int mul_out = h_ins_mul_out[q];
                 const int ir_dim = h_ins_ir_dim[q];
@@ -2280,7 +2391,15 @@ void MACEKokkos<Precision, AccumPrecision>::rrnlb_apply_linear_forward(
                 rrnlb_throw_cublas_error(
                     gemm_status,
                     "rrnlb_apply_linear_forward(cublasGemmStridedBatched)");
+                rrnlb_cublas_maybe_fence(
+                    cublas_debug_fence_mode,
+                    2,
+                    "rrnlb_apply_linear_forward(after-gemm)");
             }
+            rrnlb_cublas_maybe_fence(
+                cublas_debug_fence_mode,
+                1,
+                "rrnlb_apply_linear_forward(post-cublas)");
         }
 
         const auto bias_indices = linear.bias_indices;
@@ -2510,6 +2629,7 @@ void MACEKokkos<Precision, AccumPrecision>::rrnlb_apply_linear_transpose(
         Kokkos::SpaceAccessibility<Kokkos::CudaSpace, typename decltype(y_adj_work)::memory_space>::accessible
                && Kokkos::SpaceAccessibility<Kokkos::CudaSpace, typename decltype(x_adj_work)::memory_space>::accessible) {
         if (num_nodes > 0) {
+            const int cublas_debug_fence_mode = rrnlb_cublas_debug_fence_mode();
             auto exec = Kokkos::DefaultExecutionSpace();
             auto handle = rrnlb_get_cublas_handle();
             cublasLtHandle_t lt_handle = nullptr;
@@ -2521,9 +2641,17 @@ void MACEKokkos<Precision, AccumPrecision>::rrnlb_apply_linear_transpose(
             rrnlb_throw_cublas_error(
                 cublasSetPointerMode(handle, CUBLAS_POINTER_MODE_HOST),
                 "rrnlb_apply_linear_transpose(cublasSetPointerMode)");
+            rrnlb_cublas_maybe_fence(
+                cublas_debug_fence_mode,
+                1,
+                "rrnlb_apply_linear_transpose(pre-cublas)");
             rrnlb_throw_cublas_error(
                 cublasSetStream(handle, exec.cuda_stream()),
                 "rrnlb_apply_linear_transpose(cublasSetStream)");
+            rrnlb_cublas_check_stream(
+                handle,
+                exec.cuda_stream(),
+                "rrnlb_apply_linear_transpose(set-stream)");
 
             const std::size_t y_row_stride_sz = y_adj_work.stride(0);
             const std::size_t y_col_stride_sz = y_adj_work.stride(1);
@@ -2547,6 +2675,14 @@ void MACEKokkos<Precision, AccumPrecision>::rrnlb_apply_linear_transpose(
             const Precision beta = static_cast<Precision>(1.0);
 
             for (int q = 0; q < num_ins; ++q) {
+                rrnlb_cublas_check_stream(
+                    handle,
+                    exec.cuda_stream(),
+                    "rrnlb_apply_linear_transpose(loop)");
+                rrnlb_cublas_maybe_fence(
+                    cublas_debug_fence_mode,
+                    2,
+                    "rrnlb_apply_linear_transpose(before-gemm)");
                 const int mul_in = h_ins_mul_in[q];
                 const int mul_out = h_ins_mul_out[q];
                 const int ir_dim = h_ins_ir_dim[q];
@@ -2611,7 +2747,15 @@ void MACEKokkos<Precision, AccumPrecision>::rrnlb_apply_linear_transpose(
                 rrnlb_throw_cublas_error(
                     gemm_status,
                     "rrnlb_apply_linear_transpose(cublasGemmStridedBatched)");
+                rrnlb_cublas_maybe_fence(
+                    cublas_debug_fence_mode,
+                    2,
+                    "rrnlb_apply_linear_transpose(after-gemm)");
             }
+            rrnlb_cublas_maybe_fence(
+                cublas_debug_fence_mode,
+                1,
+                "rrnlb_apply_linear_transpose(post-cublas)");
         }
         return;
     }
@@ -2833,6 +2977,7 @@ void MACEKokkos<Precision, AccumPrecision>::rrnlb_apply_linear_transpose(
                 Kokkos::CudaSpace,
                 typename decltype(rrnlb_transpose_x_precision_workspace)::memory_space>::accessible) {
             if (num_nodes > 0) {
+                const int cublas_debug_fence_mode = rrnlb_cublas_debug_fence_mode();
                 auto exec = Kokkos::DefaultExecutionSpace();
                 auto handle = rrnlb_get_cublas_handle();
                 cublasLtHandle_t lt_handle = nullptr;
@@ -2844,9 +2989,17 @@ void MACEKokkos<Precision, AccumPrecision>::rrnlb_apply_linear_transpose(
                 rrnlb_throw_cublas_error(
                     cublasSetPointerMode(handle, CUBLAS_POINTER_MODE_HOST),
                     "rrnlb_apply_linear_transpose(mixed cublasSetPointerMode)");
+                rrnlb_cublas_maybe_fence(
+                    cublas_debug_fence_mode,
+                    1,
+                    "rrnlb_apply_linear_transpose(mixed pre-cublas)");
                 rrnlb_throw_cublas_error(
                     cublasSetStream(handle, exec.cuda_stream()),
                     "rrnlb_apply_linear_transpose(mixed cublasSetStream)");
+                rrnlb_cublas_check_stream(
+                    handle,
+                    exec.cuda_stream(),
+                    "rrnlb_apply_linear_transpose(mixed set-stream)");
 
                 const std::size_t y_row_stride_sz = y_adj_precision.stride(0);
                 const std::size_t y_col_stride_sz = y_adj_precision.stride(1);
@@ -2886,6 +3039,14 @@ void MACEKokkos<Precision, AccumPrecision>::rrnlb_apply_linear_transpose(
                     const long long int x_row_stride = static_cast<long long int>(x_row_stride_sz);
 
                     for (int t = 0; t < count; ++t) {
+                        rrnlb_cublas_check_stream(
+                            handle,
+                            exec.cuda_stream(),
+                            "rrnlb_apply_linear_transpose(mixed loop)");
+                        rrnlb_cublas_maybe_fence(
+                            cublas_debug_fence_mode,
+                            2,
+                            "rrnlb_apply_linear_transpose(mixed before-gemm)");
                         const int idx = first + t;
                         const int q = linear.h_rev_group_ins_index[idx];
                         const int mul_out = h_ins_mul_out[q];
@@ -2950,6 +3111,10 @@ void MACEKokkos<Precision, AccumPrecision>::rrnlb_apply_linear_transpose(
                         rrnlb_throw_cublas_error(
                             gemm_status,
                             "rrnlb_apply_linear_transpose(mixed cublasGemmStridedBatched)");
+                        rrnlb_cublas_maybe_fence(
+                            cublas_debug_fence_mode,
+                            2,
+                            "rrnlb_apply_linear_transpose(mixed after-gemm)");
                     }
 
                     Kokkos::parallel_for(
@@ -2966,6 +3131,10 @@ void MACEKokkos<Precision, AccumPrecision>::rrnlb_apply_linear_transpose(
                                 static_cast<AccumPrecision>(x_group(i, rem));
                         });
                 }
+                rrnlb_cublas_maybe_fence(
+                    cublas_debug_fence_mode,
+                    1,
+                    "rrnlb_apply_linear_transpose(mixed post-cublas)");
             }
             return;
         }

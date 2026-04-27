@@ -1520,7 +1520,9 @@ void PairSymmetrixMACEKokkos<DeviceType, Precision, AccumPrecision>::compute_mpi
 
     ensure_ws_2d(rrnlb_feat0_from_layer1_adj_ws, ws_sender_nodes, feat0_dim);
     auto feat0_from_layer1_adj = rrnlb_feat0_from_layer1_adj_ws;
-    Kokkos::deep_copy(feat0_from_layer1_adj, static_cast<AccumPrecision>(0.0));
+    Kokkos::deep_copy(
+      Kokkos::subview(feat0_from_layer1_adj, Kokkos::make_pair(0, sender_nodes), Kokkos::ALL),
+      static_cast<AccumPrecision>(0.0));
     mace->reverse_rrnlb_interaction_layer(
       1, num_nodes, node_types, num_neigh, neigh_indices, neigh_types, xyz, r, first_neigh,
       rrnlb_feat0, cache1, interaction1_adj, skip1_adj, feat0_from_layer1_adj,
@@ -1670,7 +1672,9 @@ void PairSymmetrixMACEKokkos<DeviceType, Precision, AccumPrecision>::compute_mpi
 
     ensure_ws_2d(rrnlb_sender_embed_adj_ws, ws_sender_nodes, num_channels);
     auto sender_embed_adj = rrnlb_sender_embed_adj_ws;
-    Kokkos::deep_copy(sender_embed_adj, static_cast<AccumPrecision>(0.0));
+    Kokkos::deep_copy(
+      Kokkos::subview(sender_embed_adj, Kokkos::make_pair(0, sender_nodes), Kokkos::ALL),
+      static_cast<AccumPrecision>(0.0));
     mace->reverse_rrnlb_interaction_layer(
       0, num_nodes, node_types, num_neigh, neigh_indices, neigh_types, xyz, r, first_neigh,
       sender_embed, cache0, interaction0_adj, skip0_adj, sender_embed_adj,
@@ -2109,10 +2113,16 @@ void PairSymmetrixMACEKokkos<DeviceType, Precision, AccumPrecision>::compute_no_
   } else {
     if (mace->node_energies.size() < num_local_nodes)
       Kokkos::realloc(mace->node_energies, num_local_nodes);
-    Kokkos::deep_copy(mace->node_energies, 0.0);
+    Kokkos::deep_copy(
+      Kokkos::subview(mace->node_energies, Kokkos::make_pair(0, num_local_nodes)),
+      0.0);
     if (mace->node_forces.size() < 3*(num_local_edges+num_ghost_edges))
       Kokkos::realloc(mace->node_forces, 3*(num_local_edges+num_ghost_edges));
-    Kokkos::deep_copy(mace->node_forces, 0.0);
+    Kokkos::deep_copy(
+      Kokkos::subview(
+        mace->node_forces,
+        Kokkos::make_pair(0, 3 * (num_local_edges + num_ghost_edges))),
+      0.0);
 
     if (mace->has_zbl)
       mace->zbl.compute_ZBL(

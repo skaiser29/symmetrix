@@ -10,6 +10,7 @@
 #include <limits>
 #include <algorithm>
 #include <cctype>
+#include <cstddef>
 #include <utility>
 #include <cstdio>
 
@@ -3246,7 +3247,9 @@ void MACEKokkos<Precision, AccumPrecision>::rrnlb_apply_gate_forward(
     if (y.extent(0) < num_nodes || y.extent(1) != layer.linear_2.dim_in) {
         throw std::runtime_error("RRNLB gate forward output has invalid shape.");
     }
-    Kokkos::deep_copy(y, static_cast<Precision>(0.0));
+    Kokkos::deep_copy(
+        Kokkos::subview(y, Kokkos::make_pair(0, num_nodes), Kokkos::ALL),
+        static_cast<Precision>(0.0));
 
     const auto target_offset = layer.target_offset;
     const auto target_mul = layer.target_mul;
@@ -3321,7 +3324,9 @@ void MACEKokkos<Precision, AccumPrecision>::rrnlb_apply_gate_reverse(
     if (x_adj.extent(0) < num_nodes || x_adj.extent(1) != layer.linear_1.dim_out) {
         throw std::runtime_error("RRNLB gate reverse input adjoint has invalid shape.");
     }
-    Kokkos::deep_copy(x_adj, static_cast<AccumPrecision>(0.0));
+    Kokkos::deep_copy(
+        Kokkos::subview(x_adj, Kokkos::make_pair(0, num_nodes), Kokkos::ALL),
+        static_cast<AccumPrecision>(0.0));
 
     const auto target_offset = layer.target_offset;
     const auto target_mul = layer.target_mul;
@@ -5351,7 +5356,9 @@ void MACEKokkos<Precision, AccumPrecision>::compute_rrnlb_node_energies_forces(
             || rrnlb_M1_adj_ap.extent_int(1) != num_channels_local) {
             Kokkos::realloc(rrnlb_M1_adj_ap, num_nodes, num_channels_local);
         }
-        Kokkos::deep_copy(rrnlb_M1_adj_ap, static_cast<AccumPrecision>(0.0));
+        Kokkos::deep_copy(
+            Kokkos::subview(rrnlb_M1_adj_ap, Kokkos::make_pair(0, num_nodes), Kokkos::ALL),
+            static_cast<AccumPrecision>(0.0));
         auto M1_adj_ap_view = rrnlb_M1_adj_ap;
         Kokkos::parallel_for(
             "rrnlb_product1_adj_to_M1_adj_ap",
@@ -5374,7 +5381,9 @@ void MACEKokkos<Precision, AccumPrecision>::compute_rrnlb_node_energies_forces(
         if (M1_adj.extent(0) < num_nodes || M1_adj.extent(1) != num_channels_local) {
             Kokkos::realloc(M1_adj, num_nodes, num_channels_local);
         }
-        Kokkos::deep_copy(M1_adj, static_cast<Precision>(0.0));
+        Kokkos::deep_copy(
+            Kokkos::subview(M1_adj, Kokkos::make_pair(0, num_nodes), Kokkos::ALL),
+            static_cast<Precision>(0.0));
         auto M1_adj_view = M1_adj;
         Kokkos::parallel_for(
             "rrnlb_product1_adj_to_M1_adj",
@@ -5484,7 +5493,9 @@ void MACEKokkos<Precision, AccumPrecision>::compute_rrnlb_node_energies_forces(
             || rrnlb_M0_adj_ap.extent_int(2) != num_channels_local) {
             Kokkos::realloc(rrnlb_M0_adj_ap, num_nodes, num_LM_local, num_channels_local);
         }
-        Kokkos::deep_copy(rrnlb_M0_adj_ap, static_cast<AccumPrecision>(0.0));
+        Kokkos::deep_copy(
+            Kokkos::subview(rrnlb_M0_adj_ap, Kokkos::make_pair(0, num_nodes), Kokkos::ALL, Kokkos::ALL),
+            static_cast<AccumPrecision>(0.0));
         auto M0_adj_ap_view = rrnlb_M0_adj_ap;
         Kokkos::parallel_for(
             "rrnlb_product0_adj_to_M0_adj_ap",
@@ -5513,7 +5524,9 @@ void MACEKokkos<Precision, AccumPrecision>::compute_rrnlb_node_energies_forces(
             || M0_adj.extent(2) != num_channels_local) {
             Kokkos::realloc(M0_adj, num_nodes, num_LM_local, num_channels_local);
         }
-        Kokkos::deep_copy(M0_adj, static_cast<Precision>(0.0));
+        Kokkos::deep_copy(
+            Kokkos::subview(M0_adj, Kokkos::make_pair(0, num_nodes), Kokkos::ALL, Kokkos::ALL),
+            static_cast<Precision>(0.0));
         auto M0_adj_view = M0_adj;
         Kokkos::parallel_for(
             "rrnlb_product0_adj_to_M0_adj",
@@ -5623,8 +5636,12 @@ void MACEKokkos<Precision, AccumPrecision>::compute_node_energies_forces(
         Kokkos::realloc(node_energies, num_nodes);
     if (node_forces.size() < xyz.size())
         Kokkos::realloc(node_forces, xyz.size());
-    Kokkos::deep_copy(node_energies, 0.0);
-    Kokkos::deep_copy(node_forces, 0.0);
+    Kokkos::deep_copy(
+        Kokkos::subview(node_energies, Kokkos::make_pair(0, num_nodes)),
+        0.0);
+    Kokkos::deep_copy(
+        Kokkos::subview(node_forces, Kokkos::make_pair(std::size_t{0}, xyz.size())),
+        0.0);
 
     if (has_zbl)
         zbl.compute_ZBL(
@@ -7343,7 +7360,9 @@ void MACEKokkos<Precision, AccumPrecision>::reverse_H2(int num_nodes, Kokkos::Vi
 
     if (zero_H1_adj)
         Kokkos::deep_copy(H1_adj, 0.0);
-    Kokkos::deep_copy(M1_adj, 0.0);
+    Kokkos::deep_copy(
+        Kokkos::subview(M1_adj, Kokkos::make_pair(0, num_nodes), Kokkos::ALL),
+        0.0);
 
     auto num_channels = this->num_channels;
     auto H1_adj = this->H1_adj;

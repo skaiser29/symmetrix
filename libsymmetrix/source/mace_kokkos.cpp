@@ -20,7 +20,9 @@
 #include "KokkosBatched_Gemm_Decl.hpp"
 #include "nlohmann/json.hpp"
 #include "sphericart.hpp"
+#ifdef SYMMETRIX_SPHERICART_CUDA
 #include "sphericart_cuda.hpp"
+#endif
 
 #include "tools_kokkos.hpp"
 #include "mace_kokkos.hpp"
@@ -29,6 +31,10 @@
 #if defined(KOKKOS_ENABLE_CUDA) && defined(SYMMETRIX_HAVE_CUBLAS)
 #include <cublas_v2.h>
 #include <cublasLt.h>
+#endif
+
+#if defined(KOKKOS_ENABLE_SYCL) && defined(SYMMETRIX_HAVE_ONEMKL)
+#include <oneapi/mkl.hpp>
 #endif
 
 using Kokkos::ALL;
@@ -186,7 +192,13 @@ auto rrnlb_forward_should_use_split(
             return true;
         case RRNLBForwardAdaptiveMode::Auto:
         default:
+#if defined(KOKKOS_ENABLE_SYCL) && defined(SYMMETRIX_HAVE_ONEMKL)
+            // On Aurora/PVC the split path routes the heavy RRNLB linears through
+            // oneMKL instead of the fused hand-rolled GEMV loops.
+            return true;
+#else
             return num_nodes < rrnlb_forward_split_min_nodes();
+#endif
     }
 }
 
@@ -266,6 +278,13 @@ auto rrnlb_group_packed_auto_should_run(
     return max_rows >= min_rows && total_work > 0;
 }
 
+auto rrnlb_onemkl_enabled() -> bool
+{
+    const char* disable = std::getenv("SYMMETRIX_DISABLE_RRNLB_ONEMKL");
+    if (disable == nullptr) return true;
+    return disable[0] == '\0' || disable[0] == '0';
+}
+
 auto rrnlb_group_packed_should_run(
     const int num_nodes,
     const std::vector<int>& group_ir_dim,
@@ -285,6 +304,10 @@ auto rrnlb_group_packed_should_run(
         || disable_cublas_env[0] == '\0'
         || disable_cublas_env[0] == '0';
     if (cublas_enabled) return false;
+#endif
+#if defined(KOKKOS_ENABLE_SYCL) && defined(SYMMETRIX_HAVE_ONEMKL)
+    // In auto mode on SYCL, prefer oneMKL strided-batched GEMM when enabled.
+    if (rrnlb_onemkl_enabled()) return false;
 #endif
     return rrnlb_group_packed_auto_should_run(
         num_nodes, group_ir_dim, group_lhs_dim, group_rhs_dim);
@@ -2420,6 +2443,66 @@ void MACEKokkos<Precision, AccumPrecision>::rrnlb_apply_linear_forward(
     }
 #endif
 
+#if defined(KOKKOS_ENABLE_SYCL) && defined(SYMMETRIX_HAVE_ONEMKL)
+    if (rrnlb_onemkl_enabled()) {
+        if (num_nodes > 0) {
+            auto exec = Kokkos::DefaultExecutionSpace();
+            auto& sycl_queue = exec.sycl_queue();
+            const int x_row_stride = x.extent_int(1);
+            const int y_row_stride = y.extent_int(1);
+            const int num_ins = static_cast<int>(linear.h_ins_in_offset.size());
+            const Precision beta = static_cast<Precision>(1.0);
+            for (int q = 0; q < num_ins; ++q) {
+                const int mul_in = linear.h_ins_mul_in[q];
+                const int mul_out = linear.h_ins_mul_out[q];
+                const int ir_dim = linear.h_ins_ir_dim[q];
+                const Precision alpha = linear.h_ins_path_weight[q];
+                const Precision* x_base = x.data() + linear.h_ins_in_offset[q];
+                const Precision* w_base = linear.ins_weights.data() + linear.h_ins_weight_offset[q];
+                Precision* y_base = y.data() + linear.h_ins_out_offset[q];
+                // Row-major formulation of Y += alpha * W^T * X.
+                oneapi::mkl::blas::row_major::gemm_batch(
+                    sycl_queue,
+                    oneapi::mkl::transpose::trans,
+                    oneapi::mkl::transpose::nontrans,
+                    static_cast<std::int64_t>(mul_out),
+                    static_cast<std::int64_t>(ir_dim),
+                    static_cast<std::int64_t>(mul_in),
+                    alpha,
+                    w_base,
+                    static_cast<std::int64_t>(mul_out),
+                    static_cast<std::int64_t>(0),
+                    x_base,
+                    static_cast<std::int64_t>(ir_dim),
+                    static_cast<std::int64_t>(x_row_stride),
+                    beta,
+                    y_base,
+                    static_cast<std::int64_t>(ir_dim),
+                    static_cast<std::int64_t>(y_row_stride),
+                    static_cast<std::int64_t>(num_nodes));
+            }
+            sycl_queue.wait_and_throw();
+        }
+
+        const auto bias_indices = linear.bias_indices;
+        const auto bias_values = linear.bias_values;
+        const int num_bias = bias_indices.extent_int(0);
+        if (num_bias > 0 && num_nodes > 0) {
+            auto exec = Kokkos::DefaultExecutionSpace();
+            Kokkos::parallel_for(
+                "RRNLB linear forward bias (oneMKL path)",
+                Kokkos::RangePolicy<Kokkos::DefaultExecutionSpace>(exec, 0, num_nodes * num_bias),
+                KOKKOS_LAMBDA (const int ib) {
+                    const int i = ib / num_bias;
+                    const int b = ib % num_bias;
+                    y(i, bias_indices(b)) += bias_values(b);
+                });
+            Kokkos::fence("RRNLB linear forward bias (oneMKL path)");
+        }
+        return;
+    }
+#endif
+
     const auto ins_in_offset = linear.ins_in_offset;
     const auto ins_out_offset = linear.ins_out_offset;
     const auto ins_mul_in = linear.ins_mul_in;
@@ -2757,6 +2840,60 @@ void MACEKokkos<Precision, AccumPrecision>::rrnlb_apply_linear_transpose(
                 cublas_debug_fence_mode,
                 1,
                 "rrnlb_apply_linear_transpose(post-cublas)");
+        }
+        return;
+    }
+#endif
+
+#if defined(KOKKOS_ENABLE_SYCL) && defined(SYMMETRIX_HAVE_ONEMKL)
+    if (rrnlb_onemkl_enabled()) {
+        if (num_nodes > 0) {
+            auto exec = Kokkos::DefaultExecutionSpace();
+            auto& sycl_queue = exec.sycl_queue();
+            const std::size_t y_row_stride_sz = y_adj_work.stride(0);
+            const std::size_t y_col_stride_sz = y_adj_work.stride(1);
+            const std::size_t x_row_stride_sz = x_adj_work.stride(0);
+            const std::size_t x_col_stride_sz = x_adj_work.stride(1);
+            if (y_col_stride_sz != 1 || x_col_stride_sz != 1) {
+                throw std::runtime_error(
+                    "RRNLB linear transpose requires contiguous column stride.");
+            }
+            const int y_row_stride = static_cast<int>(y_row_stride_sz);
+            const int x_row_stride = static_cast<int>(x_row_stride_sz);
+            const int num_ins = static_cast<int>(linear.h_ins_in_offset.size());
+            const Precision beta = static_cast<Precision>(1.0);
+            for (int q = 0; q < num_ins; ++q) {
+                const int mul_in = linear.h_ins_mul_in[q];
+                const int mul_out = linear.h_ins_mul_out[q];
+                const int ir_dim = linear.h_ins_ir_dim[q];
+                const int in_offset = linear.h_ins_in_offset[q];
+                const int out_offset = linear.h_ins_out_offset[q];
+                const Precision alpha = linear.h_ins_path_weight[q];
+                const Precision* w_base = linear.ins_weights.data() + linear.h_ins_weight_offset[q];
+                const Precision* y_base = y_adj_work.data() + out_offset;
+                Precision* x_base = x_adj_work.data() + in_offset;
+                // Row-major formulation of X_adj += alpha * W * Y_adj.
+                oneapi::mkl::blas::row_major::gemm_batch(
+                    sycl_queue,
+                    oneapi::mkl::transpose::nontrans,
+                    oneapi::mkl::transpose::nontrans,
+                    static_cast<std::int64_t>(mul_in),
+                    static_cast<std::int64_t>(ir_dim),
+                    static_cast<std::int64_t>(mul_out),
+                    alpha,
+                    w_base,
+                    static_cast<std::int64_t>(mul_out),
+                    static_cast<std::int64_t>(0),
+                    y_base,
+                    static_cast<std::int64_t>(ir_dim),
+                    static_cast<std::int64_t>(y_row_stride),
+                    beta,
+                    x_base,
+                    static_cast<std::int64_t>(ir_dim),
+                    static_cast<std::int64_t>(x_row_stride),
+                    static_cast<std::int64_t>(num_nodes));
+            }
+            sycl_queue.wait_and_throw();
         }
         return;
     }
@@ -3136,6 +3273,98 @@ void MACEKokkos<Precision, AccumPrecision>::rrnlb_apply_linear_transpose(
                     cublas_debug_fence_mode,
                     1,
                     "rrnlb_apply_linear_transpose(mixed post-cublas)");
+            }
+            return;
+        }
+#endif
+
+#if defined(KOKKOS_ENABLE_SYCL) && defined(SYMMETRIX_HAVE_ONEMKL)
+        if (rrnlb_onemkl_enabled()) {
+            if (num_nodes > 0) {
+                auto exec = Kokkos::DefaultExecutionSpace();
+                auto& sycl_queue = exec.sycl_queue();
+                const std::size_t y_row_stride_sz = y_adj_precision.stride(0);
+                const std::size_t y_col_stride_sz = y_adj_precision.stride(1);
+                if (y_col_stride_sz != 1) {
+                    throw std::runtime_error(
+                        "RRNLB mixed linear transpose requires contiguous Y column stride.");
+                }
+                const int y_row_stride = static_cast<int>(y_row_stride_sz);
+                const auto& h_ins_out_offset = linear.h_ins_out_offset;
+                const auto& h_ins_mul_out = linear.h_ins_mul_out;
+                const auto& h_ins_weight_offset = linear.h_ins_weight_offset;
+                const auto& h_ins_path_weight = linear.h_ins_path_weight;
+                const auto ins_weights = linear.ins_weights;
+                const int num_groups = static_cast<int>(linear.h_rev_group_first_ins.size());
+                const Precision beta = static_cast<Precision>(1.0);
+
+                for (int g = 0; g < num_groups; ++g) {
+                    const int ir_dim = linear.h_rev_group_ir_dim[g];
+                    const int k_in = linear.h_rev_group_mul_in[g];
+                    const int in_offset = linear.h_rev_group_in_offset[g];
+                    const int first = linear.h_rev_group_first_ins[g];
+                    const int count = linear.h_rev_group_num_ins[g];
+                    const int cols = k_in * ir_dim;
+
+                    auto x_group = Kokkos::subview(
+                        rrnlb_transpose_x_precision_workspace,
+                        Kokkos::make_pair(0, num_nodes),
+                        Kokkos::make_pair(0, cols));
+                    Kokkos::deep_copy(exec, x_group, static_cast<Precision>(0.0));
+
+                    const std::size_t x_row_stride_sz = x_group.stride(0);
+                    const std::size_t x_col_stride_sz = x_group.stride(1);
+                    if (x_col_stride_sz != 1) {
+                        throw std::runtime_error(
+                            "RRNLB mixed linear transpose requires contiguous X column stride.");
+                    }
+                    const int x_row_stride = static_cast<int>(x_row_stride_sz);
+
+                    for (int t = 0; t < count; ++t) {
+                        const int idx = first + t;
+                        const int q = linear.h_rev_group_ins_index[idx];
+                        const int mul_out = h_ins_mul_out[q];
+                        const int out_offset = h_ins_out_offset[q];
+                        const int w_offset = h_ins_weight_offset[q];
+                        const Precision alpha = h_ins_path_weight[q];
+                        const Precision* y_base = y_adj_precision.data() + out_offset;
+                        const Precision* w_base = ins_weights.data() + w_offset;
+                        Precision* x_base = x_group.data();
+                        oneapi::mkl::blas::row_major::gemm_batch(
+                            sycl_queue,
+                            oneapi::mkl::transpose::nontrans,
+                            oneapi::mkl::transpose::nontrans,
+                            static_cast<std::int64_t>(k_in),
+                            static_cast<std::int64_t>(ir_dim),
+                            static_cast<std::int64_t>(mul_out),
+                            alpha,
+                            w_base,
+                            static_cast<std::int64_t>(mul_out),
+                            static_cast<std::int64_t>(0),
+                            y_base,
+                            static_cast<std::int64_t>(ir_dim),
+                            static_cast<std::int64_t>(y_row_stride),
+                            beta,
+                            x_base,
+                            static_cast<std::int64_t>(ir_dim),
+                            static_cast<std::int64_t>(x_row_stride),
+                            static_cast<std::int64_t>(num_nodes));
+                    }
+
+                    sycl_queue.wait_and_throw();
+
+                    Kokkos::parallel_for(
+                        "RRNLB mixed transpose accum (oneMKL)",
+                        Kokkos::RangePolicy<Kokkos::DefaultExecutionSpace>(0, num_nodes * cols),
+                        KOKKOS_LAMBDA (const int ik) {
+                            const int i = ik / cols;
+                            const int rem = ik - i * cols;
+                            const int kin = rem / ir_dim;
+                            const int lm = rem - kin * ir_dim;
+                            x_adj(i, in_offset + kin * ir_dim + lm) +=
+                                static_cast<AccumPrecision>(x_group(i, rem));
+                        });
+                }
             }
             return;
         }

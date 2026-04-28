@@ -10,6 +10,10 @@ set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 # ----- dependencies -----
 
 find_package(BLAS REQUIRED)
+option(SYMMETRIX_SPHERICART_SYCL "Use SYCL sphericart for on-device SH computation." OFF)
+if(SYMMETRIX_SPHERICART_SYCL)
+    set(SPHERICART_ENABLE_SYCL ON CACHE BOOL "" FORCE)
+endif()
 add_subdirectory(external/sphericart)
 option(SYMMETRIX_KOKKOS "Enable Kokkos mode in Symmetrix." ON)
 option(SYMMETRIX_BUILD_SHARED "Build symmetrix as a shared library." ${BUILD_SHARED_LIBS})
@@ -52,9 +56,9 @@ else()
     add_library(symmetrix STATIC ${SYMMETRIX_SOURCE_FILES})
 endif()
 
-# TODO: generalize
 target_compile_options(symmetrix
-    PRIVATE $<$<COMPILE_LANGUAGE:CXX>:-march=native>
+    PRIVATE $<$<AND:$<COMPILE_LANGUAGE:CXX>,$<NOT:$<CXX_COMPILER_ID:IntelLLVM>>>:-march=native>
+            $<$<AND:$<COMPILE_LANGUAGE:CXX>,$<CXX_COMPILER_ID:IntelLLVM>>:-xHost>
             $<$<COMPILE_LANGUAGE:CXX>:-ffast-math>)
 
 target_include_directories(symmetrix
@@ -77,6 +81,22 @@ if(SYMMETRIX_KOKKOS AND Kokkos_ENABLE_CUDA)
     target_compile_definitions(symmetrix PRIVATE SYMMETRIX_HAVE_CUBLAS)
 endif()
 
+if(SYMMETRIX_KOKKOS AND Kokkos_ENABLE_SYCL)
+    find_package(MKL REQUIRED)
+    find_library(MKL_SYCL_BLAS_LIB
+        NAMES mkl_sycl_blas mkl_sycl
+        HINTS ENV MKLROOT
+        PATH_SUFFIXES lib lib/intel64)
+    if(NOT MKL_SYCL_BLAS_LIB)
+        message(FATAL_ERROR
+            "Could not find mkl_sycl_blas. Ensure the oneAPI MKL module is loaded "
+            "and MKLROOT is set.")
+    endif()
+    message(STATUS "Symmetrix: Found MKL SYCL BLAS: ${MKL_SYCL_BLAS_LIB}")
+    target_link_libraries(symmetrix PRIVATE MKL::MKL ${MKL_SYCL_BLAS_LIB})
+    target_compile_definitions(symmetrix PRIVATE SYMMETRIX_HAVE_ONEMKL)
+endif()
+
 
 # ----- options -----
 
@@ -84,4 +104,9 @@ option(SYMMETRIX_SPHERICART_CUDA OFF)
 if (SYMMETRIX_SPHERICART_CUDA)
     message(STATUS "Symmetrix: Will use CUDA version of sphericart.")
     target_compile_definitions(symmetrix PRIVATE SYMMETRIX_SPHERICART_CUDA)
+endif()
+
+if(SYMMETRIX_SPHERICART_SYCL)
+    message(STATUS "Symmetrix: Will use SYCL version of sphericart.")
+    target_compile_definitions(symmetrix PRIVATE SYMMETRIX_SPHERICART_SYCL)
 endif()

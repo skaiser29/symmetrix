@@ -285,6 +285,16 @@ auto rrnlb_onemkl_enabled() -> bool
     return disable[0] == '\0' || disable[0] == '0';
 }
 
+auto rrnlb_onemkl_wait_enabled() -> bool
+{
+    static bool enabled = []() -> bool {
+        const char* env = std::getenv("SYMMETRIX_RRNLB_ONEMKL_WAIT");
+        if (env == nullptr || env[0] == '\0') return false;
+        return env[0] != '0';
+    }();
+    return enabled;
+}
+
 auto rrnlb_group_packed_should_run(
     const int num_nodes,
     const std::vector<int>& group_ir_dim,
@@ -386,6 +396,16 @@ auto rrnlb_reverse_grouped_input_enabled() -> bool
 {
     static bool enabled = []() -> bool {
         const char* env = std::getenv("SYMMETRIX_RRNLB_REVERSE_GROUPED_INPUT");
+        if (env == nullptr || env[0] == '\0') return true;
+        return env[0] != '0';
+    }();
+    return enabled;
+}
+
+auto rrnlb_reverse_grouped_fused_enabled() -> bool
+{
+    static bool enabled = []() -> bool {
+        const char* env = std::getenv("SYMMETRIX_RRNLB_REVERSE_GROUPED_FUSED");
         if (env == nullptr || env[0] == '\0') return true;
         return env[0] != '0';
     }();
@@ -2532,7 +2552,9 @@ void MACEKokkos<Precision, AccumPrecision>::rrnlb_apply_linear_forward(
                     static_cast<std::int64_t>(y_row_stride),
                     static_cast<std::int64_t>(num_nodes));
             }
-            sycl_queue.wait_and_throw();
+            if (rrnlb_onemkl_wait_enabled()) {
+                sycl_queue.wait_and_throw();
+            }
         }
 
         const auto bias_indices = linear.bias_indices;
@@ -2944,7 +2966,9 @@ void MACEKokkos<Precision, AccumPrecision>::rrnlb_apply_linear_transpose(
                     static_cast<std::int64_t>(x_row_stride),
                     static_cast<std::int64_t>(num_nodes));
             }
-            sycl_queue.wait_and_throw();
+            if (rrnlb_onemkl_wait_enabled()) {
+                sycl_queue.wait_and_throw();
+            }
         }
         return;
     }
@@ -3402,7 +3426,9 @@ void MACEKokkos<Precision, AccumPrecision>::rrnlb_apply_linear_transpose(
                             static_cast<std::int64_t>(num_nodes));
                     }
 
-                    sycl_queue.wait_and_throw();
+                    if (rrnlb_onemkl_wait_enabled()) {
+                        sycl_queue.wait_and_throw();
+                    }
 
                     Kokkos::parallel_for(
                         "RRNLB mixed transpose accum (oneMKL)",
@@ -5114,7 +5140,74 @@ void MACEKokkos<Precision, AccumPrecision>::reverse_rrnlb_interaction_layer(
             && !use_compact_active
             && work_by_in_offsets.extent_int(0) >= h_up_dim + 1
             && work_by_in_indices.extent_int(0) >= num_work_items;
-        if (use_grouped_input_reverse) {
+        const bool use_grouped_fused_reverse =
+            use_grouped_input_reverse && rrnlb_reverse_grouped_fused_enabled();
+        if (use_grouped_fused_reverse) {
+            Kokkos::parallel_for(
+                "RRNLB conv reverse (edge-parallel grouped-input fused)",
+                Kokkos::TeamPolicy<>(total_edges, Kokkos::AUTO, rrnlb_reverse_vector_length()),
+                KOKKOS_LAMBDA (Kokkos::TeamPolicy<>::member_type team_member) {
+                    const int ij = team_member.league_rank();
+                    const int i = edge_recv(ij);
+                    const int sender = neigh_indices(ij);
+                    const Precision r_ij = static_cast<Precision>(r(ij));
+
+                    auto conv_adj_i = Kokkos::subview(conv_adj, i, Kokkos::ALL);
+                    const auto h_up_sender = Kokkos::subview(h_up, sender, Kokkos::ALL);
+                    auto h_up_sender_adj = Kokkos::subview(h_up_adj, sender, Kokkos::ALL);
+
+                    RRNLBReverseReduceVal<AccumPrecision> rev_reduce;
+                    Kokkos::parallel_reduce(
+                        Kokkos::TeamThreadRange(team_member, active_in_count),
+                        [&] (const int p, RRNLBReverseReduceVal<AccumPrecision>& vals) {
+                            AccumPrecision val = static_cast<AccumPrecision>(0.0);
+                            const int begin = work_by_in_offsets(p);
+                            const int end = work_by_in_offsets(p + 1);
+                            for (int pos = begin; pos < end; ++pos) {
+                                const int w = work_by_in_indices(pos);
+                                const AccumPrecision upstream = conv_adj_i(work_out_idx(w));
+                                const AccumPrecision tp_val = static_cast<AccumPrecision>(edge_tp_vals(ij, work_w_idx(w)));
+                                const AccumPrecision tp_der = static_cast<AccumPrecision>(edge_tp_ders(ij, work_w_idx(w)));
+                                const AccumPrecision up_val = static_cast<AccumPrecision>(h_up_sender(work_in_idx(w)));
+                                const AccumPrecision y_val = static_cast<AccumPrecision>(Y(ij * num_lm + work_y_lm(w)));
+                                const AccumPrecision contrib = upstream * static_cast<AccumPrecision>(work_coeff(w));
+
+                                val += contrib * y_val * tp_val;
+                                vals.dE_dr += contrib * y_val * up_val * tp_der;
+                                const AccumPrecision y_force_base = contrib * tp_val * up_val;
+                                const int lm = work_y_lm(w);
+                                vals.fx += y_force_base * static_cast<AccumPrecision>(Y_grad(ij * 3 * num_lm + lm));
+                                vals.fy += y_force_base * static_cast<AccumPrecision>(Y_grad(ij * 3 * num_lm + num_lm + lm));
+                                vals.fz += y_force_base * static_cast<AccumPrecision>(Y_grad(ij * 3 * num_lm + 2 * num_lm + lm));
+                            }
+                            if (val != static_cast<AccumPrecision>(0.0)) {
+                                Kokkos::atomic_add(&h_up_sender_adj(p), val);
+                            }
+                        },
+                        rev_reduce);
+
+                    Kokkos::single(Kokkos::PerTeam(team_member), [&] () {
+                        const ForceAccumPrecision inv_r =
+                            static_cast<ForceAccumPrecision>(1.0) / static_cast<ForceAccumPrecision>(r_ij);
+                        const ForceAccumPrecision dE_dr_total =
+                            static_cast<ForceAccumPrecision>(
+                                density_adj(i) * static_cast<AccumPrecision>(edge_den_der(ij))
+                                + rev_reduce.dE_dr);
+                        ForceAccumPrecision dxyz_x =
+                            dE_dr_total * static_cast<ForceAccumPrecision>(xyz(3 * ij + 0)) * inv_r
+                            + static_cast<ForceAccumPrecision>(rev_reduce.fx);
+                        ForceAccumPrecision dxyz_y =
+                            dE_dr_total * static_cast<ForceAccumPrecision>(xyz(3 * ij + 1)) * inv_r
+                            + static_cast<ForceAccumPrecision>(rev_reduce.fy);
+                        ForceAccumPrecision dxyz_z =
+                            dE_dr_total * static_cast<ForceAccumPrecision>(xyz(3 * ij + 2)) * inv_r
+                            + static_cast<ForceAccumPrecision>(rev_reduce.fz);
+                        node_forces(3 * ij + 0) -= static_cast<double>(dxyz_x);
+                        node_forces(3 * ij + 1) -= static_cast<double>(dxyz_y);
+                        node_forces(3 * ij + 2) -= static_cast<double>(dxyz_z);
+                    });
+                });
+        } else if (use_grouped_input_reverse) {
             Kokkos::parallel_for(
                 "RRNLB conv reverse (edge-parallel grouped-input)",
                 Kokkos::TeamPolicy<>(total_edges, Kokkos::AUTO, rrnlb_reverse_vector_length()),

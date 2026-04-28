@@ -1,0 +1,135 @@
+#!/bin/bash -l
+#PBS -N symm_onemkl_wait
+#PBS -l select=1
+#PBS -l place=scatter
+#PBS -l walltime=00:50:00
+#PBS -l filesystems=home
+#PBS -j oe
+#PBS -q debug
+#PBS -A RAPTOR_gpudev
+
+set -euo pipefail
+
+module purge
+module use /opt/aurora/25.190.0/modulefiles
+module load oneapi/release/2025.2.0 cmake/3.31.8 mpich/opt/develop-git.6037a7a
+export PATH="/opt/cray/pals/1.8/bin:$PATH"
+
+SUITE_DIR="${SUITE_DIR:-/home/skaiser/tests/water_bench_suite}"
+BENCH_5184_ROOT="${BENCH_5184_ROOT:-/home/skaiser/tests/water_benchmark_5184_symmetrix}"
+LMP_BIN="${LMP_BIN:-/home/skaiser/soft/lammps-aurora-water-perf/build_lean_25190/lmp}"
+MODEL_JSON="${MODEL_JSON:-/home/skaiser/tests/mace-mh-1-1-8-17-omol.json}"
+RESTART_770="${RESTART_770:-/home/skaiser/tests/water_bench_suite/restart_seg_152.bin}"
+TEMPLATE_5184="${TEMPLATE_5184:-$BENCH_5184_ROOT/scripts/in.water_5184_rrnlb_aurora.lmp}"
+DATA_5184="${DATA_5184:-$BENCH_5184_ROOT/inputs/seed192_5184.data}"
+AFFINITY_SCRIPT="${AFFINITY_SCRIPT:-/soft/tools/mpi_wrapper_utils/gpu_tile_compact.sh}"
+PHASE_STEPS_770="${PHASE_STEPS_770:-100}"
+PHASE_STEPS_5184="${PHASE_STEPS_5184:-60}"
+OUTROOT="${OUTROOT:-/home/skaiser/tests/water_benchmark_5184_symmetrix/runs/onemkl_wait_12r_${PBS_JOBID:-local}}"
+
+export OMP_NUM_THREADS=1
+export OMP_PROC_BIND=spread
+export OMP_PLACES=cores
+export MPICH_GPU_SUPPORT_ENABLED=1
+export MKL_NUM_THREADS=1
+export OPENBLAS_NUM_THREADS=1
+export NUMEXPR_NUM_THREADS=1
+
+mkdir -p "$OUTROOT"
+cd "$SUITE_DIR"
+
+echo "PBS_JOBID=${PBS_JOBID:-unknown}"
+echo "host=$(hostname)"
+echo "outroot=$OUTROOT"
+echo "lmp_bin=$LMP_BIN"
+echo "phase_steps_770=$PHASE_STEPS_770"
+echo "phase_steps_5184=$PHASE_STEPS_5184"
+module list 2>&1
+
+set_candidate_env() {
+  local mode="$1"
+  unset SYMMETRIX_RRNLB_FORWARD_ADAPTIVE_MODE
+  unset SYMMETRIX_RRNLB_FORWARD_SPLIT_MIN_NODES
+  unset SYMMETRIX_RRNLB_FORWARD_VECTOR_LENGTH
+  unset SYMMETRIX_RRNLB_REVERSE_VECTOR_LENGTH
+  unset SYMMETRIX_RRNLB_SENDER_TILED_REV
+  unset SYMMETRIX_RRNLB_SENDER_SEGMENT_SIZE
+  unset SYMMETRIX_RRNLB_PHASE_CSV
+  unset SYMMETRIX_DISABLE_RRNLB_ONEMKL
+  export SYMMETRIX_RRNLB_REVERSE_GROUPED_INPUT=1
+  export SYMMETRIX_RRNLB_REVERSE_GROUPED_FUSED=1
+  if [[ "$mode" == "wait" ]]; then
+    export SYMMETRIX_RRNLB_ONEMKL_WAIT=1
+  else
+    export SYMMETRIX_RRNLB_ONEMKL_WAIT=0
+  fi
+}
+
+run_770_case() {
+  local label="$1"
+  local mode="$2"
+  local case_out="$OUTROOT/$label"
+  mkdir -p "$case_out"
+  echo
+  echo "=== CASE $label workload=770 ranks=12 onemkl_wait=$mode steps=$PHASE_STEPS_770 ==="
+  (
+    set_candidate_env "$mode"
+    ./run_water_bench_aurora.sh \
+      --lmp "$LMP_BIN" --steps "$PHASE_STEPS_770" --ranks 12 \
+      --pairmode mpi_message_passing --outdir "$case_out" \
+      --model-json "$MODEL_JSON" --restart-file "$RESTART_770" \
+      --num-atoms 770 --affinity-script "$AFFINITY_SCRIPT" --profile
+  )
+}
+
+run_5184_case() {
+  local label="$1"
+  local mode="$2"
+  local case_out="$OUTROOT/$label"
+  mkdir -p "$case_out"
+  echo
+  echo "=== CASE $label workload=5184 ranks=12 onemkl_wait=$mode steps=$PHASE_STEPS_5184 ==="
+  (
+    set_candidate_env "$mode"
+    ./run_water_bench_aurora.sh \
+      --lmp "$LMP_BIN" --steps "$PHASE_STEPS_5184" --ranks 12 \
+      --pairmode mpi_message_passing --outdir "$case_out" \
+      --template "$TEMPLATE_5184" --model-json "$MODEL_JSON" \
+      --use-data --data-file "$DATA_5184" --num-atoms 5184 \
+      --affinity-script "$AFFINITY_SCRIPT" --profile
+  )
+}
+
+run_770_case  "water770_r12_wait" "wait"
+run_770_case  "water770_r12_nowait" "nowait"
+run_5184_case "water5184_r12_wait" "wait"
+run_5184_case "water5184_r12_nowait" "nowait"
+
+python3 - <<'PY' "$OUTROOT"
+import csv
+import pathlib
+import sys
+
+outroot = pathlib.Path(sys.argv[1])
+rows = []
+for report in sorted(outroot.glob("*/report.csv")):
+    with report.open() as f:
+        for row in csv.DictReader(f):
+            row = dict(row)
+            row["case"] = report.parent.name
+            rows.append(row)
+
+fields = ["case"]
+for row in rows:
+    for key in row:
+        if key not in fields:
+            fields.append(key)
+
+summary = outroot / "matrix_summary.csv"
+with summary.open("w", newline="") as f:
+    writer = csv.DictWriter(f, fieldnames=fields)
+    writer.writeheader()
+    writer.writerows(rows)
+
+print(f"wrote {summary}")
+PY

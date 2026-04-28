@@ -463,3 +463,60 @@ Correctness remained matched within the existing benchmark noise:
 - It improves both small and larger water workloads and both 1-rank and 12-rank cases.
 - It does not get the 770 one-node case to `2 ns/day`; the validated speed is `1.668 ns/day`, up from `1.571 ns/day` in this production A/B and from the earlier `~1.55 ns/day` baseline.
 - The remaining gap is now less dominated by reverse convolution; next targets should be reverse MPI/halo overhead for 770 12-rank and any remaining layer-1 reverse-conv arithmetic/memory traffic.
+
+# Follow-On Reverse/Pair Optimization Tranches (2026-04-28)
+
+## Goal
+
+Continue Aurora pair/reverse optimization after grouped-input reverse convolution until either no credible options remain or the 770-atom 12-rank benchmark improves by more than `0.2 ns/day` over the validated grouped baseline (`1.668 ns/day`). Preserve correctness and avoid regressing the 5184-atom workload.
+
+## Plan
+
+- [x] Re-rank remaining bottlenecks after grouped-input default-on validation.
+- [x] Inspect reverse MPI communication and pack/unpack paths for avoidable payload or synchronization.
+- [x] Inspect remaining layer-1 reverse-conv work for arithmetic or memory traffic reductions compatible with the grouped path.
+- [x] Implement one narrowly scoped tranche at a time.
+- [x] Rebuild after the first tranche.
+- [x] Run a short full-node production timing after the first tranche.
+- [x] Reject the comm internal-fence tranche: 300-step `8453447` produced 770 12-rank `1.662 ns/day` and 5184 12-rank `0.545 ns/day`, not a meaningful gain over the grouped baseline.
+- [x] Implement a sender-segment grouped-input reverse variant for 12-rank atomics.
+- [x] Test sender-segment grouped-input reverse across segment sizes on 12 ranks.
+- [x] Reject the sender-segment grouped-input tranche: job `8453452` regressed 770 12-rank from default `1.626 ns/day` to `1.405`, `1.391`, `1.367`, and `1.311 ns/day` for segment sizes `4`, `8`, `16`, and `32`; 5184 12-rank similarly regressed from `0.554` to about `0.424-0.427 ns/day`.
+- [x] Rebuild after rejecting sender-segment grouped-input so the benchmark binary again matches the accepted source.
+- [x] Test grouped-input fused reverse: combine the grouped `h_up_adj` input pass with force/dE reductions to remove the duplicate work-table sweep while preserving edge-parallel semantics. It is controlled by `SYMMETRIX_RRNLB_REVERSE_GROUPED_FUSED` and defaults on for the candidate build.
+  - Build completed successfully after the candidate change.
+  - Phase A/B job `8453466` was canceled while still queued after code review found a device-side branch in the candidate kernel.
+  - Candidate was revised to split fused and legacy grouped kernels at the host branch so the fused timing does not pay for legacy-path control flow.
+  - Rebuild completed successfully and replacement phase A/B job `8453469` submitted.
+  - Job `8453469` showed a small but real win: 770 12-rank `1.621 -> 1.666 ns/day`, 5184 12-rank `0.556 -> 0.575 ns/day`; reverse conv dropped `0.00437 -> 0.00400 s/rank-step` for 770 and `0.0270 -> 0.0247` for 5184. This is useful but below the `>0.2 ns/day` threshold.
+- [x] Test oneMKL no-wait launch candidate: Kokkos uses in-order SYCL queues, so gate the internal oneMKL `wait_and_throw()` calls behind `SYMMETRIX_RRNLB_ONEMKL_WAIT`; after validation, no-wait is the default and `SYMMETRIX_RRNLB_ONEMKL_WAIT=1` restores the conservative wait behavior.
+  - Build completed successfully and phase A/B job `8453487` submitted with fused reverse enabled on both sides.
+  - Job `8453487` showed 770 12-rank `1.644 -> 1.700 ns/day` for wait vs no-wait, with matched drift; 5184 12-rank was effectively neutral (`0.574 -> 0.577 ns/day`).
+- [x] Test existing grouped packed Kokkos linear backend against oneMKL no-wait for small 12-rank batches.
+  - Phase A/B job `8453489` submitted.
+  - Result: rejected. Packed backend regressed badly: 770 12-rank `1.690 -> 0.126 ns/day`; 5184 12-rank `0.575 -> 0.068 ns/day`.
+- [x] Run longer no-profile production A/B for accepted grouped baseline behavior vs fused reverse plus oneMKL no-wait.
+  - Production A/B job `8453492` submitted for 1000-step 770 and 5184 12-rank cases.
+  - Result: keep the stack. Production 1000-step A/B improved 770 12-rank `1.668 -> 1.729 ns/day` and 5184 12-rank `0.528 -> 0.549 ns/day`; drift and delta-K matched baseline (`770 drift 0.000351 -> 0.000331`, `5184 drift 0.001456 -> 0.001467`).
+  - This is below the `>0.2 ns/day` target, so continue only if another credible low-risk tranche remains; otherwise document residual bottlenecks.
+- [x] Rebuild with fused reverse and oneMKL no-wait as the default path, preserving env overrides for rollback.
+  - Rebuild completed successfully.
+  - Default no-profile smoke job `8453498` submitted with all candidate env vars unset.
+  - Default smoke result: 770 12-rank `1.711 ns/day`, 5184 12-rank `0.566 ns/day` for 300-step no-profile runs. Short-run drift matched the same 300-step noise pattern seen in prior timing-only runs.
+- [x] Keep only changes that are accurate and improve 770 12-rank or 5184 12-rank timing.
+- [x] Run 1000-step production validation for any candidate near the `>0.2 ns/day` acceptance bar.
+- [x] Document rejected options and final residual bottlenecks.
+
+## Follow-On Review
+
+- Kept: fused grouped-input reverse conv and default no-wait oneMKL submissions on Kokkos' in-order SYCL queue. Rollbacks remain available with `SYMMETRIX_RRNLB_REVERSE_GROUPED_FUSED=0` and `SYMMETRIX_RRNLB_ONEMKL_WAIT=1`.
+- Validated production gain over the grouped baseline is `+0.061 ns/day` for 770 12-rank and `+0.021 ns/day` for 5184 12-rank.
+- The `>0.2 ns/day` target was not reached. The credible local pair/reverse tranches tested here are exhausted: comm internal-fence removal, sender-segment reverse accumulation, fused grouped reverse, oneMKL no-wait, and packed Kokkos linear backend.
+- Remaining 770 12-rank bottlenecks are distributed across reverse conv, oneMKL transpose work, and reverse MPI/halo exchange. Getting another `>0.2 ns/day` likely requires a larger algorithmic communication change or broader forward-path work, not another small local reverse-kernel edit.
+
+## Starting Point
+
+- Branch: `perf/aurora-water-12r-transfer-2026-04-28`.
+- Commit: `1634f2d` (`aurora: group reverse convolution input adjoints`).
+- Validated grouped baseline: 770 12-rank `1.668 ns/day`, 5184 12-rank `0.528 ns/day`.
+- Default-on grouped phase smoke: 770 12-rank reverse conv about `0.00437 s/rank-step`, reverse MPI about `0.0029 s/rank-step`.

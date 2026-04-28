@@ -589,3 +589,94 @@ Benchmark the newly committed fused-reverse/no-wait path, identify the current d
   - Reverse MPI internal-fence removal: already neutral/regressed.
   - Larger fused linear/reverse kernels: likely duplicate oneMKL work or increase register pressure; no clean design survived the phase data.
 - The requested `>0.2 ns/day` 12-rank improvement was not achieved. The remaining path to that size likely needs a broader reverse communication redesign or a different algorithmic decomposition, not another local reverse-conv or transpose cleanup.
+
+# Unified Reverse Communication Redesign (2026-04-28)
+
+## Goal
+
+Reduce the 12-rank 770-atom reverse communication tax without introducing a rank-count-specific or benchmark-specific code path. Preserve one default RRNLB reverse path that also remains correct and acceptable for larger 5184-atom workloads.
+
+## Plan
+
+- [x] Map the current Kokkos RRNLB reverse adjoint dataflow around `rrnlb_feat0_adj`, `comm->reverse_comm(this)`, `pack_reverse_comm_kokkos`, and `unpack_reverse_comm_kokkos`.
+- [x] Confirm what portion of reverse communication is payload movement versus enforced ordering/fences and pack/unpack kernels.
+- [x] Choose the simplest unified redesign that reduces communication ordering, payload, or post-communication gather work without changing the mathematical adjoint.
+- [x] Implement the redesign with a rollback environment knob until validated.
+- [x] Rebuild with the Aurora module stack used by the benchmark harness.
+- [x] Run a short correctness smoke test against the rollback path.
+- [x] Run 770-atom and 5184-atom 12-rank performance/phase validation.
+- [x] Compare force/energy drift and delta-K against the rollback path before accepting.
+- [x] Commit only if the change is numerically equivalent and performance-positive.
+
+## Constraints
+
+- Avoid splintering into separate 1-rank, 12-rank, or 770-only paths.
+- Do not reduce model generality by assuming inactive channels or a fixed feature width.
+- Treat pack/unpack kernel micro-optimization as secondary; existing VTune evidence says the larger issue is reverse communication ordering/latency.
+- Keep rollback controls from earlier commits intact.
+
+## Implementation Notes
+
+- Added `SYMMETRIX_RRNLB_COMPACT_REVERSE_UNPACK`, default on, rollback `=0`.
+- The new path initializes compact `feat0_adj_nodes` before reverse communication, builds an atom-index to compact-node map, and has RRNLB reverse unpack accumulate returned owner adjoints directly into compact node order.
+- The atom-indexed `rrnlb_feat0_adj` buffer is still retained for ghost forwarding during LAMMPS reverse multi-swap communication, so the path is not rank-count-specific.
+- Rebuild command completed successfully:
+  - `cmake --build /home/skaiser/soft/lammps-aurora-water-perf/build_lean_25190 --target lmp -j 12`
+- Phase A/B script added:
+  - `tasks/run_aurora_compact_reverse_unpack_12r_matrix.pbs`
+- Phase A/B job submitted:
+  - `8454655`
+
+## Phase A/B Result
+
+- Job `8454655` completed cleanly.
+- 770 12-rank: rollback `1.722 ns/day`, candidate `1.729 ns/day`; drift and delta-K matched.
+- 5184 12-rank: rollback `0.588 ns/day`, candidate `0.587 ns/day`; drift and delta-K matched.
+- Phase counters showed the reverse MPI stage was essentially unchanged:
+  - 770 reverse MPI `0.002754653 -> 0.002752748 s/rank-step`.
+  - 5184 reverse MPI `0.004284317 -> 0.004262935 s/rank-step`.
+- Decision: this pair-side compact-unpack path is numerically valid but too small and slightly negative for 5184, so it is not the broader redesign we need. Move to the LAMMPS Kokkos reverse-comm ordering layer.
+
+## LAMMPS Kokkos Reverse-Comm Ordering Plan
+
+- [ ] Add an environment-gated Kokkos reverse pair comm variant that posts the receive before pack and removes the pre-receive device fence.
+- [ ] Preserve the reverse swap order to avoid breaking multi-hop ghost reductions.
+- [ ] Keep a rollback knob for direct A/B in one binary.
+- [ ] Rebuild LAMMPS and run the same 770/5184 12-rank phase A/B.
+- [ ] Accept only if the phase and production results show a meaningful positive change without drift.
+
+## LAMMPS Ordering Implementation Notes
+
+- Added `LAMMPS_KOKKOS_REVERSE_PAIR_POST_RECV_FIRST`, default on, rollback `=0`, in the local LAMMPS Kokkos pair reverse comm driver.
+- The change keeps the reverse swap loop order intact, but posts `MPI_Irecv` before pair pack for each non-self swap.
+- Rebuilt `/home/skaiser/soft/lammps-aurora-water-perf/build_lean_25190/lmp` successfully.
+- Phase A/B script added:
+  - `tasks/run_aurora_lammps_reverse_order_12r_matrix.pbs`
+- Phase A/B job submitted:
+  - `8454687`
+
+## LAMMPS Ordering Phase A/B Result
+
+- Job `8454687` completed cleanly.
+- 770 12-rank: rollback `1.720 ns/day`, candidate `1.727 ns/day`.
+- 5184 12-rank: rollback `0.584 ns/day`, candidate `0.585 ns/day`.
+- Reverse MPI moved only slightly:
+  - 770 reverse MPI `0.002747178 -> 0.002737218 s/rank-step`.
+  - 5184 reverse MPI `0.004313149 -> 0.004281016 s/rank-step`.
+- Decision: receive-before-pack alone is too small.
+
+## LAMMPS Nonblocking Send Follow-Up
+
+- Added `LAMMPS_KOKKOS_REVERSE_PAIR_NONBLOCKING_SEND`, default on, rollback `=0`, to replace blocking `MPI_Send` with `MPI_Isend` plus wait inside the same reverse swap.
+- Updated `tasks/run_aurora_lammps_reverse_order_12r_matrix.pbs` so rollback disables both LAMMPS ordering flags and candidate enables both.
+- Rebuilt `/home/skaiser/soft/lammps-aurora-water-perf/build_lean_25190/lmp` successfully.
+- Combined ordering A/B job submitted:
+  - `8454716`
+
+## Final Lock-In Decision
+
+- [x] Per user direction, accept the compact RRNLB reverse unpack path as a small positive movement and call the broader redesign out of scope for now.
+- [x] Keep `SYMMETRIX_RRNLB_COMPACT_REVERSE_UNPACK=0` as the rollback knob.
+- [x] Do not carry the LAMMPS Kokkos reverse-comm ordering/nonblocking-send source experiments in this SymmetriX commit.
+- [x] Use job `8454655` as the acceptance benchmark: 770-atom 12-rank moved `1.722 -> 1.729 ns/day`; 5184-atom 12-rank stayed noise-level at `0.588 -> 0.587 ns/day`; drift and delta-K matched rollback.
+- [x] Commit the accepted SymmetriX pair-side change and compact reverse A/B harness.

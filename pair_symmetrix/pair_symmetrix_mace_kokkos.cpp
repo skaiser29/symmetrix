@@ -640,6 +640,10 @@ void PairSymmetrixMACEKokkos<DeviceType, Precision, AccumPrecision>::unpack_reve
   if (mace->interaction_mode_rrnlb && mode == "mpi_message_passing") {
     Kokkos::Timer comm_timer;
     auto feat0_adj = rrnlb_feat0_adj;
+    auto feat0_adj_nodes = rrnlb_feat0_adj_nodes_comm;
+    const auto atom_to_node = rrnlb_atom_to_node_ws;
+    const bool compact_unpack = rrnlb_compact_reverse_unpack_active;
+    const int nlocal = atom->nlocal;
     const int width = mace->rrnlb_product_linear_0.dim_out;
     Kokkos::parallel_for(
       "PairSymmetrixMACEKokkos::unpack_reverse_comm_kokkos_rrnlb",
@@ -648,7 +652,15 @@ void PairSymmetrixMACEKokkos<DeviceType, Precision, AccumPrecision>::unpack_reve
         const int ii = iw / width;
         const int k = iw % width;
         const int i = d_sendlist(ii);
-        Kokkos::atomic_add(&feat0_adj(i, k), d_buf(ii * width + k));
+        const auto value = static_cast<AccumPrecision>(d_buf(ii * width + k));
+        if (compact_unpack && i < nlocal) {
+          const int node = atom_to_node(i);
+          if (node >= 0) {
+            Kokkos::atomic_add(&feat0_adj_nodes(node, k), value);
+          }
+        } else {
+          Kokkos::atomic_add(&feat0_adj(i, k), value);
+        }
       });
     Kokkos::fence();
     mace->rrnlb_record_comm_unpack(comm_timer.seconds());
@@ -1039,6 +1051,8 @@ void PairSymmetrixMACEKokkos<DeviceType, Precision, AccumPrecision>::compute_mpi
     rrnlb_env_flag(
       "SYMMETRIX_RRNLB_PAIR_EDGE_PARALLEL_REV",
       rrnlb_pair_edge_parallel_default);
+  static const bool rrnlb_compact_reverse_unpack =
+    rrnlb_env_flag("SYMMETRIX_RRNLB_COMPACT_REVERSE_UNPACK", true);
   const bool edge_parallel_active = rrnlb_pair_edge_parallel_fwd || rrnlb_pair_edge_parallel_rev;
   const bool force_refresh_topology = edge_parallel_active;
   const int rrnlb_total_edges_fwd = rrnlb_pair_edge_parallel_fwd ? num_edges : 0;
@@ -1672,15 +1686,36 @@ void PairSymmetrixMACEKokkos<DeviceType, Precision, AccumPrecision>::compute_mpi
 
     rrnlb_feat0_adj = feat0_from_layer1_adj;
     auto feat0_adj_all = rrnlb_feat0_adj;
+    ensure_ws_2d(rrnlb_feat0_adj_nodes_ws, ws_nodes, feat0_dim);
+    auto feat0_adj_nodes = rrnlb_feat0_adj_nodes_ws;
     Kokkos::parallel_for(
-      "rrnlb_add_feat0_readout_adj_mpi",
+      "rrnlb_init_feat0_adj_nodes_mpi",
       Kokkos::RangePolicy<DeviceType>(0, num_nodes * feat0_dim),
       KOKKOS_LAMBDA (const int ip) {
         const int ii = ip / feat0_dim;
         const int p = ip % feat0_dim;
         const int i = node_indices_view(ii);
-        feat0_adj_all(i, p) += feat0_adj_local(ii, p);
+        const auto adj = feat0_adj_all(i, p) + feat0_adj_local(ii, p);
+        feat0_adj_all(i, p) = adj;
+        feat0_adj_nodes(ii, p) = adj;
       });
+    const bool use_compact_reverse_unpack =
+      rrnlb_compact_reverse_unpack && reverse_comm_device != 0;
+    if (use_compact_reverse_unpack) {
+      ensure_ws_1d(rrnlb_atom_to_node_ws, sender_nodes);
+      auto atom_to_node = rrnlb_atom_to_node_ws;
+      Kokkos::deep_copy(
+        Kokkos::subview(atom_to_node, Kokkos::make_pair(0, sender_nodes)),
+        -1);
+      Kokkos::parallel_for(
+        "rrnlb_atom_to_node_mpi",
+        Kokkos::RangePolicy<DeviceType>(0, num_nodes),
+        KOKKOS_LAMBDA (const int ii) {
+          atom_to_node(node_indices_view(ii)) = ii;
+        });
+      rrnlb_feat0_adj_nodes_comm = feat0_adj_nodes;
+      rrnlb_compact_reverse_unpack_active = true;
+    }
     // Explicitly order adjoint accumulation before MPI reverse comm pack.
     run_rrnlb_phase_stage([&] {
       Kokkos::fence();
@@ -1690,19 +1725,20 @@ void PairSymmetrixMACEKokkos<DeviceType, Precision, AccumPrecision>::compute_mpi
     }, [&] (double seconds) {
       mace->rrnlb_record_reverse_mpi_comm(seconds);
     });
+    rrnlb_compact_reverse_unpack_active = false;
 
-    ensure_ws_2d(rrnlb_feat0_adj_nodes_ws, ws_nodes, feat0_dim);
-    auto feat0_adj_nodes = rrnlb_feat0_adj_nodes_ws;
-    const auto feat0_adj_comm = rrnlb_feat0_adj;
-    Kokkos::parallel_for(
-      "rrnlb_gather_feat0_adj_mpi",
-      Kokkos::RangePolicy<DeviceType>(0, num_nodes * feat0_dim),
-      KOKKOS_LAMBDA (const int ip) {
-        const int ii = ip / feat0_dim;
-        const int p = ip % feat0_dim;
-        const int i = node_indices_view(ii);
-        feat0_adj_nodes(ii, p) = feat0_adj_comm(i, p);
-      });
+    if (!use_compact_reverse_unpack) {
+      const auto feat0_adj_comm = rrnlb_feat0_adj;
+      Kokkos::parallel_for(
+        "rrnlb_gather_feat0_adj_mpi",
+        Kokkos::RangePolicy<DeviceType>(0, num_nodes * feat0_dim),
+        KOKKOS_LAMBDA (const int ip) {
+          const int ii = ip / feat0_dim;
+          const int p = ip % feat0_dim;
+          const int i = node_indices_view(ii);
+          feat0_adj_nodes(ii, p) = feat0_adj_comm(i, p);
+        });
+    }
 
     auto skip0_adj = feat0_adj_nodes;
     ensure_ws_2d(rrnlb_product0_in_adj_ws, ws_nodes, product0_dim_in);

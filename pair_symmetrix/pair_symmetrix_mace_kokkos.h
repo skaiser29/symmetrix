@@ -100,6 +100,8 @@ class PairSymmetrixMACEKokkos : public Pair, public KokkosBase {
   Kokkos::View<AccumPrecision**,Kokkos::LayoutRight> rrnlb_interaction1_adj_ws;
   Kokkos::View<AccumPrecision**,Kokkos::LayoutRight> rrnlb_feat0_from_layer1_adj_ws;
   Kokkos::View<AccumPrecision**,Kokkos::LayoutRight> rrnlb_feat0_adj_nodes_ws;
+  Kokkos::View<AccumPrecision**,Kokkos::LayoutRight> rrnlb_feat0_adj_nodes_comm;
+  Kokkos::View<int*> rrnlb_atom_to_node_ws;
   Kokkos::View<AccumPrecision**,Kokkos::LayoutRight> rrnlb_product0_in_adj_ws;
   Kokkos::View<AccumPrecision**,Kokkos::LayoutRight> rrnlb_interaction0_adj_ws;
   Kokkos::View<AccumPrecision**,Kokkos::LayoutRight> rrnlb_sender_embed_adj_ws;
@@ -130,6 +132,7 @@ class PairSymmetrixMACEKokkos : public Pair, public KokkosBase {
   long long rrnlb_phase_step_counter = 0;
   bool rrnlb_phase_csv_header_written = false;
   std::string rrnlb_phase_csv_path;
+  bool rrnlb_compact_reverse_unpack_active = false;
 
   const std::array<std::string,118> periodic_table =
     { "H", "He",

@@ -412,6 +412,26 @@ auto rrnlb_reverse_grouped_fused_enabled() -> bool
     return enabled;
 }
 
+auto rrnlb_direct_linear_up_accum_enabled() -> bool
+{
+    static bool enabled = []() -> bool {
+        const char* env = std::getenv("SYMMETRIX_RRNLB_DIRECT_LINEAR_UP_ACCUM");
+        if (env == nullptr || env[0] == '\0') return true;
+        return env[0] != '0';
+    }();
+    return enabled;
+}
+
+auto rrnlb_reverse_grouped_direct_work_enabled() -> bool
+{
+    static bool enabled = []() -> bool {
+        const char* env = std::getenv("SYMMETRIX_RRNLB_REVERSE_GROUPED_DIRECT_WORK");
+        if (env == nullptr || env[0] == '\0') return true;
+        return env[0] != '0';
+    }();
+    return enabled;
+}
+
 auto rrnlb_epoch_topology_validate_enabled() -> bool
 {
     static bool enabled = []() -> bool {
@@ -2650,7 +2670,8 @@ void MACEKokkos<Precision, AccumPrecision>::rrnlb_apply_linear_transpose(
     const RRNLBLinearKokkos& linear,
     const int num_nodes,
     Kokkos::View<const AccumPrecision**,Kokkos::LayoutRight> y_adj,
-    Kokkos::View<AccumPrecision**,Kokkos::LayoutRight> x_adj)
+    Kokkos::View<AccumPrecision**,Kokkos::LayoutRight> x_adj,
+    bool zero_output)
 {
     if (y_adj.extent(0) < num_nodes || y_adj.extent(1) != linear.dim_out) {
         throw std::runtime_error("RRNLB linear transpose input has invalid shape.");
@@ -2659,9 +2680,11 @@ void MACEKokkos<Precision, AccumPrecision>::rrnlb_apply_linear_transpose(
         throw std::runtime_error("RRNLB linear transpose output has invalid shape.");
     }
 
-    Kokkos::deep_copy(
-        Kokkos::subview(x_adj, Kokkos::make_pair(0, num_nodes), Kokkos::ALL),
-        static_cast<AccumPrecision>(0.0));
+    if (zero_output) {
+        Kokkos::deep_copy(
+            Kokkos::subview(x_adj, Kokkos::make_pair(0, num_nodes), Kokkos::ALL),
+            static_cast<AccumPrecision>(0.0));
+    }
 
     auto run_transpose_precision = [&] (
         Kokkos::View<const Precision**,Kokkos::LayoutStride> y_adj_work,
@@ -4952,6 +4975,10 @@ void MACEKokkos<Precision, AccumPrecision>::reverse_rrnlb_interaction_layer(
     const auto work_coeff = layer.conv_work_coeff;
     const auto work_by_in_offsets = layer.conv_work_by_in_offsets;
     const auto work_by_in_indices = layer.conv_work_by_in_indices;
+    const auto work_by_in_out_idx = layer.conv_work_by_in_out_idx;
+    const auto work_by_in_w_idx = layer.conv_work_by_in_w_idx;
+    const auto work_by_in_y_lm = layer.conv_work_by_in_y_lm;
+    const auto work_by_in_coeff = layer.conv_work_by_in_coeff;
     const int num_work_items = layer.conv_work_table_size;
 
     if (time_rrnlb_phase) Kokkos::fence();
@@ -5142,7 +5169,85 @@ void MACEKokkos<Precision, AccumPrecision>::reverse_rrnlb_interaction_layer(
             && work_by_in_indices.extent_int(0) >= num_work_items;
         const bool use_grouped_fused_reverse =
             use_grouped_input_reverse && rrnlb_reverse_grouped_fused_enabled();
-        if (use_grouped_fused_reverse) {
+        const bool use_grouped_direct_work =
+            use_grouped_fused_reverse
+            && rrnlb_reverse_grouped_direct_work_enabled()
+            && work_by_in_out_idx.extent_int(0) >= num_work_items
+            && work_by_in_w_idx.extent_int(0) >= num_work_items
+            && work_by_in_y_lm.extent_int(0) >= num_work_items
+            && work_by_in_coeff.extent_int(0) >= num_work_items;
+        if (use_grouped_direct_work) {
+            Kokkos::parallel_for(
+                "RRNLB conv reverse (edge-parallel grouped-input direct-work)",
+                Kokkos::TeamPolicy<>(total_edges, Kokkos::AUTO, rrnlb_reverse_vector_length()),
+                KOKKOS_LAMBDA (Kokkos::TeamPolicy<>::member_type team_member) {
+                    const int ij = team_member.league_rank();
+                    const int i = edge_recv(ij);
+                    const int sender = neigh_indices(ij);
+                    const Precision r_ij = static_cast<Precision>(r(ij));
+
+                    auto conv_adj_i = Kokkos::subview(conv_adj, i, Kokkos::ALL);
+                    const auto h_up_sender = Kokkos::subview(h_up, sender, Kokkos::ALL);
+                    auto h_up_sender_adj = Kokkos::subview(h_up_adj, sender, Kokkos::ALL);
+
+                    RRNLBReverseReduceVal<AccumPrecision> rev_reduce;
+                    Kokkos::parallel_reduce(
+                        Kokkos::TeamThreadRange(team_member, active_in_count),
+                        [&] (const int p, RRNLBReverseReduceVal<AccumPrecision>& vals) {
+                            AccumPrecision val = static_cast<AccumPrecision>(0.0);
+                            const AccumPrecision up_val = static_cast<AccumPrecision>(h_up_sender(p));
+                            const int begin = work_by_in_offsets(p);
+                            const int end = work_by_in_offsets(p + 1);
+                            for (int pos = begin; pos < end; ++pos) {
+                                const int lm = work_by_in_y_lm(pos);
+                                const AccumPrecision upstream = conv_adj_i(work_by_in_out_idx(pos));
+                                const AccumPrecision tp_val = static_cast<AccumPrecision>(
+                                    edge_tp_vals(ij, work_by_in_w_idx(pos)));
+                                const AccumPrecision tp_der = static_cast<AccumPrecision>(
+                                    edge_tp_ders(ij, work_by_in_w_idx(pos)));
+                                const AccumPrecision y_val =
+                                    static_cast<AccumPrecision>(Y(ij * num_lm + lm));
+                                const AccumPrecision contrib =
+                                    upstream * static_cast<AccumPrecision>(work_by_in_coeff(pos));
+
+                                val += contrib * y_val * tp_val;
+                                vals.dE_dr += contrib * y_val * up_val * tp_der;
+                                const AccumPrecision y_force_base = contrib * tp_val * up_val;
+                                vals.fx += y_force_base * static_cast<AccumPrecision>(
+                                    Y_grad(ij * 3 * num_lm + lm));
+                                vals.fy += y_force_base * static_cast<AccumPrecision>(
+                                    Y_grad(ij * 3 * num_lm + num_lm + lm));
+                                vals.fz += y_force_base * static_cast<AccumPrecision>(
+                                    Y_grad(ij * 3 * num_lm + 2 * num_lm + lm));
+                            }
+                            if (val != static_cast<AccumPrecision>(0.0)) {
+                                Kokkos::atomic_add(&h_up_sender_adj(p), val);
+                            }
+                        },
+                        rev_reduce);
+
+                    Kokkos::single(Kokkos::PerTeam(team_member), [&] () {
+                        const ForceAccumPrecision inv_r =
+                            static_cast<ForceAccumPrecision>(1.0) / static_cast<ForceAccumPrecision>(r_ij);
+                        const ForceAccumPrecision dE_dr_total =
+                            static_cast<ForceAccumPrecision>(
+                                density_adj(i) * static_cast<AccumPrecision>(edge_den_der(ij))
+                                + rev_reduce.dE_dr);
+                        ForceAccumPrecision dxyz_x =
+                            dE_dr_total * static_cast<ForceAccumPrecision>(xyz(3 * ij + 0)) * inv_r
+                            + static_cast<ForceAccumPrecision>(rev_reduce.fx);
+                        ForceAccumPrecision dxyz_y =
+                            dE_dr_total * static_cast<ForceAccumPrecision>(xyz(3 * ij + 1)) * inv_r
+                            + static_cast<ForceAccumPrecision>(rev_reduce.fy);
+                        ForceAccumPrecision dxyz_z =
+                            dE_dr_total * static_cast<ForceAccumPrecision>(xyz(3 * ij + 2)) * inv_r
+                            + static_cast<ForceAccumPrecision>(rev_reduce.fz);
+                        node_forces(3 * ij + 0) -= static_cast<double>(dxyz_x);
+                        node_forces(3 * ij + 1) -= static_cast<double>(dxyz_y);
+                        node_forces(3 * ij + 2) -= static_cast<double>(dxyz_z);
+                    });
+                });
+        } else if (use_grouped_fused_reverse) {
             Kokkos::parallel_for(
                 "RRNLB conv reverse (edge-parallel grouped-input fused)",
                 Kokkos::TeamPolicy<>(total_edges, Kokkos::AUTO, rrnlb_reverse_vector_length()),
@@ -5557,22 +5662,34 @@ void MACEKokkos<Precision, AccumPrecision>::reverse_rrnlb_interaction_layer(
         }
     }, rrnlb_phase_counters.reverse_skip_scatter_seconds,
        rrnlb_phase_counters.reverse_skip_scatter_calls);
-    auto x_up_adj = cache.x_up_adj;
-    run_reverse_stage([&] {
-        rrnlb_apply_linear_transpose(layer.linear_up, sender_nodes, h_up_adj, x_up_adj);
-    }, rrnlb_phase_counters.reverse_linear_up_transpose_seconds,
-       rrnlb_phase_counters.reverse_linear_up_transpose_calls);
-    run_reverse_stage([&] {
-        Kokkos::parallel_for(
-            "RRNLB sum input adjoints",
-            sender_nodes * in_dim,
-            KOKKOS_LAMBDA (const int ip) {
-                const int i = ip / in_dim;
-                const int p = ip % in_dim;
-                node_feats_in_adj(i, p) += x_up_adj(i, p);
-            });
-    }, rrnlb_phase_counters.reverse_input_adj_accum_seconds,
-       rrnlb_phase_counters.reverse_input_adj_accum_calls);
+    if (rrnlb_direct_linear_up_accum_enabled()) {
+        run_reverse_stage([&] {
+            rrnlb_apply_linear_transpose(
+                layer.linear_up,
+                sender_nodes,
+                h_up_adj,
+                node_feats_in_adj,
+                false);
+        }, rrnlb_phase_counters.reverse_linear_up_transpose_seconds,
+           rrnlb_phase_counters.reverse_linear_up_transpose_calls);
+    } else {
+        auto x_up_adj = cache.x_up_adj;
+        run_reverse_stage([&] {
+            rrnlb_apply_linear_transpose(layer.linear_up, sender_nodes, h_up_adj, x_up_adj);
+        }, rrnlb_phase_counters.reverse_linear_up_transpose_seconds,
+           rrnlb_phase_counters.reverse_linear_up_transpose_calls);
+        run_reverse_stage([&] {
+            Kokkos::parallel_for(
+                "RRNLB sum input adjoints",
+                sender_nodes * in_dim,
+                KOKKOS_LAMBDA (const int ip) {
+                    const int i = ip / in_dim;
+                    const int p = ip % in_dim;
+                    node_feats_in_adj(i, p) += x_up_adj(i, p);
+                });
+        }, rrnlb_phase_counters.reverse_input_adj_accum_seconds,
+           rrnlb_phase_counters.reverse_input_adj_accum_calls);
+    }
     if (time_rrnlb_phase) {
         Kokkos::fence();
         const double seconds = reverse_total_timer.seconds();
@@ -8225,6 +8342,10 @@ void MACEKokkos<Precision, AccumPrecision>::load_from_json(std::string filename)
                     Kokkos::realloc(layer.conv_work_out_slot, total_work);
                     Kokkos::realloc(layer.conv_work_by_in_offsets, h_up_dim + 1);
                     Kokkos::realloc(layer.conv_work_by_in_indices, total_work);
+                    Kokkos::realloc(layer.conv_work_by_in_out_idx, total_work);
+                    Kokkos::realloc(layer.conv_work_by_in_w_idx, total_work);
+                    Kokkos::realloc(layer.conv_work_by_in_y_lm, total_work);
+                    Kokkos::realloc(layer.conv_work_by_in_coeff, total_work);
 
                     auto h_work_out_idx = Kokkos::create_mirror_view(layer.conv_work_out_idx);
                     auto h_work_in_idx = Kokkos::create_mirror_view(layer.conv_work_in_idx);
@@ -8235,6 +8356,10 @@ void MACEKokkos<Precision, AccumPrecision>::load_from_json(std::string filename)
                     auto h_work_out_slot = Kokkos::create_mirror_view(layer.conv_work_out_slot);
                     auto h_work_by_in_offsets = Kokkos::create_mirror_view(layer.conv_work_by_in_offsets);
                     auto h_work_by_in_indices = Kokkos::create_mirror_view(layer.conv_work_by_in_indices);
+                    auto h_work_by_in_out_idx = Kokkos::create_mirror_view(layer.conv_work_by_in_out_idx);
+                    auto h_work_by_in_w_idx = Kokkos::create_mirror_view(layer.conv_work_by_in_w_idx);
+                    auto h_work_by_in_y_lm = Kokkos::create_mirror_view(layer.conv_work_by_in_y_lm);
+                    auto h_work_by_in_coeff = Kokkos::create_mirror_view(layer.conv_work_by_in_coeff);
                     std::vector<int> work_by_in_counts(h_up_dim, 0);
 
                     int w_pos = 0;
@@ -8289,7 +8414,12 @@ void MACEKokkos<Precision, AccumPrecision>::load_from_json(std::string filename)
                     for (int w = 0; w < total_work; ++w) {
                         const int in_idx = h_work_in_idx(w);
                         if (in_idx >= 0 && in_idx < h_up_dim) {
-                            h_work_by_in_indices(work_by_in_next[in_idx]++) = w;
+                            const int pos = work_by_in_next[in_idx]++;
+                            h_work_by_in_indices(pos) = w;
+                            h_work_by_in_out_idx(pos) = h_work_out_idx(w);
+                            h_work_by_in_w_idx(pos) = h_work_w_idx(w);
+                            h_work_by_in_y_lm(pos) = h_work_y_lm(w);
+                            h_work_by_in_coeff(pos) = h_work_coeff(w);
                         }
                     }
 
@@ -8302,6 +8432,10 @@ void MACEKokkos<Precision, AccumPrecision>::load_from_json(std::string filename)
                     Kokkos::deep_copy(layer.conv_work_out_slot, h_work_out_slot);
                     Kokkos::deep_copy(layer.conv_work_by_in_offsets, h_work_by_in_offsets);
                     Kokkos::deep_copy(layer.conv_work_by_in_indices, h_work_by_in_indices);
+                    Kokkos::deep_copy(layer.conv_work_by_in_out_idx, h_work_by_in_out_idx);
+                    Kokkos::deep_copy(layer.conv_work_by_in_w_idx, h_work_by_in_w_idx);
+                    Kokkos::deep_copy(layer.conv_work_by_in_y_lm, h_work_by_in_y_lm);
+                    Kokkos::deep_copy(layer.conv_work_by_in_coeff, h_work_by_in_coeff);
                 }
 
                 const auto& radial = layer_json.at("radial");

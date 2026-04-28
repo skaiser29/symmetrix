@@ -520,3 +520,72 @@ Continue Aurora pair/reverse optimization after grouped-input reverse convolutio
 - Commit: `1634f2d` (`aurora: group reverse convolution input adjoints`).
 - Validated grouped baseline: 770 12-rank `1.668 ns/day`, 5184 12-rank `0.528 ns/day`.
 - Default-on grouped phase smoke: 770 12-rank reverse conv about `0.00437 s/rank-step`, reverse MPI about `0.0029 s/rank-step`.
+
+# Current-Path Bottleneck And Redesign Pass (2026-04-28)
+
+## Goal
+
+Benchmark the newly committed fused-reverse/no-wait path, identify the current dominant bottleneck, and use that evidence to choose the next larger optimization path. If reverse remains dominant, redesign the reverse path; if forward now dominates, switch to a forward-path plan. Fused kernels are allowed only behind a measurement gate because launch reduction can lose to register pressure or reduced occupancy.
+
+## Plan
+
+- [x] Confirm the accepted gains are locked in a local commit and identify the exact commit: `857de95` (`aurora: fuse reverse input pass and relax onemkl waits`).
+- [x] Submit a current-default 12-rank phase/profile benchmark for both 770-atom and 5184-atom water workloads: job `8454410`.
+- [ ] Compare current phase timing against the previous grouped baseline and VTune hotspot mix.
+- [ ] Decide whether the largest remaining cost is reverse, forward, oneMKL linear transpose, MPI reverse exchange, or a distributed mix.
+- [x] If reverse remains dominant, design and implement the next reverse-path tranche with rollback env gates.
+- [ ] If forward dominates, design and implement a forward-path tranche instead.
+- [ ] Rebuild and run short smoke/phase validation for any source change.
+- [ ] Run no-profile production A/B on 770 12-rank, and include 5184 12-rank when the change touches shared kernels.
+- [ ] Compare drift, delta-K, and error scans before accepting any change.
+- [ ] Commit only accepted source/harness changes and document rejected options.
+
+## Initial Constraints
+
+- Do not rely on rank-count special cases.
+- Keep exact rollback knobs for any new path until it has production validation.
+- Treat a fused kernel as a candidate, not a presumption; reject it if it increases register pressure or slows 12-rank.
+- Preserve the committed fallback controls from `857de95`: `SYMMETRIX_RRNLB_REVERSE_GROUPED_FUSED=0` and `SYMMETRIX_RRNLB_ONEMKL_WAIT=1`.
+
+## First Candidate
+
+- The current reverse path still pays `linear_up^T -> x_up_adj` followed by a separate `x_up_adj -> node_feats_in_adj` accumulation kernel.
+- Candidate: allow `rrnlb_apply_linear_transpose` to skip output zeroing and accumulate `linear_up^T` directly into `node_feats_in_adj`.
+- Rollback: `SYMMETRIX_RRNLB_DIRECT_LINEAR_UP_ACCUM=0`.
+- Expected upside is modest but clean: one fewer temporary clear/write/read and one fewer reverse-stage kernel after convolution.
+- Build note: the first rebuild attempt failed before compilation because `cmake` was not in the shell `PATH`; retry with the explicit Aurora 25.190 / oneAPI 2025.2 module stack used by the benchmark harness.
+- Rebuild result: module-loaded rebuild completed successfully.
+- Current-default profile job `8454410` completed before the rebuilt binary timestamp, so it is a clean profile of commit `857de95`.
+- Current 770 12-rank phase profile: speed `1.697 ns/day`; reverse interaction `0.007229 s/rank-step`, reverse conv `0.004034`, reverse MPI `0.002800`, `linear_up^T + input_adj_accum` `0.000790`.
+- Current 5184 12-rank phase profile: speed `0.578 ns/day`; reverse interaction `0.033843 s/rank-step`, reverse conv `0.025140`, reverse MPI `0.004019`, `linear_up^T + input_adj_accum` `0.001556`.
+- Direct-linear-up A/B job submitted: `8454447`.
+- Prepared a second reverse-conv candidate in source, not yet rebuilt: model-load materialized grouped work arrays so the fused grouped reverse kernel can avoid indirect `work_by_in_indices -> work_*` gathers. Rollback: `SYMMETRIX_RRNLB_REVERSE_GROUPED_DIRECT_WORK=0`.
+- Direct-linear-up A/B result from `8454447`: provisionally keep. 770 12-rank improved `1.689 -> 1.706 ns/day`; 5184 12-rank improved `0.576 -> 0.577 ns/day`. Drift and delta-K matched the short-run baseline. Reverse `linear_up^T + input_adj_accum` dropped from `0.000795` to `0.000692 s/rank-step` for 770 12-rank.
+- Direct-work reverse-conv rebuild completed successfully.
+- Direct-work A/B job submitted: `8454475`.
+- Direct-work A/B result from `8454475`: keep for production validation. With direct-linear-up enabled on both sides, 770 12-rank improved `1.696 -> 1.727 ns/day`; 5184 12-rank improved `0.578 -> 0.589 ns/day`. Reverse conv dropped `0.004025 -> 0.003778 s/rank-step` for 770 and `0.025093 -> 0.023707` for 5184.
+- Production validation submission first failed because `01:20:00` exceeded queue limits; script walltime reduced to `01:00:00`.
+- Production validation job submitted: `8454494`.
+- Production validation result from `8454494`: keep the combined stack, but it is not a `>0.2 ns/day` improvement.
+  - 770 12-rank: `1.724 -> 1.745 ns/day`, `+0.021`.
+  - 5184 12-rank: `0.552 -> 0.564 ns/day`, `+0.012`.
+  - Drift/delta-K matched baseline noise: 770 drift `0.000317 -> 0.000301`, 5184 drift `0.001456 -> 0.001469`.
+
+## Current Bottleneck Decision
+
+- The newly committed fused/no-wait path is still reverse-heavy after profiling. In job `8454410`, 770 12-rank reverse interaction was `0.007229 s/rank-step`; reverse conv was `0.004034`, reverse MPI was `0.002800`, and `linear_up^T + input_adj_accum` was `0.000790`.
+- Direct-linear-up removed the standalone input-adjoint accumulation kernel and reduced the linear-up tail, but the production win was small.
+- Direct grouped-work arrays reduced reverse conv by avoiding the grouped-work indirection. This is the cleanest remaining local reverse-conv improvement, but production gain is still small.
+- Remaining reverse cost is split between reverse conv and reverse MPI/halo exchange. The already-tested comm fence removal did not improve production timing, and changing the reverse communication algorithm would be a larger LAMMPS communication design rather than a contained SymmetriX kernel tranche.
+
+## Review
+
+- Accepted:
+  - `SYMMETRIX_RRNLB_DIRECT_LINEAR_UP_ACCUM`, default on, rollback `=0`.
+  - `SYMMETRIX_RRNLB_REVERSE_GROUPED_DIRECT_WORK`, default on, rollback `=0`.
+- Rejected or exhausted in this cycle:
+  - More local oneMKL wait/fence changes: already tested in the prior tranche.
+  - Reverse sender segmentation: already regressed.
+  - Reverse MPI internal-fence removal: already neutral/regressed.
+  - Larger fused linear/reverse kernels: likely duplicate oneMKL work or increase register pressure; no clean design survived the phase data.
+- The requested `>0.2 ns/day` 12-rank improvement was not achieved. The remaining path to that size likely needs a broader reverse communication redesign or a different algorithmic decomposition, not another local reverse-conv or transpose cleanup.

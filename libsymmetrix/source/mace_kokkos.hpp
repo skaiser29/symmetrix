@@ -191,6 +191,10 @@ struct RRNLBLayerKokkos {
     Kokkos::View<int*> conv_work_out_slot;
     Kokkos::View<int*> conv_work_by_in_offsets;
     Kokkos::View<int*> conv_work_by_in_indices;
+    Kokkos::View<int*> conv_work_by_in_out_idx;
+    Kokkos::View<int*> conv_work_by_in_w_idx;
+    Kokkos::View<int*> conv_work_by_in_y_lm;
+    Kokkos::View<Precision*> conv_work_by_in_coeff;
 };
 
 struct RRNLBLayerEpochDispatchCacheKokkos {
@@ -478,7 +482,8 @@ void rrnlb_apply_linear_transpose(
     const RRNLBLinearKokkos& linear,
     const int num_nodes,
     Kokkos::View<const AccumPrecision**,Kokkos::LayoutRight> y_adj,
-    Kokkos::View<AccumPrecision**,Kokkos::LayoutRight> x_adj);
+    Kokkos::View<AccumPrecision**,Kokkos::LayoutRight> x_adj,
+    bool zero_output = true);
 void rrnlb_apply_gate_forward(
     const RRNLBLayerKokkos& layer,
     const int num_nodes,

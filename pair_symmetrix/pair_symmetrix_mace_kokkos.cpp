@@ -188,6 +188,7 @@ void PairSymmetrixMACEKokkos<DeviceType, Precision, AccumPrecision>::coeff(int n
       csv_env != nullptr && csv_env[0] != '\0') {
     rrnlb_phase_csv_path = resolve_rrnlb_phase_csv_path(csv_env, comm->me, comm->nprocs);
   }
+  mace->rrnlb_set_phase_stats_enabled(!rrnlb_phase_csv_path.empty());
 
   // extract atomic numbers from pair_coeff
   // We need one mapping entry per LAMMPS atom type, not per model element.
@@ -252,7 +253,121 @@ template<class DeviceType, typename Precision, typename AccumPrecision>
 void PairSymmetrixMACEKokkos<DeviceType, Precision, AccumPrecision>::rrnlb_maybe_emit_phase_stats(
   const char *mode_tag)
 {
-  (void)mode_tag;
+  if (!mace || !mace->interaction_mode_rrnlb) return;
+  if (rrnlb_phase_csv_path.empty()) {
+    mace->rrnlb_reset_phase_counters();
+    return;
+  }
+
+  const auto counters = mace->rrnlb_take_phase_counters();
+  rrnlb_phase_step_counter += 1;
+
+  std::ofstream csv(rrnlb_phase_csv_path, std::ios::app);
+  if (!csv.good()) return;
+  if (!rrnlb_phase_csv_header_written) {
+    csv << "step_idx,timestep,rank,mode"
+        << ",forward_interaction_seconds,reverse_interaction_seconds"
+        << ",linear_forward_seconds,linear_transpose_seconds"
+        << ",comm_pack_seconds,comm_unpack_seconds,workspace_reset_seconds"
+        << ",reverse_layer0_seconds,reverse_layer1_seconds"
+        << ",reverse_h_up_zero_seconds,reverse_linear2_transpose_seconds"
+        << ",reverse_gate_normalize_seconds,reverse_linear1_transpose_seconds"
+        << ",reverse_linear_res_transpose_seconds,reverse_h_up_scatter_seconds"
+        << ",reverse_conv_seconds,reverse_skip_transpose_seconds"
+        << ",reverse_skip_scatter_seconds,reverse_linear_up_transpose_seconds"
+        << ",reverse_input_adj_accum_seconds"
+        << ",reverse_product0_transpose_seconds,reverse_product1_transpose_seconds"
+        << ",reverse_m0_mixed_seconds,reverse_m1_mixed_seconds"
+        << ",reverse_mpi_comm_seconds"
+        << ",forward_interaction_calls,reverse_interaction_calls"
+        << ",linear_forward_calls,linear_transpose_calls"
+        << ",comm_pack_calls,comm_unpack_calls,workspace_reset_calls"
+        << ",reverse_layer0_calls,reverse_layer1_calls"
+        << ",reverse_h_up_zero_calls,reverse_linear2_transpose_calls"
+        << ",reverse_gate_normalize_calls,reverse_linear1_transpose_calls"
+        << ",reverse_linear_res_transpose_calls,reverse_h_up_scatter_calls"
+        << ",reverse_conv_calls,reverse_skip_transpose_calls"
+        << ",reverse_skip_scatter_calls,reverse_linear_up_transpose_calls"
+        << ",reverse_input_adj_accum_calls"
+        << ",reverse_product0_transpose_calls,reverse_product1_transpose_calls"
+        << ",reverse_m0_mixed_calls,reverse_m1_mixed_calls"
+        << ",reverse_mpi_comm_calls"
+        << ",fused_forward_global_staged_calls,fused_reverse_global_staged_calls"
+        << ",fused_forward_scratch_tiled_calls,fused_reverse_scratch_tiled_calls"
+        << ",forward_adaptive_mode_auto_calls"
+        << ",forward_adaptive_mode_force_fused_calls"
+        << ",forward_adaptive_mode_force_split_calls"
+        << ",forward_full_fused_calls,forward_split_calls"
+        << ",forward_split_conv_stage_calls,forward_split_norm_gate_stage_calls\n";
+    rrnlb_phase_csv_header_written = true;
+  }
+
+  csv << std::setprecision(17)
+      << rrnlb_phase_step_counter << ','
+      << update->ntimestep << ','
+      << comm->me << ','
+      << mode_tag << ','
+      << counters.forward_interaction_seconds << ','
+      << counters.reverse_interaction_seconds << ','
+      << counters.linear_forward_seconds << ','
+      << counters.linear_transpose_seconds << ','
+      << counters.comm_pack_seconds << ','
+      << counters.comm_unpack_seconds << ','
+      << counters.workspace_reset_seconds << ','
+      << counters.reverse_layer0_seconds << ','
+      << counters.reverse_layer1_seconds << ','
+      << counters.reverse_h_up_zero_seconds << ','
+      << counters.reverse_linear2_transpose_seconds << ','
+      << counters.reverse_gate_normalize_seconds << ','
+      << counters.reverse_linear1_transpose_seconds << ','
+      << counters.reverse_linear_res_transpose_seconds << ','
+      << counters.reverse_h_up_scatter_seconds << ','
+      << counters.reverse_conv_seconds << ','
+      << counters.reverse_skip_transpose_seconds << ','
+      << counters.reverse_skip_scatter_seconds << ','
+      << counters.reverse_linear_up_transpose_seconds << ','
+      << counters.reverse_input_adj_accum_seconds << ','
+      << counters.reverse_product0_transpose_seconds << ','
+      << counters.reverse_product1_transpose_seconds << ','
+      << counters.reverse_m0_mixed_seconds << ','
+      << counters.reverse_m1_mixed_seconds << ','
+      << counters.reverse_mpi_comm_seconds << ','
+      << counters.forward_interaction_calls << ','
+      << counters.reverse_interaction_calls << ','
+      << counters.linear_forward_calls << ','
+      << counters.linear_transpose_calls << ','
+      << counters.comm_pack_calls << ','
+      << counters.comm_unpack_calls << ','
+      << counters.workspace_reset_calls << ','
+      << counters.reverse_layer0_calls << ','
+      << counters.reverse_layer1_calls << ','
+      << counters.reverse_h_up_zero_calls << ','
+      << counters.reverse_linear2_transpose_calls << ','
+      << counters.reverse_gate_normalize_calls << ','
+      << counters.reverse_linear1_transpose_calls << ','
+      << counters.reverse_linear_res_transpose_calls << ','
+      << counters.reverse_h_up_scatter_calls << ','
+      << counters.reverse_conv_calls << ','
+      << counters.reverse_skip_transpose_calls << ','
+      << counters.reverse_skip_scatter_calls << ','
+      << counters.reverse_linear_up_transpose_calls << ','
+      << counters.reverse_input_adj_accum_calls << ','
+      << counters.reverse_product0_transpose_calls << ','
+      << counters.reverse_product1_transpose_calls << ','
+      << counters.reverse_m0_mixed_calls << ','
+      << counters.reverse_m1_mixed_calls << ','
+      << counters.reverse_mpi_comm_calls << ','
+      << counters.fused_forward_global_staged_calls << ','
+      << counters.fused_reverse_global_staged_calls << ','
+      << counters.fused_forward_scratch_tiled_calls << ','
+      << counters.fused_reverse_scratch_tiled_calls << ','
+      << counters.forward_adaptive_mode_auto_calls << ','
+      << counters.forward_adaptive_mode_force_fused_calls << ','
+      << counters.forward_adaptive_mode_force_split_calls << ','
+      << counters.forward_full_fused_calls << ','
+      << counters.forward_split_calls << ','
+      << counters.forward_split_conv_stage_calls << ','
+      << counters.forward_split_norm_gate_stage_calls << '\n';
 }
 
 /* ----------------------------------------------------------------------
@@ -859,6 +974,18 @@ void PairSymmetrixMACEKokkos<DeviceType, Precision, AccumPrecision>::compute_mpi
     if (rrnlb_neighbor_epoch_id < 0 || this->neighbor->ago == 0) rrnlb_neighbor_epoch_id += 1;
     mace->rrnlb_set_neighbor_epoch(rrnlb_neighbor_epoch_id);
   }
+  const bool rrnlb_phase_timing = mace->rrnlb_phase_stats_enabled();
+  auto run_rrnlb_phase_stage = [&] (auto&& body, auto&& recorder) {
+    if (rrnlb_phase_timing) {
+      Kokkos::fence();
+      Kokkos::Timer timer;
+      body();
+      Kokkos::fence();
+      recorder(timer.seconds());
+    } else {
+      body();
+    }
+  };
   if (node_indices.size() < num_nodes) Kokkos::realloc(node_indices, num_nodes);
   if (node_types.size() < num_nodes) Kokkos::realloc(node_types, num_nodes);
   if (num_neigh.size() < num_nodes) Kokkos::realloc(num_neigh, num_nodes);
@@ -1418,8 +1545,12 @@ void PairSymmetrixMACEKokkos<DeviceType, Precision, AccumPrecision>::compute_mpi
     auto skip1_adj = feat1_adj;
     ensure_ws_2d(rrnlb_product1_in_adj_ws, ws_nodes, product1_dim_in);
     auto product1_in_adj = rrnlb_product1_in_adj_ws;
-    mace->rrnlb_apply_linear_transpose(
-      mace->rrnlb_product_linear_1, num_nodes, feat1_adj, product1_in_adj);
+    run_rrnlb_phase_stage([&] {
+      mace->rrnlb_apply_linear_transpose(
+        mace->rrnlb_product_linear_1, num_nodes, feat1_adj, product1_in_adj);
+    }, [&] (double seconds) {
+      mace->rrnlb_record_reverse_product1_transpose(seconds);
+    });
 
     if constexpr (!std::is_same_v<Precision, AccumPrecision>) {
       const bool m1_adj_ap_resized =
@@ -1444,8 +1575,12 @@ void PairSymmetrixMACEKokkos<DeviceType, Precision, AccumPrecision>::compute_mpi
             &M1_adj_ap(i, map_dst_k(e)),
             static_cast<AccumPrecision>(product1_in_adj(i, map_src_col(e))));
         });
-      mace->reverse_M1_mixed_rrnlb(
-        num_nodes, node_types, mace->rrnlb_M1_adj_ap, mace->rrnlb_A1_adj_ap);
+      run_rrnlb_phase_stage([&] {
+        mace->reverse_M1_mixed_rrnlb(
+          num_nodes, node_types, mace->rrnlb_M1_adj_ap, mace->rrnlb_A1_adj_ap);
+      }, [&] (double seconds) {
+        mace->rrnlb_record_reverse_m1_mixed(seconds);
+      });
     } else {
       const bool m1_adj_resized =
         mace->M1_adj.extent(0) < num_nodes
@@ -1468,7 +1603,11 @@ void PairSymmetrixMACEKokkos<DeviceType, Precision, AccumPrecision>::compute_mpi
             M1_adj(i, k) = product1_in_adj(i, offset + k * ir_dim);
           }
         });
-      mace->reverse_M1(num_nodes, node_types);
+      run_rrnlb_phase_stage([&] {
+        mace->reverse_M1(num_nodes, node_types);
+      }, [&] (double seconds) {
+        mace->rrnlb_record_reverse_m1_mixed(seconds);
+      });
     }
 
     const bool interaction1_adj_resized =
@@ -1543,10 +1682,14 @@ void PairSymmetrixMACEKokkos<DeviceType, Precision, AccumPrecision>::compute_mpi
         feat0_adj_all(i, p) += feat0_adj_local(ii, p);
       });
     // Explicitly order adjoint accumulation before MPI reverse comm pack.
-    Kokkos::fence();
-    comm->reverse_comm(this);
-    // Ensure reverse comm unpack completed before node-index gather.
-    Kokkos::fence();
+    run_rrnlb_phase_stage([&] {
+      Kokkos::fence();
+      comm->reverse_comm(this);
+      // Ensure reverse comm unpack completed before node-index gather.
+      Kokkos::fence();
+    }, [&] (double seconds) {
+      mace->rrnlb_record_reverse_mpi_comm(seconds);
+    });
 
     ensure_ws_2d(rrnlb_feat0_adj_nodes_ws, ws_nodes, feat0_dim);
     auto feat0_adj_nodes = rrnlb_feat0_adj_nodes_ws;
@@ -1564,8 +1707,12 @@ void PairSymmetrixMACEKokkos<DeviceType, Precision, AccumPrecision>::compute_mpi
     auto skip0_adj = feat0_adj_nodes;
     ensure_ws_2d(rrnlb_product0_in_adj_ws, ws_nodes, product0_dim_in);
     auto product0_in_adj = rrnlb_product0_in_adj_ws;
-    mace->rrnlb_apply_linear_transpose(
-      mace->rrnlb_product_linear_0, num_nodes, feat0_adj_nodes, product0_in_adj);
+    run_rrnlb_phase_stage([&] {
+      mace->rrnlb_apply_linear_transpose(
+        mace->rrnlb_product_linear_0, num_nodes, feat0_adj_nodes, product0_in_adj);
+    }, [&] (double seconds) {
+      mace->rrnlb_record_reverse_product0_transpose(seconds);
+    });
 
     if constexpr (!std::is_same_v<Precision, AccumPrecision>) {
       const bool m0_adj_ap_resized =
@@ -1592,8 +1739,12 @@ void PairSymmetrixMACEKokkos<DeviceType, Precision, AccumPrecision>::compute_mpi
             &M0_adj_ap(i, map_dst_lm(e), map_dst_k(e)),
             static_cast<AccumPrecision>(product0_in_adj(i, map_src_col(e))));
         });
-      mace->reverse_M0_mixed_rrnlb(
-        num_nodes, node_types, mace->rrnlb_M0_adj_ap, mace->rrnlb_A0_adj_ap);
+      run_rrnlb_phase_stage([&] {
+        mace->reverse_M0_mixed_rrnlb(
+          num_nodes, node_types, mace->rrnlb_M0_adj_ap, mace->rrnlb_A0_adj_ap);
+      }, [&] (double seconds) {
+        mace->rrnlb_record_reverse_m0_mixed(seconds);
+      });
     } else {
       const bool m0_adj_resized =
         mace->M0_adj.extent(0) < num_nodes
@@ -1620,7 +1771,11 @@ void PairSymmetrixMACEKokkos<DeviceType, Precision, AccumPrecision>::compute_mpi
             }
           }
         });
-      mace->reverse_M0(num_nodes, node_types);
+      run_rrnlb_phase_stage([&] {
+        mace->reverse_M0(num_nodes, node_types);
+      }, [&] (double seconds) {
+        mace->rrnlb_record_reverse_m0_mixed(seconds);
+      });
     }
 
     const bool interaction0_adj_resized =

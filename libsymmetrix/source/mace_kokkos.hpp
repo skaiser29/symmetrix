@@ -189,6 +189,8 @@ struct RRNLBLayerKokkos {
     Kokkos::View<Precision*> conv_work_coeff;
     Kokkos::View<int*> conv_work_in_local_idx;
     Kokkos::View<int*> conv_work_out_slot;
+    Kokkos::View<int*> conv_work_by_in_offsets;
+    Kokkos::View<int*> conv_work_by_in_indices;
 };
 
 struct RRNLBLayerEpochDispatchCacheKokkos {
@@ -251,6 +253,24 @@ struct RRNLBPhaseCounters {
     double comm_pack_seconds = 0.0;
     double comm_unpack_seconds = 0.0;
     double workspace_reset_seconds = 0.0;
+    double reverse_layer0_seconds = 0.0;
+    double reverse_layer1_seconds = 0.0;
+    double reverse_h_up_zero_seconds = 0.0;
+    double reverse_linear2_transpose_seconds = 0.0;
+    double reverse_gate_normalize_seconds = 0.0;
+    double reverse_linear1_transpose_seconds = 0.0;
+    double reverse_linear_res_transpose_seconds = 0.0;
+    double reverse_h_up_scatter_seconds = 0.0;
+    double reverse_conv_seconds = 0.0;
+    double reverse_skip_transpose_seconds = 0.0;
+    double reverse_skip_scatter_seconds = 0.0;
+    double reverse_linear_up_transpose_seconds = 0.0;
+    double reverse_input_adj_accum_seconds = 0.0;
+    double reverse_product0_transpose_seconds = 0.0;
+    double reverse_product1_transpose_seconds = 0.0;
+    double reverse_m0_mixed_seconds = 0.0;
+    double reverse_m1_mixed_seconds = 0.0;
+    double reverse_mpi_comm_seconds = 0.0;
     long long forward_interaction_calls = 0;
     long long reverse_interaction_calls = 0;
     long long linear_forward_calls = 0;
@@ -258,6 +278,24 @@ struct RRNLBPhaseCounters {
     long long comm_pack_calls = 0;
     long long comm_unpack_calls = 0;
     long long workspace_reset_calls = 0;
+    long long reverse_layer0_calls = 0;
+    long long reverse_layer1_calls = 0;
+    long long reverse_h_up_zero_calls = 0;
+    long long reverse_linear2_transpose_calls = 0;
+    long long reverse_gate_normalize_calls = 0;
+    long long reverse_linear1_transpose_calls = 0;
+    long long reverse_linear_res_transpose_calls = 0;
+    long long reverse_h_up_scatter_calls = 0;
+    long long reverse_conv_calls = 0;
+    long long reverse_skip_transpose_calls = 0;
+    long long reverse_skip_scatter_calls = 0;
+    long long reverse_linear_up_transpose_calls = 0;
+    long long reverse_input_adj_accum_calls = 0;
+    long long reverse_product0_transpose_calls = 0;
+    long long reverse_product1_transpose_calls = 0;
+    long long reverse_m0_mixed_calls = 0;
+    long long reverse_m1_mixed_calls = 0;
+    long long reverse_mpi_comm_calls = 0;
     long long fused_forward_global_staged_calls = 0;
     long long fused_reverse_global_staged_calls = 0;
     long long fused_forward_scratch_tiled_calls = 0;
@@ -503,6 +541,7 @@ void precompute_rrnlb_edge_radial_descriptors(
 auto rrnlb_portable_v2_enabled() const -> bool { return rrnlb_portable_v2; }
 auto rrnlb_phase_stats_enabled() const -> bool { return rrnlb_phase_stats_enabled_flag; }
 auto rrnlb_phase_stats_every() const -> int { return rrnlb_phase_stats_every_steps; }
+void rrnlb_set_phase_stats_enabled(bool enabled);
 void rrnlb_record_comm_pack(double seconds);
 void rrnlb_record_comm_unpack(double seconds);
 void rrnlb_record_workspace_reset(double seconds);
@@ -510,6 +549,11 @@ void rrnlb_record_forward_interaction(double seconds);
 void rrnlb_record_reverse_interaction(double seconds);
 void rrnlb_record_linear_forward(double seconds);
 void rrnlb_record_linear_transpose(double seconds);
+void rrnlb_record_reverse_product0_transpose(double seconds);
+void rrnlb_record_reverse_product1_transpose(double seconds);
+void rrnlb_record_reverse_m0_mixed(double seconds);
+void rrnlb_record_reverse_m1_mixed(double seconds);
+void rrnlb_record_reverse_mpi_comm(double seconds);
 auto rrnlb_take_phase_counters() -> RRNLBPhaseCounters;
 void rrnlb_reset_phase_counters();
 void rrnlb_set_neighbor_epoch(long long epoch);

@@ -3,6 +3,13 @@
 > [!WARNING]
 > Symmetrix now requires the [10 September 2025](https://github.com/lammps/lammps/releases/tag/patch_10Sep2025) LAMMPS release, or newer.
 
+> [!WARNING]
+> Multi-rank Kokkos force clients driven by i-PI require LAMMPS commit
+> [`366d24438b`](https://github.com/skaiser29/lammps/commit/366d24438b77ab27de9c379ce4b69d132c436398)
+> or an equivalent upstream fix. Older `fix ipi` implementations wrap externally
+> supplied coordinates by only one box length and can lose atoms when i-PI sends
+> a more deeply unwrapped snapshot.
+
 ### Generating a model
 
 First, extract your model in `.json` form. See the `symmetrix` [Python package documentation](../symmetrix/README.md) for details.
